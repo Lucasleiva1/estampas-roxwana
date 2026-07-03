@@ -1,0 +1,16 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/schemas/
+
+*.log
+*.tmp
+*.sqlite
+*.sqlite3
+
+.DS_Store
+Thumbs.db
+
+.env
+.env.*
+!.env.example
