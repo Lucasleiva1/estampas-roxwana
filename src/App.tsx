@@ -1,6 +1,5 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { watch } from "@tauri-apps/plugin-fs";
 import {
   Check,
   ChevronLeft,
@@ -144,41 +143,31 @@ export default function App() {
 
   useEffect(() => {
     if (!library?.rootPath) return;
-    let unwatch: (() => void) | null = null;
     let active = true;
+    let scanning = false;
 
-    const startWatch = async () => {
+    setWatching(true);
+    setError((current) => (current?.startsWith("No pude activar el watcher:") ? null : current));
+
+    const rescanCurrentLibrary = async () => {
+      if (scanning) return;
+      scanning = true;
       try {
-        const unwatchFn = await watch(
-          library.rootPath,
-          () => {
-            if (rescanTimer.current) window.clearTimeout(rescanTimer.current);
-            rescanTimer.current = window.setTimeout(async () => {
-              try {
-                const response = await rescanPaths(library.rootPath, []);
-                if (active) applyLibrary(response);
-              } catch (watchError) {
-                if (active) setError(String(watchError));
-              }
-            }, 1400);
-          },
-          { recursive: true, delayMs: 800 },
-        );
-        unwatch = unwatchFn;
-        if (active) setWatching(true);
-      } catch (watchError) {
-        setWatching(false);
-        setError(`No pude activar el watcher: ${String(watchError)}`);
+        const response = await rescanPaths(library.rootPath, []);
+        if (active) applyLibrary(response);
+      } catch (rescanError) {
+        if (active) setError(String(rescanError));
+      } finally {
+        scanning = false;
       }
     };
 
-    startWatch();
+    rescanTimer.current = window.setInterval(rescanCurrentLibrary, 30000);
 
     return () => {
       active = false;
       setWatching(false);
-      if (rescanTimer.current) window.clearTimeout(rescanTimer.current);
-      if (unwatch) unwatch();
+      if (rescanTimer.current) window.clearInterval(rescanTimer.current);
     };
   }, [applyLibrary, library?.rootPath]);
 
@@ -430,18 +419,6 @@ export default function App() {
         />
       </section>
 
-      <BottomTray
-        design={selectedDesign}
-        categories={library?.categories ?? []}
-        onOpenFolder={openFolderForDesign}
-        onRevealFile={revealFileForDesign}
-        onFavorite={setFavorite}
-        onStatus={setStatus}
-        onCategory={saveCategory}
-        onAddTag={addTagToDesign}
-        onRemoveTag={removeTagFromDesign}
-        showIconLabels={showIconLabels}
-      />
     </main>
   );
 }
@@ -485,7 +462,6 @@ function Header({
           <strong>RXW</strong>
           <span>Visual Library</span>
         </div>
-        <div className="brand-word">ROXWANA</div>
       </section>
 
       <nav className="quick-pills">
@@ -595,7 +571,7 @@ function LeftFilters({
 
       <div className="left-status">
         <div className={watching ? "pulse active" : "pulse"} />
-        <span>{watching ? "Detectando cambios" : "Watcher inactivo"}</span>
+        <span>{watching ? "Autoescaneo activo" : "Autoescaneo inactivo"}</span>
       </div>
       <div className="result-count">{filteredCount.toLocaleString("es-AR")} visibles</div>
       <div className="side-icons">
@@ -651,38 +627,37 @@ function Viewer({
           </div>
         )}
 
-        {design && (
-          <div className="viewer-file-overlay">
-            <div className="overlay-file-main" title={previewFile?.path ?? design.directory}>
-              <FileText size={18} />
-              <span>{previewFile?.fileName ?? design.name}</span>
-            </div>
-
-            <div className="overlay-assets" aria-label="Archivos de esta estampa">
-              <AssetPill label="IMG" value={imageCount} tone="red" />
-              <AssetPill label="AI" value={countForExtension(design, ".ai")} tone="gold" />
-              <AssetPill label="PSD" value={countForExtension(design, ".psd")} tone="blue" />
-              <AssetPill label="EPS" value={countForExtension(design, ".eps")} tone="gold" />
-              <AssetPill label="ZIP" value={countForExtension(design, ".zip")} tone="neutral" />
-              <AssetPill label="TXT" value={countForExtension(design, ".txt")} tone="neutral" />
-            </div>
-
-            <div className="overlay-folder" title={design.directory}>
-              <FolderOpen size={17} />
-              <span>{design.name}</span>
-            </div>
-
-            <button className="overlay-action primary" onClick={() => onOpenFolder(design)}>
-              <FolderOpen size={16} />
-              Abrir carpeta
-            </button>
-            <button className="overlay-action" onClick={() => onRevealFile(design)}>
-              <Maximize2 size={15} />
-              Mostrar archivo
-            </button>
-          </div>
-        )}
       </div>
+
+      {design && (
+        <div className="viewer-file-overlay">
+          <div className="overlay-file-main" title={previewFile?.path ?? design.directory}>
+            <FileText size={18} />
+            <span>{previewFile?.fileName ?? design.name}</span>
+          </div>
+
+          <div className="overlay-assets" aria-label="Archivos de esta estampa">
+            <AssetPill label="IMG" value={imageCount} tone="red" />
+            <AssetPill label="AI" value={countForExtension(design, ".ai")} tone="gold" />
+            <AssetPill label="PSD" value={countForExtension(design, ".psd")} tone="blue" />
+            <AssetPill label="EPS" value={countForExtension(design, ".eps")} tone="gold" />
+            <AssetPill label="ZIP" value={countForExtension(design, ".zip")} tone="neutral" />
+            <AssetPill label="TXT" value={countForExtension(design, ".txt")} tone="neutral" />
+          </div>
+
+          <div className="overlay-folder" title={design.directory}>
+            <span>{design.name}</span>
+          </div>
+
+          <button className="overlay-action primary icon-action" onClick={() => onOpenFolder(design)} title="Abrir carpeta" aria-label="Abrir carpeta">
+            <FolderOpen size={16} />
+          </button>
+          <button className="overlay-action" onClick={() => onRevealFile(design)}>
+            <Maximize2 size={15} />
+            Mostrar archivo
+          </button>
+        </div>
+      )}
 
       <button className="nav-arrow right" onClick={onNext} disabled={!design} title="Siguiente">
         <ChevronRight size={28} />
