@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { DesignStatus, LibraryResponse } from "./types";
+import type { Design, DesignStatus, LibraryResponse } from "./types";
 
 const DEFAULT_LIBRARY_PATH = "C:\\Users\\jaell\\Documents\\estampas-roxwana";
 
@@ -13,6 +13,14 @@ export async function rescanPaths(rootPath: string, paths: string[]) {
 
 export async function getInitialState() {
   return invoke<LibraryResponse>("get_initial_state");
+}
+
+export async function getLibraryFromDb() {
+  return invoke<LibraryResponse>("get_library_from_db");
+}
+
+export async function getDesignDetail(designId: string) {
+  return invoke<Design | null>("get_design_detail", { designId });
 }
 
 export async function updateFavorite(designId: string, favorite: boolean) {
@@ -37,6 +45,10 @@ export async function removeTag(designId: string, tag: string) {
 
 export async function generateThumbnail(previewPath: string, updatedAt: number) {
   return invoke<string | null>("generate_thumbnail", { previewPath, updatedAt });
+}
+
+export async function generatePreview(previewPath: string, updatedAt: number) {
+  return invoke<string | null>("generate_preview", { previewPath, updatedAt });
 }
 
 export async function openDesignFolder(path: string) {

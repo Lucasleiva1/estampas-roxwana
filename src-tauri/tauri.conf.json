@@ -31,7 +31,19 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": "all",
     "icon": ["icons/icon.ico"]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEQxRUI1QkQ1QkIyOTc2OTYKUldTV2RpbTcxVnZyMFZrbW94OXRFa3E2Wm41bmhEMWVyVGxPcUJadjVlQ3pOSHpQWlB0ZE1EMVMK",
+      "endpoints": [
+        "https://github.com/Lucasleiva1/estampas-roxwana/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }

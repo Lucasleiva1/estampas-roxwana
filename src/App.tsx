@@ -1,5 +1,7 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { relaunch } from "@tauri-apps/plugin-process";
+import { check, type DownloadEvent } from "@tauri-apps/plugin-updater";
 import {
   Check,
   ChevronLeft,
@@ -40,12 +42,13 @@ import { memo, useCallback, useDeferredValue, useEffect, useMemo, useRef, useSta
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   addTag,
+  generatePreview,
   generateThumbnail,
+  getDesignDetail,
   getInitialState,
   openDesignFolder,
   removeTag,
   revealDesignFile,
-  rescanPaths,
   scanLibrary,
   updateCategory,
   updateFavorite,
@@ -56,6 +59,7 @@ import { formatBytes } from "./lib/fileTypes";
 import type { Design, DesignStatus, Filters, LibraryResponse } from "./lib/types";
 
 const DEFAULT_LIBRARY_PATH = "C:\\Users\\jaell\\Documents\\estampas-roxwana";
+const PAGE_SIZE = 50;
 const supportFilters = [".png", ".jpg", ".ai", ".psd", ".eps", ".zip", ".txt"];
 const defaultZoom = 100;
 
@@ -84,19 +88,51 @@ const quickFilters: QuickFilter[] = [
   { id: "urban", label: "Urbano", icon: Home, kind: "category", category: "Urbano" },
 ];
 
+type UpdatePhase = "idle" | "checking" | "downloading" | "installing" | "none" | "done" | "error";
+
+type AppUpdateState = {
+  phase: UpdatePhase;
+  message: string | null;
+  progress: number | null;
+};
+
+type ThumbnailPrepState = {
+  phase: "idle" | "running" | "done" | "error";
+  done: number;
+  total: number;
+  message: string | null;
+};
+
+const initialUpdateState: AppUpdateState = {
+  phase: "idle",
+  message: null,
+  progress: null,
+};
+
+const initialThumbnailPrepState: ThumbnailPrepState = {
+  phase: "idle",
+  done: 0,
+  total: 0,
+  message: null,
+};
+
 export default function App() {
   const [library, setLibrary] = useState<LibraryResponse | null>(null);
   const [filters, setFilters] = useState<Filters>(() => createDefaultFilters());
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [scanning, setScanning] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [watching, setWatching] = useState(false);
   const [zoom, setZoom] = useState(defaultZoom);
   const [thumbMode, setThumbMode] = useState<"compact" | "grid" | "list">("compact");
   const [showIconLabels, setShowIconLabels] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const rescanTimer = useRef<number | null>(null);
-  const attemptedThumbnails = useRef<Set<string>>(new Set());
+  const [detailsById, setDetailsById] = useState<Record<string, Design>>({});
+  const [pageIndex, setPageIndex] = useState(0);
+  const [isChangingPage, setIsChangingPage] = useState(false);
+  const [updateState, setUpdateState] = useState<AppUpdateState>(initialUpdateState);
+  const [thumbnailPrep, setThumbnailPrep] = useState<ThumbnailPrepState>(initialThumbnailPrepState);
+  const attemptedPreviews = useRef<Set<string>>(new Set());
   const deferredFilters = useDeferredValue(filters);
 
   const applyLibrary = useCallback((next: LibraryResponse) => {
@@ -109,15 +145,16 @@ export default function App() {
 
   const runScan = useCallback(
     async (rootPath = library?.rootPath ?? DEFAULT_LIBRARY_PATH) => {
-      setLoading(true);
+      setScanning(true);
       setError(null);
       try {
         const response = await scanLibrary(rootPath);
         applyLibrary(response);
+        setDetailsById({});
       } catch (scanError) {
         setError(String(scanError));
       } finally {
-        setLoading(false);
+        setScanning(false);
       }
     },
     [applyLibrary, library?.rootPath],
@@ -141,42 +178,29 @@ export default function App() {
     };
   }, [applyLibrary]);
 
-  useEffect(() => {
-    if (!library?.rootPath) return;
-    let active = true;
-    let scanning = false;
-
-    setWatching(true);
-    setError((current) => (current?.startsWith("No pude activar el watcher:") ? null : current));
-
-    const rescanCurrentLibrary = async () => {
-      if (scanning) return;
-      scanning = true;
-      try {
-        const response = await rescanPaths(library.rootPath, []);
-        if (active) applyLibrary(response);
-      } catch (rescanError) {
-        if (active) setError(String(rescanError));
-      } finally {
-        scanning = false;
-      }
-    };
-
-    rescanTimer.current = window.setInterval(rescanCurrentLibrary, 30000);
-
-    return () => {
-      active = false;
-      setWatching(false);
-      if (rescanTimer.current) window.clearInterval(rescanTimer.current);
-    };
-  }, [applyLibrary, library?.rootPath]);
-
   const filteredDesigns = useMemo(() => filterDesigns(library?.designs ?? [], deferredFilters), [deferredFilters, library?.designs]);
+  const totalPages = Math.max(1, Math.ceil(filteredDesigns.length / PAGE_SIZE));
+  const currentPageIndex = Math.min(pageIndex, totalPages - 1);
+  const pageStart = currentPageIndex * PAGE_SIZE;
+  const pageEnd = Math.min(pageStart + PAGE_SIZE, filteredDesigns.length);
+  const visibleDesigns = useMemo(() => filteredDesigns.slice(pageStart, pageEnd), [filteredDesigns, pageEnd, pageStart]);
   const selectedIndex = useMemo(
     () => Math.max(0, filteredDesigns.findIndex((design) => design.id === selectedId)),
     [filteredDesigns, selectedId],
   );
-  const selectedDesign = filteredDesigns[selectedIndex] ?? filteredDesigns[0] ?? null;
+  const selectedSummary = filteredDesigns[selectedIndex] ?? filteredDesigns[0] ?? null;
+  const selectedDesign = selectedSummary ? detailsById[selectedSummary.id] ?? selectedSummary : null;
+
+  useEffect(() => {
+    setPageIndex(0);
+    setIsChangingPage(false);
+  }, [deferredFilters, library?.rootPath]);
+
+  useEffect(() => {
+    if (pageIndex !== currentPageIndex) {
+      setPageIndex(currentPageIndex);
+    }
+  }, [currentPageIndex, pageIndex]);
 
   const updateDesignLocal = useCallback((designId: string, updater: (design: Design) => Design) => {
     setLibrary((current) => {
@@ -186,51 +210,59 @@ export default function App() {
         designs: current.designs.map((design) => (design.id === designId ? updater(design) : design)),
       };
     });
+    setDetailsById((current) => {
+      const detail = current[designId];
+      if (!detail) return current;
+      return { ...current, [designId]: updater(detail) };
+    });
   }, []);
 
-  const thumbnailCandidates = useMemo(() => {
-    const start = Math.max(0, selectedIndex - 8);
-    return filteredDesigns
-      .slice(start, start + 20)
-      .filter((design) => {
-        if (!design.previewPath || design.thumbnailPath) return false;
-        return !attemptedThumbnails.current.has(`${design.previewPath}:${design.updatedAt}`);
-      })
-      .slice(0, 10);
-  }, [filteredDesigns, selectedIndex]);
-
   useEffect(() => {
-    if (thumbnailCandidates.length === 0) return;
+    const candidates = [selectedSummary, filteredDesigns[selectedIndex - 1], filteredDesigns[selectedIndex + 1]].filter(Boolean) as Design[];
+    if (candidates.length === 0) return;
     let cancelled = false;
-    const timer = window.setTimeout(() => {
-      void (async () => {
-        for (const design of thumbnailCandidates) {
-          if (cancelled || !design.previewPath) break;
-          const key = `${design.previewPath}:${design.updatedAt}`;
-          if (attemptedThumbnails.current.has(key)) continue;
-          attemptedThumbnails.current.add(key);
 
-          try {
-            const thumbnailPath = await generateThumbnail(design.previewPath, design.updatedAt);
-            if (!cancelled && thumbnailPath) {
-              updateDesignLocal(design.id, (item) => ({ ...item, thumbnailPath }));
-            }
-          } catch {
-            // A broken image should not block navigation or scrolling.
+    void (async () => {
+      for (const design of candidates) {
+        if (cancelled || detailsById[design.id]) continue;
+        try {
+          const detail = await getDesignDetail(design.id);
+          if (!cancelled && detail) {
+            setDetailsById((current) => (current[detail.id] ? current : { ...current, [detail.id]: detail }));
           }
-
-          if (!cancelled) {
-            await new Promise((resolve) => window.setTimeout(resolve, 55));
-          }
+        } catch (detailError) {
+          if (!cancelled) setError(String(detailError));
         }
-      })();
-    }, 160);
+      }
+    })();
 
     return () => {
       cancelled = true;
-      window.clearTimeout(timer);
     };
-  }, [thumbnailCandidates, updateDesignLocal]);
+  }, [detailsById, filteredDesigns, selectedIndex, selectedSummary]);
+
+  useEffect(() => {
+    if (!selectedDesign?.previewPath || selectedDesign.previewCachePath) return;
+    const key = `${selectedDesign.previewPath}:${selectedDesign.updatedAt}`;
+    if (attemptedPreviews.current.has(key)) return;
+    attemptedPreviews.current.add(key);
+    let cancelled = false;
+
+    void (async () => {
+      try {
+        const previewCachePath = await generatePreview(selectedDesign.previewPath!, selectedDesign.updatedAt);
+        if (!cancelled && previewCachePath) {
+          updateDesignLocal(selectedDesign.id, (item) => ({ ...item, previewCachePath }));
+        }
+      } catch (previewError) {
+        if (!cancelled) setError(`No pude generar preview optimizado: ${String(previewError)}`);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedDesign?.id, selectedDesign?.previewCachePath, selectedDesign?.previewPath, selectedDesign?.updatedAt, updateDesignLocal]);
 
   const chooseFolder = async () => {
     const selected = await openDialog({
@@ -312,6 +344,145 @@ export default function App() {
     if (random) setSelectedId(random.id);
   };
 
+  const prepareThumbnails = useCallback(async () => {
+    if (!library || thumbnailPrep.phase === "running") return;
+
+    const queue = library.designs.filter((design) => design.previewPath && !design.thumbnailPath);
+    if (queue.length === 0) {
+      setThumbnailPrep({
+        phase: "done",
+        done: 0,
+        total: 0,
+        message: "Todas las miniaturas ya estan preparadas.",
+      });
+      return;
+    }
+
+    setThumbnailPrep({
+      phase: "running",
+      done: 0,
+      total: queue.length,
+      message: "Preparando miniaturas cacheadas...",
+    });
+
+    let completed = 0;
+    let failed = 0;
+    for (const design of queue) {
+      try {
+        const thumbnailPath = await generateThumbnail(design.previewPath!, design.updatedAt);
+        if (thumbnailPath) {
+          updateDesignLocal(design.id, (item) => ({ ...item, thumbnailPath }));
+        }
+      } catch {
+        // Some source files can be invalid or too large; keep preparing the rest.
+        failed += 1;
+      }
+
+      completed += 1;
+      setThumbnailPrep({
+        phase: "running",
+        done: completed,
+        total: queue.length,
+        message: "Preparando miniaturas cacheadas...",
+      });
+
+      await new Promise((resolve) => window.setTimeout(resolve, 35));
+    }
+
+    setThumbnailPrep({
+      phase: "done",
+      done: completed,
+      total: queue.length,
+      message:
+        failed > 0
+          ? `Miniaturas preparadas. ${failed} imagenes no se pudieron convertir.`
+          : "Miniaturas preparadas. La galeria lateral ya usa cache.",
+    });
+  }, [library, thumbnailPrep.phase, updateDesignLocal]);
+
+  const goToPage = useCallback((nextPageIndex: number) => {
+    if (isChangingPage) return;
+    const clampedPage = Math.max(0, Math.min(nextPageIndex, totalPages - 1));
+    if (clampedPage === currentPageIndex) return;
+    setIsChangingPage(true);
+    window.setTimeout(() => {
+      setPageIndex(clampedPage);
+      setIsChangingPage(false);
+    }, 120);
+  }, [currentPageIndex, isChangingPage, totalPages]);
+
+  const checkForUpdates = useCallback(async () => {
+    if (["checking", "downloading", "installing"].includes(updateState.phase)) return;
+
+    setUpdateState({
+      phase: "checking",
+      message: "Buscando actualizacion...",
+      progress: null,
+    });
+
+    try {
+      const update = await check({ timeout: 30000 });
+      if (!update) {
+        setUpdateState({
+          phase: "none",
+          message: "No hay actualizaciones disponibles.",
+          progress: null,
+        });
+        return;
+      }
+
+      let downloaded = 0;
+      let contentLength = 0;
+      setUpdateState({
+        phase: "downloading",
+        message: `Descargando version ${update.version}...`,
+        progress: 0,
+      });
+
+      await update.downloadAndInstall((event: DownloadEvent) => {
+        if (event.event === "Started") {
+          contentLength = event.data.contentLength ?? 0;
+          downloaded = 0;
+          setUpdateState({
+            phase: "downloading",
+            message: `Descargando version ${update.version}...`,
+            progress: contentLength > 0 ? 0 : null,
+          });
+        }
+
+        if (event.event === "Progress") {
+          downloaded += event.data.chunkLength;
+          setUpdateState({
+            phase: "downloading",
+            message: `Descargando version ${update.version}...`,
+            progress: contentLength > 0 ? Math.min(99, Math.round((downloaded / contentLength) * 100)) : null,
+          });
+        }
+
+        if (event.event === "Finished") {
+          setUpdateState({
+            phase: "installing",
+            message: "Instalando actualizacion...",
+            progress: 100,
+          });
+        }
+      });
+
+      setUpdateState({
+        phase: "done",
+        message: "Actualizacion instalada. Reiniciando...",
+        progress: 100,
+      });
+      await relaunch();
+    } catch (updateError) {
+      setUpdateState({
+        phase: "error",
+        message: `No se pudo actualizar: ${String(updateError)}`,
+        progress: null,
+      });
+    }
+  }, [updateState.phase]);
+
   const goToOffset = (offset: number) => {
     if (filteredDesigns.length === 0) return;
     const nextIndex = (selectedIndex + offset + filteredDesigns.length) % filteredDesigns.length;
@@ -364,7 +535,7 @@ export default function App() {
         filters={filters}
         setFilters={setFilters}
         selectedDesign={selectedDesign}
-        loading={loading}
+        loading={loading || scanning}
         onQuickFilter={applyQuickFilter}
         onAddTag={addQuickTag}
         onChooseFolder={chooseFolder}
@@ -374,6 +545,10 @@ export default function App() {
         setShowIconLabels={setShowIconLabels}
         settingsOpen={settingsOpen}
         setSettingsOpen={setSettingsOpen}
+        updateState={updateState}
+        onCheckForUpdates={checkForUpdates}
+        thumbnailPrep={thumbnailPrep}
+        onPrepareThumbnails={prepareThumbnails}
       />
 
       {error && (
@@ -391,14 +566,14 @@ export default function App() {
           library={library}
           allDesigns={library?.designs ?? []}
           filteredCount={filteredDesigns.length}
-          watching={watching}
+          scanning={scanning}
           onQuickFilter={applyQuickFilter}
           onClear={() => setFilters(createDefaultFilters())}
         />
 
         <Viewer
           design={selectedDesign}
-          loading={loading}
+          loading={loading || scanning}
         zoom={zoom}
         setZoom={setZoom}
         onPrev={() => goToOffset(-1)}
@@ -408,7 +583,13 @@ export default function App() {
       />
 
         <RightRail
-          designs={filteredDesigns}
+          designs={visibleDesigns}
+          totalCount={filteredDesigns.length}
+          pageStart={pageStart}
+          pageEnd={pageEnd}
+          pageIndex={currentPageIndex}
+          totalPages={totalPages}
+          isChangingPage={isChangingPage}
           selectedId={selectedDesign?.id ?? null}
           filters={filters}
           setFilters={setFilters}
@@ -416,6 +597,7 @@ export default function App() {
           setThumbMode={setThumbMode}
           onSelect={setSelectedId}
           onFavorite={setFavorite}
+          onPageChange={goToPage}
         />
       </section>
 
@@ -438,6 +620,10 @@ function Header({
   setShowIconLabels,
   settingsOpen,
   setSettingsOpen,
+  updateState,
+  onCheckForUpdates,
+  thumbnailPrep,
+  onPrepareThumbnails,
 }: {
   library: LibraryResponse | null;
   filters: Filters;
@@ -453,7 +639,15 @@ function Header({
   setShowIconLabels: (show: boolean) => void;
   settingsOpen: boolean;
   setSettingsOpen: (open: boolean) => void;
+  updateState: AppUpdateState;
+  onCheckForUpdates: () => void;
+  thumbnailPrep: ThumbnailPrepState;
+  onPrepareThumbnails: () => void;
 }) {
+  const updateBusy = updateState.phase === "checking" || updateState.phase === "downloading" || updateState.phase === "installing";
+  const thumbnailBusy = thumbnailPrep.phase === "running";
+  const thumbnailProgress = thumbnailPrep.total > 0 ? Math.round((thumbnailPrep.done / thumbnailPrep.total) * 100) : null;
+
   return (
     <header className="visual-header">
       <section className="logo-area" title={library?.rootPath ?? DEFAULT_LIBRARY_PATH}>
@@ -494,6 +688,47 @@ function Header({
           </button>
           {settingsOpen && (
             <div className="settings-popover">
+              <button className="settings-action" onClick={onRunScan} disabled={loading}>
+                <RefreshCw size={16} className={loading ? "spin" : ""} />
+                <span>Escanear biblioteca</span>
+              </button>
+              <button className="settings-action secondary" onClick={onPrepareThumbnails} disabled={thumbnailBusy || !library}>
+                {thumbnailBusy ? <Loader2 size={16} className="spin" /> : <FileImage size={16} />}
+                <span>{thumbnailBusy ? "Preparando..." : "Preparar miniaturas"}</span>
+              </button>
+              {thumbnailPrep.message && (
+                <div className={`update-status ${thumbnailPrep.phase}`}>
+                  <span>{thumbnailPrep.message}</span>
+                  {thumbnailPrep.total > 0 && (
+                    <>
+                      <small>
+                        {thumbnailPrep.done.toLocaleString("es-AR")} de {thumbnailPrep.total.toLocaleString("es-AR")}
+                      </small>
+                      <div className="update-progress" aria-label={`Progreso ${thumbnailProgress ?? 0}%`}>
+                        <span style={{ width: `${thumbnailProgress ?? 0}%` }} />
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
+              <button className="settings-action secondary" onClick={onCheckForUpdates} disabled={updateBusy}>
+                {updateState.phase === "done" || updateState.phase === "none" ? (
+                  <Check size={16} />
+                ) : (
+                  <RefreshCw size={16} className={updateBusy ? "spin" : ""} />
+                )}
+                <span>{updateBusy ? "Actualizando..." : "Buscar actualizacion"}</span>
+              </button>
+              {updateState.message && (
+                <div className={`update-status ${updateState.phase}`}>
+                  <span>{updateState.message}</span>
+                  {updateState.progress !== null && (
+                    <div className="update-progress" aria-label={`Progreso ${updateState.progress}%`}>
+                      <span style={{ width: `${updateState.progress}%` }} />
+                    </div>
+                  )}
+                </div>
+              )}
               <label className="settings-toggle">
                 <input type="checkbox" checked={showIconLabels} onChange={(event) => setShowIconLabels(event.target.checked)} />
                 <span />
@@ -529,7 +764,7 @@ function LeftFilters({
   library,
   allDesigns,
   filteredCount,
-  watching,
+  scanning,
   onQuickFilter,
   onClear,
 }: {
@@ -537,7 +772,7 @@ function LeftFilters({
   library: LibraryResponse | null;
   allDesigns: Design[];
   filteredCount: number;
-  watching: boolean;
+  scanning: boolean;
   onQuickFilter: (filter: QuickFilter) => void;
   onClear: () => void;
 }) {
@@ -570,8 +805,8 @@ function LeftFilters({
       </div>
 
       <div className="left-status">
-        <div className={watching ? "pulse active" : "pulse"} />
-        <span>{watching ? "Autoescaneo activo" : "Autoescaneo inactivo"}</span>
+        <div className={scanning ? "pulse active" : "pulse"} />
+        <span>{scanning ? "Escaneando biblioteca" : "Escaneo manual"}</span>
       </div>
       <div className="result-count">{filteredCount.toLocaleString("es-AR")} visibles</div>
       <div className="side-icons">
@@ -602,7 +837,7 @@ function Viewer({
   onOpenFolder: (design: Design) => void;
   onRevealFile: (design: Design) => void;
 }) {
-  const preview = design?.previewPath ? convertFileSrc(design.previewPath) : null;
+  const preview = design?.previewCachePath ? convertFileSrc(design.previewCachePath) : null;
   const previewFile = design?.files.find((file) => file.path === design.previewPath) ?? design?.files[0] ?? null;
   const imageCount = design ? countForExtension(design, ".jpg") + countForExtension(design, ".jpeg") + countForExtension(design, ".png") + countForExtension(design, ".webp") : 0;
 
@@ -620,6 +855,11 @@ function Viewer({
           </div>
         ) : preview ? (
           <img src={preview} alt={design?.name ?? "Estampa"} style={{ transform: `scale(${zoom / 100})` }} />
+        ) : design?.previewPath ? (
+          <div className="viewer-empty">
+            <Loader2 className="spin" size={34} />
+            <span>Preparando preview</span>
+          </div>
         ) : (
           <div className="viewer-empty">
             <ImageOff size={42} />
@@ -691,6 +931,12 @@ function AssetPill({ label, value, tone }: { label: string; value: number; tone:
 
 function RightRail({
   designs,
+  totalCount,
+  pageStart,
+  pageEnd,
+  pageIndex,
+  totalPages,
+  isChangingPage,
   selectedId,
   filters,
   setFilters,
@@ -698,8 +944,15 @@ function RightRail({
   setThumbMode,
   onSelect,
   onFavorite,
+  onPageChange,
 }: {
   designs: Design[];
+  totalCount: number;
+  pageStart: number;
+  pageEnd: number;
+  pageIndex: number;
+  totalPages: number;
+  isChangingPage: boolean;
   selectedId: string | null;
   filters: Filters;
   setFilters: React.Dispatch<React.SetStateAction<Filters>>;
@@ -707,10 +960,14 @@ function RightRail({
   setThumbMode: (mode: "compact" | "grid" | "list") => void;
   onSelect: (id: string) => void;
   onFavorite: (design: Design, favorite: boolean) => void;
+  onPageChange: (pageIndex: number) => void;
 }) {
   const parentRef = useRef<HTMLDivElement | null>(null);
-  const selectedIndex = Math.max(0, designs.findIndex((design) => design.id === selectedId));
+  const previousSelectedId = useRef<string | null>(null);
+  const selectedIndex = designs.findIndex((design) => design.id === selectedId);
   const rowHeight = thumbMode === "grid" ? 112 : thumbMode === "list" ? 76 : 88;
+  const canGoPrevious = pageIndex > 0;
+  const canGoNext = pageIndex < totalPages - 1;
   const virtualizer = useVirtualizer({
     count: designs.length,
     getScrollElement: () => parentRef.current,
@@ -720,10 +977,15 @@ function RightRail({
   });
 
   useEffect(() => {
-    if (selectedId && designs.length > 0) {
+    if (selectedId && previousSelectedId.current !== selectedId && selectedIndex >= 0) {
       virtualizer.scrollToIndex(selectedIndex, { align: "center" });
     }
-  }, [designs.length, selectedId, selectedIndex, virtualizer]);
+    previousSelectedId.current = selectedId;
+  }, [selectedId, selectedIndex, virtualizer]);
+
+  useEffect(() => {
+    parentRef.current?.scrollTo({ top: 0 });
+  }, [pageStart, thumbMode]);
 
   return (
     <aside className="right-rail">
@@ -778,6 +1040,37 @@ function RightRail({
             })}
           </div>
         )}
+      </div>
+
+      <div className="load-more-panel">
+        <strong>
+          {totalCount === 0
+            ? "Mostrando 0 de 0"
+            : `Mostrando ${(pageStart + 1).toLocaleString("es-AR")}-${pageEnd.toLocaleString("es-AR")} de ${totalCount.toLocaleString("es-AR")}`}
+        </strong>
+        <small>
+          Pagina {(pageIndex + 1).toLocaleString("es-AR")} de {totalPages.toLocaleString("es-AR")}
+        </small>
+        <div className="page-buttons">
+          <button onClick={() => onPageChange(pageIndex - 1)} disabled={!canGoPrevious || isChangingPage}>
+            <ChevronLeft size={16} />
+            Anteriores 50
+          </button>
+          <button onClick={() => onPageChange(pageIndex + 1)} disabled={!canGoNext || isChangingPage}>
+            {isChangingPage ? (
+              <>
+                <Loader2 size={16} className="spin" />
+                Cargando...
+              </>
+            ) : (
+              <>
+                Siguientes 50
+                <ChevronRight size={16} />
+              </>
+            )}
+          </button>
+        </div>
+        {!canGoNext && <span>No hay mas paginas para cargar</span>}
       </div>
     </aside>
   );

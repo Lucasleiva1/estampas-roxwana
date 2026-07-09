@@ -19,6 +19,8 @@
     "opener:allow-open-path",
     "fs:allow-watch",
     "fs:allow-unwatch",
-    "sql:default"
+    "sql:default",
+    "updater:default",
+    "process:default"
   ]
 }

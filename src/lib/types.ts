@@ -40,6 +40,7 @@ export interface Design {
   directory: string;
   groupType: "folder" | "loose_file";
   previewPath: string | null;
+  previewCachePath?: string | null;
   thumbnailPath: string | null;
   totalFiles: number;
   updatedAt: number;

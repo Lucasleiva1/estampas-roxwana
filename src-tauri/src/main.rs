@@ -46,6 +46,7 @@ struct Design {
     directory: String,
     group_type: String,
     preview_path: Option<String>,
+    preview_cache_path: Option<String>,
     thumbnail_path: Option<String>,
     total_files: usize,
     updated_at: i64,
@@ -100,8 +101,10 @@ struct CollectedDesign {
     directory: PathBuf,
     group_type: String,
     preview_path: Option<PathBuf>,
+    preview_cache_path: Option<PathBuf>,
     thumbnail_path: Option<PathBuf>,
     files: Vec<DesignFile>,
+    #[allow(dead_code)]
     counts: SupportCounts,
     updated_at: i64,
     auto_category: Option<String>,
@@ -122,8 +125,22 @@ fn get_initial_state(app: AppHandle) -> Result<LibraryResponse, String> {
     let conn = open_database(&app)?;
     ensure_database(&conn)?;
     let root = get_setting(&conn, "library_root")?.unwrap_or_else(|| DEFAULT_LIBRARY_PATH.to_string());
-    drop(conn);
-    scan_library_impl(&app, &root)
+    load_library_from_db(&conn, &root)
+}
+
+#[tauri::command]
+fn get_library_from_db(app: AppHandle) -> Result<LibraryResponse, String> {
+    let conn = open_database(&app)?;
+    ensure_database(&conn)?;
+    let root = get_setting(&conn, "library_root")?.unwrap_or_else(|| DEFAULT_LIBRARY_PATH.to_string());
+    load_library_from_db(&conn, &root)
+}
+
+#[tauri::command]
+fn get_design_detail(app: AppHandle, design_id: String) -> Result<Option<Design>, String> {
+    let conn = open_database(&app)?;
+    ensure_database(&conn)?;
+    load_design_from_db(&conn, &design_id, true)
 }
 
 #[tauri::command]
@@ -133,26 +150,55 @@ fn scan_library(app: AppHandle, root_path: String) -> Result<LibraryResponse, St
 
 #[tauri::command]
 fn rescan_paths(app: AppHandle, root_path: String, paths: Vec<String>) -> Result<LibraryResponse, String> {
-    let _ = paths;
-    scan_library_impl(&app, &root_path)
+    if paths.is_empty() || paths.len() > 80 {
+        return scan_library_impl(&app, &root_path);
+    }
+
+    rescan_paths_impl(&app, &root_path, &paths)
 }
 
 #[tauri::command]
-fn generate_thumbnail(app: AppHandle, preview_path: String, updated_at: i64) -> Result<Option<String>, String> {
-    let path = PathBuf::from(&preview_path);
-    let thumbnail = ensure_thumbnail(&app, Some(&path), updated_at)?;
+async fn generate_thumbnail(app: AppHandle, preview_path: String, updated_at: i64) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = PathBuf::from(&preview_path);
+        let thumbnail = ensure_thumbnail(&app, Some(&path), updated_at)?;
 
-    if let Some(thumbnail_path) = &thumbnail {
-        let conn = open_database(&app)?;
-        ensure_database(&conn)?;
-        conn.execute(
-            "UPDATE designs SET thumbnail_path = ?1 WHERE preview_path = ?2",
-            params![path_to_string(thumbnail_path), preview_path],
-        )
-        .map_err(to_string)?;
-    }
+        if let Some(thumbnail_path) = &thumbnail {
+            let conn = open_database(&app)?;
+            ensure_database(&conn)?;
+            conn.execute(
+                "UPDATE designs SET thumbnail_path = ?1 WHERE preview_path = ?2",
+                params![path_to_string(thumbnail_path), preview_path],
+            )
+            .map_err(to_string)?;
+        }
 
-    Ok(thumbnail.map(|path| path_to_string(&path)))
+        Ok(thumbnail.map(|path| path_to_string(&path)))
+    })
+    .await
+    .map_err(to_string)?
+}
+
+#[tauri::command]
+async fn generate_preview(app: AppHandle, preview_path: String, updated_at: i64) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = PathBuf::from(&preview_path);
+        let preview = ensure_preview_cache(&app, Some(&path), updated_at)?;
+
+        if let Some(preview_cache_path) = &preview {
+            let conn = open_database(&app)?;
+            ensure_database(&conn)?;
+            conn.execute(
+                "UPDATE designs SET preview_cache_path = ?1 WHERE preview_path = ?2",
+                params![path_to_string(preview_cache_path), preview_path],
+            )
+            .map_err(to_string)?;
+        }
+
+        Ok(preview.map(|path| path_to_string(&path)))
+    })
+    .await
+    .map_err(to_string)?
 }
 
 #[tauri::command]
@@ -307,18 +353,96 @@ fn scan_library_impl(app: &AppHandle, root_path: &str) -> Result<LibraryResponse
     let mut collected = collect_designs(&root)?;
     for design in &mut collected {
         design.thumbnail_path = cached_thumbnail(app, design.preview_path.as_deref(), design.updated_at)?;
+        design.preview_cache_path = cached_preview(app, design.preview_path.as_deref(), design.updated_at)?;
         persist_design(&conn, design)?;
         sync_auto_tags(&conn, &design.id, &design.auto_tags)?;
     }
 
-    let designs = collected
-        .into_iter()
-        .map(|design| design_with_classification(&conn, design))
-        .collect::<Result<Vec<_>, _>>()?;
+    load_library_from_db(&conn, root_path)
+}
 
-    let stats = build_stats(&conn, &designs)?;
-    let categories = load_categories(&conn)?;
-    let tags = load_tags(&conn)?;
+fn rescan_paths_impl(app: &AppHandle, root_path: &str, paths: &[String]) -> Result<LibraryResponse, String> {
+    let root = PathBuf::from(root_path);
+    if !root.exists() {
+        return Err(format!("La carpeta no existe: {root_path}"));
+    }
+
+    let mut affected_dirs = BTreeSet::new();
+    let mut needs_full_scan = false;
+    for path in paths {
+        let path = PathBuf::from(path);
+        let target = if path.is_dir() {
+            path
+        } else {
+            path.parent().map(Path::to_path_buf).unwrap_or_else(|| root.clone())
+        };
+
+        if same_path(&target, &root) {
+            needs_full_scan = true;
+            break;
+        }
+
+        if target.starts_with(&root) {
+            affected_dirs.insert(target);
+        }
+    }
+
+    if needs_full_scan || affected_dirs.is_empty() {
+        return scan_library_impl(app, root_path);
+    }
+
+    let conn = open_database(app)?;
+    ensure_database(&conn)?;
+    save_setting(&conn, "library_root", root_path)?;
+
+    for dir in &affected_dirs {
+        let dir_string = path_to_string(dir);
+        conn.execute("UPDATE designs SET missing = 1 WHERE directory = ?1", params![dir_string])
+            .map_err(to_string)?;
+        conn.execute(
+            "UPDATE files SET missing = 1 WHERE design_id IN (SELECT id FROM designs WHERE directory = ?1)",
+            params![path_to_string(dir)],
+        )
+        .map_err(to_string)?;
+    }
+
+    let walk_roots = affected_dirs.into_iter().collect::<Vec<_>>();
+    let mut collected = collect_designs_from_walk_roots(&root, &walk_roots)?;
+    for design in &mut collected {
+        design.thumbnail_path = cached_thumbnail(app, design.preview_path.as_deref(), design.updated_at)?;
+        design.preview_cache_path = cached_preview(app, design.preview_path.as_deref(), design.updated_at)?;
+        persist_design(&conn, design)?;
+        sync_auto_tags(&conn, &design.id, &design.auto_tags)?;
+    }
+
+    load_library_from_db(&conn, root_path)
+}
+
+fn load_library_from_db(conn: &Connection, root_path: &str) -> Result<LibraryResponse, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id
+             FROM designs
+             WHERE missing = 0
+             ORDER BY name COLLATE NOCASE",
+        )
+        .map_err(to_string)?;
+    let ids = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(to_string)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(to_string)?;
+
+    let mut designs = Vec::with_capacity(ids.len());
+    for id in ids {
+        if let Some(design) = load_design_from_db(conn, &id, false)? {
+            designs.push(design);
+        }
+    }
+
+    let stats = build_stats_from_db(conn)?;
+    let categories = load_categories(conn)?;
+    let tags = load_tags(conn)?;
 
     Ok(LibraryResponse {
         root_path: root_path.to_string(),
@@ -326,6 +450,189 @@ fn scan_library_impl(app: &AppHandle, root_path: &str) -> Result<LibraryResponse
         stats,
         categories,
         tags,
+    })
+}
+
+fn load_design_from_db(conn: &Connection, design_id: &str, include_files: bool) -> Result<Option<Design>, String> {
+    let row = conn
+        .query_row(
+            "SELECT id, name, path, directory, group_type, preview_path, preview_cache_path,
+                    thumbnail_path, total_files, updated_at, auto_category
+             FROM designs
+             WHERE id = ?1 AND missing = 0",
+            params![design_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(to_string)?;
+
+    let Some((id, name, path, directory, group_type, preview_path, preview_cache_path, thumbnail_path, total_files, updated_at, auto_category)) = row else {
+        return Ok(None);
+    };
+
+    let files = if include_files {
+        load_design_files(conn, &id)?
+    } else {
+        Vec::new()
+    };
+    let counts = load_support_counts(conn, &id)?;
+    let classification = load_classification(conn, &id)?;
+    let auto_tags = load_auto_tags(conn, &id)?;
+
+    Ok(Some(Design {
+        id,
+        name,
+        path,
+        directory,
+        group_type,
+        preview_path,
+        preview_cache_path,
+        thumbnail_path,
+        total_files: total_files as usize,
+        updated_at,
+        counts,
+        files,
+        classification,
+        auto_category,
+        auto_tags,
+    }))
+}
+
+fn load_design_files(conn: &Connection, design_id: &str) -> Result<Vec<DesignFile>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, design_id, path, file_name, extension, kind, size, modified
+             FROM files
+             WHERE design_id = ?1 AND missing = 0
+             ORDER BY file_name COLLATE NOCASE",
+        )
+        .map_err(to_string)?;
+    let files = stmt.query_map(params![design_id], |row| {
+        Ok(DesignFile {
+            id: row.get(0)?,
+            design_id: row.get(1)?,
+            path: row.get(2)?,
+            file_name: row.get(3)?,
+            extension: row.get(4)?,
+            kind: row.get(5)?,
+            size: row.get::<_, i64>(6)? as u64,
+            modified: row.get(7)?,
+        })
+    })
+    .map_err(to_string)?
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(to_string)?;
+    Ok(files)
+}
+
+fn load_support_counts(conn: &Connection, design_id: &str) -> Result<SupportCounts, String> {
+    let mut counts = SupportCounts::default();
+    let mut stmt = conn
+        .prepare(
+            "SELECT extension, COUNT(*)
+             FROM files
+             WHERE design_id = ?1 AND missing = 0
+             GROUP BY extension",
+        )
+        .map_err(to_string)?;
+    let rows = stmt
+        .query_map(params![design_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+        .map_err(to_string)?;
+
+    for row in rows {
+        let (extension, count) = row.map_err(to_string)?;
+        let count = count as usize;
+        match extension.as_str() {
+            ".ai" => counts.ai = count,
+            ".psd" => counts.psd = count,
+            ".svg" => counts.svg = count,
+            ".pdf" => counts.pdf = count,
+            ".eps" => counts.eps = count,
+            ".zip" => counts.zip = count,
+            ".txt" => counts.txt = count,
+            extension if SUPPORT_EXTENSIONS.contains(&extension) => counts.other += count,
+            _ => {}
+        }
+    }
+
+    Ok(counts)
+}
+
+fn load_auto_tags(conn: &Connection, design_id: &str) -> Result<Vec<String>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT tags.name
+             FROM tags
+             INNER JOIN design_tags ON design_tags.tag_id = tags.id
+             WHERE design_tags.design_id = ?1 AND design_tags.source = 'auto'
+             ORDER BY tags.name COLLATE NOCASE",
+        )
+        .map_err(to_string)?;
+    let tags = stmt.query_map(params![design_id], |row| row.get::<_, String>(0))
+        .map_err(to_string)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(to_string)?;
+    Ok(tags)
+}
+
+fn build_stats_from_db(conn: &Connection) -> Result<LibraryStats, String> {
+    let designs = conn
+        .query_row("SELECT COUNT(*) FROM designs WHERE missing = 0", [], |row| row.get::<_, i64>(0))
+        .map_err(to_string)? as usize;
+    let missing = conn
+        .query_row("SELECT COUNT(*) FROM designs WHERE missing = 1", [], |row| row.get::<_, i64>(0))
+        .map_err(to_string)? as usize;
+
+    let mut by_extension = BTreeMap::new();
+    let mut previews = 0usize;
+    let mut support = 0usize;
+    let mut files = 0usize;
+    let mut stmt = conn
+        .prepare(
+            "SELECT files.extension, files.kind, COUNT(*)
+             FROM files
+             INNER JOIN designs ON designs.id = files.design_id
+             WHERE files.missing = 0 AND designs.missing = 0
+             GROUP BY files.extension, files.kind",
+        )
+        .map_err(to_string)?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?)))
+        .map_err(to_string)?;
+
+    for row in rows {
+        let (extension, kind, count) = row.map_err(to_string)?;
+        let count = count as usize;
+        *by_extension.entry(extension).or_insert(0) += count;
+        files += count;
+        if kind == "preview" {
+            previews += count;
+        } else {
+            support += count;
+        }
+    }
+
+    Ok(LibraryStats {
+        designs,
+        files,
+        previews,
+        support,
+        missing,
+        by_extension,
     })
 }
 
@@ -372,6 +679,7 @@ fn ensure_database(conn: &Connection) -> Result<(), String> {
             directory TEXT NOT NULL,
             group_type TEXT NOT NULL,
             preview_path TEXT,
+            preview_cache_path TEXT,
             thumbnail_path TEXT,
             total_files INTEGER NOT NULL DEFAULT 0,
             updated_at INTEGER NOT NULL DEFAULT 0,
@@ -423,6 +731,16 @@ fn ensure_database(conn: &Connection) -> Result<(), String> {
     )
     .map_err(to_string)?;
 
+    conn.execute("ALTER TABLE designs ADD COLUMN preview_cache_path TEXT", [])
+        .or_else(|error| {
+            if error.to_string().contains("duplicate column name") {
+                Ok(0)
+            } else {
+                Err(error)
+            }
+        })
+        .map_err(to_string)?;
+
     seed_categories(conn)?;
     Ok(())
 }
@@ -468,83 +786,93 @@ fn seed_categories(conn: &Connection) -> Result<(), String> {
 }
 
 fn collect_designs(root: &Path) -> Result<Vec<CollectedDesign>, String> {
+    collect_designs_from_walk_roots(root, &[root.to_path_buf()])
+}
+
+fn collect_designs_from_walk_roots(root: &Path, walk_roots: &[PathBuf]) -> Result<Vec<CollectedDesign>, String> {
     let mut groups: BTreeMap<String, GroupBuilder> = BTreeMap::new();
     let root = root.to_path_buf();
 
-    for entry in WalkDir::new(&root).follow_links(false).into_iter() {
-        let entry = entry.map_err(to_string)?;
-        if !entry.file_type().is_file() {
+    for walk_root in walk_roots {
+        if !walk_root.exists() {
             continue;
         }
 
-        let path = entry.path().to_path_buf();
-        let extension = extension_for(&path);
-        if !is_supported_extension(&extension) {
-            continue;
-        }
+        for entry in WalkDir::new(walk_root).follow_links(false).into_iter() {
+            let entry = entry.map_err(to_string)?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
 
-        let parent = path.parent().unwrap_or(&root).to_path_buf();
-        let file_stem = path
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .unwrap_or("sin-nombre")
-            .to_string();
-        let (key, key_path, directory, group_type, name) = if same_path(&parent, &root) {
-            let key_path = root.join(&file_stem);
-            (
-                format!("root:{}", file_stem.to_lowercase()),
-                key_path,
-                root.clone(),
-                "loose_file".to_string(),
-                title_from_slug(&file_stem),
-            )
-        } else {
-            let dir_name = parent
-                .file_name()
+            let path = entry.path().to_path_buf();
+            let extension = extension_for(&path);
+            if !is_supported_extension(&extension) {
+                continue;
+            }
+
+            let parent = path.parent().unwrap_or(&root).to_path_buf();
+            let file_stem = path
+                .file_stem()
                 .and_then(|value| value.to_str())
                 .unwrap_or("sin-nombre")
                 .to_string();
-            (
-                normalize_path_for_id(&parent),
-                parent.clone(),
-                parent.clone(),
-                "folder".to_string(),
-                title_from_slug(&dir_name),
-            )
-        };
+            let (key, key_path, directory, group_type, name) = if same_path(&parent, &root) {
+                let key_path = root.join(&file_stem);
+                (
+                    format!("root:{}", file_stem.to_lowercase()),
+                    key_path,
+                    root.clone(),
+                    "loose_file".to_string(),
+                    title_from_slug(&file_stem),
+                )
+            } else {
+                let dir_name = parent
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("sin-nombre")
+                    .to_string();
+                (
+                    normalize_path_for_id(&parent),
+                    parent.clone(),
+                    parent.clone(),
+                    "folder".to_string(),
+                    title_from_slug(&dir_name),
+                )
+            };
 
-        let metadata = fs::metadata(&path).map_err(to_string)?;
-        let modified = metadata
-            .modified()
-            .ok()
-            .and_then(system_time_to_i64)
-            .unwrap_or(0);
-        let file = DesignFile {
-            id: stable_id(&normalize_path_for_id(&path)),
-            design_id: String::new(),
-            path: path_to_string(&path),
-            file_name: path
-                .file_name()
-                .and_then(|value| value.to_str())
-                .unwrap_or("archivo")
-                .to_string(),
-            extension: extension.clone(),
-            kind: kind_for_extension(&extension).to_string(),
-            size: metadata.len(),
-            modified,
-        };
+            let metadata = fs::metadata(&path).map_err(to_string)?;
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(system_time_to_i64)
+                .unwrap_or(0);
+            let file = DesignFile {
+                id: stable_id(&normalize_path_for_id(&path)),
+                design_id: String::new(),
+                path: path_to_string(&path),
+                file_name: path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("archivo")
+                    .to_string(),
+                extension: extension.clone(),
+                kind: kind_for_extension(&extension).to_string(),
+                size: metadata.len(),
+                modified,
+            };
 
-        groups
-            .entry(key)
-            .or_insert_with(|| GroupBuilder {
-                key_path,
-                directory,
-                group_type,
-                name,
-                files: Vec::new(),
-            })
-            .files
-            .push(file);
+            groups
+                .entry(key)
+                .or_insert_with(|| GroupBuilder {
+                    key_path,
+                    directory,
+                    group_type,
+                    name,
+                    files: Vec::new(),
+                })
+                .files
+                .push(file);
+        }
     }
 
     let mut designs = Vec::with_capacity(groups.len());
@@ -567,6 +895,7 @@ fn collect_designs(root: &Path) -> Result<Vec<CollectedDesign>, String> {
             directory: group.directory,
             group_type: group.group_type,
             preview_path,
+            preview_cache_path: None,
             thumbnail_path: None,
             files: group.files,
             counts,
@@ -626,21 +955,23 @@ fn persist_design(conn: &Connection, design: &CollectedDesign) -> Result<(), Str
     let path = path_to_string(&design.path);
     let directory = path_to_string(&design.directory);
     let preview_path = design.preview_path.as_ref().map(|path| path_to_string(path));
+    let preview_cache_path = design.preview_cache_path.as_ref().map(|path| path_to_string(path));
     let thumbnail_path = design.thumbnail_path.as_ref().map(|path| path_to_string(path));
 
     conn.execute(
         "INSERT INTO designs (
-            id, name, path, directory, group_type, preview_path, thumbnail_path, total_files,
+            id, name, path, directory, group_type, preview_path, preview_cache_path, thumbnail_path, total_files,
             updated_at, first_seen, last_seen, missing, favorite, status, category,
             category_user_set, auto_category
          )
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, 0, 0, 'pending', ?11, 0, ?11)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, 0, 0, 'pending', ?12, 0, ?12)
          ON CONFLICT(id) DO UPDATE SET
             name = excluded.name,
             path = excluded.path,
             directory = excluded.directory,
             group_type = excluded.group_type,
             preview_path = excluded.preview_path,
+            preview_cache_path = excluded.preview_cache_path,
             thumbnail_path = excluded.thumbnail_path,
             total_files = excluded.total_files,
             updated_at = excluded.updated_at,
@@ -658,6 +989,7 @@ fn persist_design(conn: &Connection, design: &CollectedDesign) -> Result<(), Str
             directory,
             design.group_type,
             preview_path,
+            preview_cache_path,
             thumbnail_path,
             design.files.len() as i64,
             design.updated_at,
@@ -699,27 +1031,6 @@ fn persist_design(conn: &Connection, design: &CollectedDesign) -> Result<(), Str
     }
 
     Ok(())
-}
-
-fn design_with_classification(conn: &Connection, design: CollectedDesign) -> Result<Design, String> {
-    let classification = load_classification(conn, &design.id)?;
-
-    Ok(Design {
-        id: design.id,
-        name: design.name,
-        path: path_to_string(&design.path),
-        directory: path_to_string(&design.directory),
-        group_type: design.group_type,
-        preview_path: design.preview_path.map(|path| path_to_string(&path)),
-        thumbnail_path: design.thumbnail_path.map(|path| path_to_string(&path)),
-        total_files: design.files.len(),
-        updated_at: design.updated_at,
-        counts: design.counts,
-        files: design.files,
-        classification,
-        auto_category: design.auto_category,
-        auto_tags: design.auto_tags,
-    })
 }
 
 fn load_classification(conn: &Connection, design_id: &str) -> Result<Classification, String> {
@@ -787,43 +1098,28 @@ fn sync_auto_tags(conn: &Connection, design_id: &str, auto_tags: &[String]) -> R
     Ok(())
 }
 
-fn build_stats(conn: &Connection, designs: &[Design]) -> Result<LibraryStats, String> {
-    let mut by_extension = BTreeMap::new();
-    let mut preview_count = 0;
-    let mut support_count = 0;
-    let mut file_count = 0;
-
-    for design in designs {
-        for file in &design.files {
-            *by_extension.entry(file.extension.clone()).or_insert(0) += 1;
-            file_count += 1;
-            if file.kind == "preview" {
-                preview_count += 1;
-            } else {
-                support_count += 1;
-            }
-        }
-    }
-
-    let missing = conn
-        .query_row("SELECT COUNT(*) FROM designs WHERE missing = 1", [], |row| row.get::<_, i64>(0))
-        .map_err(to_string)? as usize;
-
-    Ok(LibraryStats {
-        designs: designs.len(),
-        files: file_count,
-        previews: preview_count,
-        support: support_count,
-        missing,
-        by_extension,
-    })
-}
-
 fn cached_thumbnail(app: &AppHandle, preview_path: Option<&Path>, updated_at: i64) -> Result<Option<PathBuf>, String> {
     let Some(preview_path) = preview_path else {
         return Ok(None);
     };
-    let target = thumbnail_cache_path(app, preview_path, updated_at)?;
+    let target = image_cache_path(app, "thumbnails", preview_path, updated_at, "webp")?;
+    if target.exists() {
+        return Ok(Some(target));
+    }
+
+    let legacy_target = image_cache_path(app, "thumbnails", preview_path, updated_at, "jpg")?;
+    if legacy_target.exists() {
+        Ok(Some(legacy_target))
+    } else {
+        Ok(None)
+    }
+}
+
+fn cached_preview(app: &AppHandle, preview_path: Option<&Path>, updated_at: i64) -> Result<Option<PathBuf>, String> {
+    let Some(preview_path) = preview_path else {
+        return Ok(None);
+    };
+    let target = image_cache_path(app, "previews", preview_path, updated_at, "jpg")?;
     if target.exists() {
         Ok(Some(target))
     } else {
@@ -836,16 +1132,36 @@ fn ensure_thumbnail(app: &AppHandle, preview_path: Option<&Path>, updated_at: i6
         return Ok(None);
     };
 
-    let target = thumbnail_cache_path(app, preview_path, updated_at)?;
+    ensure_cached_image(app, "thumbnails", preview_path, updated_at, 320, image::ImageFormat::WebP, "webp")
+}
+
+fn ensure_preview_cache(app: &AppHandle, preview_path: Option<&Path>, updated_at: i64) -> Result<Option<PathBuf>, String> {
+    let Some(preview_path) = preview_path else {
+        return Ok(None);
+    };
+
+    ensure_cached_image(app, "previews", preview_path, updated_at, 1600, image::ImageFormat::Jpeg, "jpg")
+}
+
+fn ensure_cached_image(
+    app: &AppHandle,
+    cache_name: &str,
+    preview_path: &Path,
+    updated_at: i64,
+    max_side: u32,
+    format: image::ImageFormat,
+    extension: &str,
+) -> Result<Option<PathBuf>, String> {
+    let target = image_cache_path(app, cache_name, preview_path, updated_at, extension)?;
     if target.exists() {
         return Ok(Some(target));
     }
 
     match image::open(preview_path) {
         Ok(image) => {
-            let thumbnail = image.thumbnail(520, 520);
-            thumbnail
-                .save_with_format(&target, image::ImageFormat::Jpeg)
+            let cached = image.thumbnail(max_side, max_side);
+            cached
+                .save_with_format(&target, format)
                 .map_err(to_string)?;
             Ok(Some(target))
         }
@@ -853,7 +1169,7 @@ fn ensure_thumbnail(app: &AppHandle, preview_path: Option<&Path>, updated_at: i6
     }
 }
 
-fn thumbnail_cache_path(app: &AppHandle, preview_path: &Path, updated_at: i64) -> Result<PathBuf, String> {
+fn image_cache_path(app: &AppHandle, cache_name: &str, preview_path: &Path, updated_at: i64, extension: &str) -> Result<PathBuf, String> {
     let metadata = fs::metadata(preview_path).map_err(to_string)?;
     let cache_key = stable_id(&format!(
         "{}:{}:{}",
@@ -863,11 +1179,11 @@ fn thumbnail_cache_path(app: &AppHandle, preview_path: &Path, updated_at: i64) -
     ));
     let cache_dir = app
         .path()
-        .app_cache_dir()
-        .map_err(|error| format!("No se pudo resolver APPCACHE: {error}"))?
-        .join("thumbnails");
+        .app_local_data_dir()
+        .map_err(|error| format!("No se pudo resolver APPLOCALDATA: {error}"))?
+        .join(cache_name);
     fs::create_dir_all(&cache_dir).map_err(to_string)?;
-    Ok(cache_dir.join(format!("{cache_key}.jpg")))
+    Ok(cache_dir.join(format!("{cache_key}.{extension}")))
 }
 
 fn classify_design(name: &str, files: &[DesignFile]) -> (Option<String>, Vec<String>) {
@@ -1103,12 +1419,17 @@ fn main() {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_persisted_scope::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_sql::Builder::default().build())
         .invoke_handler(tauri::generate_handler![
             get_initial_state,
+            get_library_from_db,
+            get_design_detail,
             scan_library,
             rescan_paths,
             generate_thumbnail,
+            generate_preview,
             update_design_favorite,
             update_design_status,
             update_design_category,
