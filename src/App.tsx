@@ -475,9 +475,19 @@ export default function App() {
       });
       await relaunch();
     } catch (updateError) {
+      const message = String(updateError);
+      if (message.includes("valid release JSON") || message.includes("latest.json") || message.includes("404")) {
+        setUpdateState({
+          phase: "none",
+          message: "Todavia no hay una actualizacion publicada.",
+          progress: null,
+        });
+        return;
+      }
+
       setUpdateState({
         phase: "error",
-        message: `No se pudo actualizar: ${String(updateError)}`,
+        message: `No se pudo actualizar: ${message}`,
         progress: null,
       });
     }
@@ -837,7 +847,8 @@ function Viewer({
   onOpenFolder: (design: Design) => void;
   onRevealFile: (design: Design) => void;
 }) {
-  const preview = design?.previewCachePath ? convertFileSrc(design.previewCachePath) : null;
+  const previewPath = design?.previewCachePath ?? design?.previewPath ?? null;
+  const preview = previewPath ? convertFileSrc(previewPath) : null;
   const previewFile = design?.files.find((file) => file.path === design.previewPath) ?? design?.files[0] ?? null;
   const imageCount = design ? countForExtension(design, ".jpg") + countForExtension(design, ".jpeg") + countForExtension(design, ".png") + countForExtension(design, ".webp") : 0;
 
@@ -1089,7 +1100,8 @@ const ThumbCard = memo(function ThumbCard({
   onSelect: (id: string) => void;
   onFavorite: (design: Design, favorite: boolean) => void;
 }) {
-  const source = design.thumbnailPath ? convertFileSrc(design.thumbnailPath) : null;
+  const sourcePath = design.thumbnailPath ?? design.previewPath;
+  const source = sourcePath ? convertFileSrc(sourcePath) : null;
   const previewFile = design.files.find((file) => file.path === design.previewPath);
 
   return (

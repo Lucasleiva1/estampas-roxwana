@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -124,15 +126,26 @@ struct GroupBuilder {
 fn get_initial_state(app: AppHandle) -> Result<LibraryResponse, String> {
     let conn = open_database(&app)?;
     ensure_database(&conn)?;
-    let root = get_setting(&conn, "library_root")?.unwrap_or_else(|| DEFAULT_LIBRARY_PATH.to_string());
-    load_library_from_db(&conn, &root)
+    let root =
+        get_setting(&conn, "library_root")?.unwrap_or_else(|| DEFAULT_LIBRARY_PATH.to_string());
+    let should_scan = PathBuf::from(&root).exists() && active_design_count(&conn)? == 0;
+    drop(conn);
+
+    if should_scan {
+        scan_library_impl(&app, &root)
+    } else {
+        let conn = open_database(&app)?;
+        ensure_database(&conn)?;
+        load_library_from_db(&conn, &root)
+    }
 }
 
 #[tauri::command]
 fn get_library_from_db(app: AppHandle) -> Result<LibraryResponse, String> {
     let conn = open_database(&app)?;
     ensure_database(&conn)?;
-    let root = get_setting(&conn, "library_root")?.unwrap_or_else(|| DEFAULT_LIBRARY_PATH.to_string());
+    let root =
+        get_setting(&conn, "library_root")?.unwrap_or_else(|| DEFAULT_LIBRARY_PATH.to_string());
     load_library_from_db(&conn, &root)
 }
 
@@ -149,7 +162,11 @@ fn scan_library(app: AppHandle, root_path: String) -> Result<LibraryResponse, St
 }
 
 #[tauri::command]
-fn rescan_paths(app: AppHandle, root_path: String, paths: Vec<String>) -> Result<LibraryResponse, String> {
+fn rescan_paths(
+    app: AppHandle,
+    root_path: String,
+    paths: Vec<String>,
+) -> Result<LibraryResponse, String> {
     if paths.is_empty() || paths.len() > 80 {
         return scan_library_impl(&app, &root_path);
     }
@@ -158,7 +175,11 @@ fn rescan_paths(app: AppHandle, root_path: String, paths: Vec<String>) -> Result
 }
 
 #[tauri::command]
-async fn generate_thumbnail(app: AppHandle, preview_path: String, updated_at: i64) -> Result<Option<String>, String> {
+async fn generate_thumbnail(
+    app: AppHandle,
+    preview_path: String,
+    updated_at: i64,
+) -> Result<Option<String>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let path = PathBuf::from(&preview_path);
         let thumbnail = ensure_thumbnail(&app, Some(&path), updated_at)?;
@@ -180,7 +201,11 @@ async fn generate_thumbnail(app: AppHandle, preview_path: String, updated_at: i6
 }
 
 #[tauri::command]
-async fn generate_preview(app: AppHandle, preview_path: String, updated_at: i64) -> Result<Option<String>, String> {
+async fn generate_preview(
+    app: AppHandle,
+    preview_path: String,
+    updated_at: i64,
+) -> Result<Option<String>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let path = PathBuf::from(&preview_path);
         let preview = ensure_preview_cache(&app, Some(&path), updated_at)?;
@@ -230,7 +255,11 @@ fn update_design_status(app: AppHandle, design_id: String, status: String) -> Re
 }
 
 #[tauri::command]
-fn update_design_category(app: AppHandle, design_id: String, category: Option<String>) -> Result<(), String> {
+fn update_design_category(
+    app: AppHandle,
+    design_id: String,
+    category: Option<String>,
+) -> Result<(), String> {
     let conn = open_database(&app)?;
     ensure_database(&conn)?;
     let normalized = category.and_then(|value| {
@@ -347,13 +376,17 @@ fn scan_library_impl(app: &AppHandle, root_path: &str) -> Result<LibraryResponse
     let conn = open_database(app)?;
     ensure_database(&conn)?;
     save_setting(&conn, "library_root", root_path)?;
-    conn.execute("UPDATE designs SET missing = 1", []).map_err(to_string)?;
-    conn.execute("UPDATE files SET missing = 1", []).map_err(to_string)?;
+    conn.execute("UPDATE designs SET missing = 1", [])
+        .map_err(to_string)?;
+    conn.execute("UPDATE files SET missing = 1", [])
+        .map_err(to_string)?;
 
     let mut collected = collect_designs(&root)?;
     for design in &mut collected {
-        design.thumbnail_path = cached_thumbnail(app, design.preview_path.as_deref(), design.updated_at)?;
-        design.preview_cache_path = cached_preview(app, design.preview_path.as_deref(), design.updated_at)?;
+        design.thumbnail_path =
+            cached_thumbnail(app, design.preview_path.as_deref(), design.updated_at)?;
+        design.preview_cache_path =
+            cached_preview(app, design.preview_path.as_deref(), design.updated_at)?;
         persist_design(&conn, design)?;
         sync_auto_tags(&conn, &design.id, &design.auto_tags)?;
     }
@@ -361,7 +394,11 @@ fn scan_library_impl(app: &AppHandle, root_path: &str) -> Result<LibraryResponse
     load_library_from_db(&conn, root_path)
 }
 
-fn rescan_paths_impl(app: &AppHandle, root_path: &str, paths: &[String]) -> Result<LibraryResponse, String> {
+fn rescan_paths_impl(
+    app: &AppHandle,
+    root_path: &str,
+    paths: &[String],
+) -> Result<LibraryResponse, String> {
     let root = PathBuf::from(root_path);
     if !root.exists() {
         return Err(format!("La carpeta no existe: {root_path}"));
@@ -374,7 +411,9 @@ fn rescan_paths_impl(app: &AppHandle, root_path: &str, paths: &[String]) -> Resu
         let target = if path.is_dir() {
             path
         } else {
-            path.parent().map(Path::to_path_buf).unwrap_or_else(|| root.clone())
+            path.parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| root.clone())
         };
 
         if same_path(&target, &root) {
@@ -397,8 +436,11 @@ fn rescan_paths_impl(app: &AppHandle, root_path: &str, paths: &[String]) -> Resu
 
     for dir in &affected_dirs {
         let dir_string = path_to_string(dir);
-        conn.execute("UPDATE designs SET missing = 1 WHERE directory = ?1", params![dir_string])
-            .map_err(to_string)?;
+        conn.execute(
+            "UPDATE designs SET missing = 1 WHERE directory = ?1",
+            params![dir_string],
+        )
+        .map_err(to_string)?;
         conn.execute(
             "UPDATE files SET missing = 1 WHERE design_id IN (SELECT id FROM designs WHERE directory = ?1)",
             params![path_to_string(dir)],
@@ -409,8 +451,10 @@ fn rescan_paths_impl(app: &AppHandle, root_path: &str, paths: &[String]) -> Resu
     let walk_roots = affected_dirs.into_iter().collect::<Vec<_>>();
     let mut collected = collect_designs_from_walk_roots(&root, &walk_roots)?;
     for design in &mut collected {
-        design.thumbnail_path = cached_thumbnail(app, design.preview_path.as_deref(), design.updated_at)?;
-        design.preview_cache_path = cached_preview(app, design.preview_path.as_deref(), design.updated_at)?;
+        design.thumbnail_path =
+            cached_thumbnail(app, design.preview_path.as_deref(), design.updated_at)?;
+        design.preview_cache_path =
+            cached_preview(app, design.preview_path.as_deref(), design.updated_at)?;
         persist_design(&conn, design)?;
         sync_auto_tags(&conn, &design.id, &design.auto_tags)?;
     }
@@ -453,7 +497,11 @@ fn load_library_from_db(conn: &Connection, root_path: &str) -> Result<LibraryRes
     })
 }
 
-fn load_design_from_db(conn: &Connection, design_id: &str, include_files: bool) -> Result<Option<Design>, String> {
+fn load_design_from_db(
+    conn: &Connection,
+    design_id: &str,
+    include_files: bool,
+) -> Result<Option<Design>, String> {
     let row = conn
         .query_row(
             "SELECT id, name, path, directory, group_type, preview_path, preview_cache_path,
@@ -480,7 +528,20 @@ fn load_design_from_db(conn: &Connection, design_id: &str, include_files: bool) 
         .optional()
         .map_err(to_string)?;
 
-    let Some((id, name, path, directory, group_type, preview_path, preview_cache_path, thumbnail_path, total_files, updated_at, auto_category)) = row else {
+    let Some((
+        id,
+        name,
+        path,
+        directory,
+        group_type,
+        preview_path,
+        preview_cache_path,
+        thumbnail_path,
+        total_files,
+        updated_at,
+        auto_category,
+    )) = row
+    else {
         return Ok(None);
     };
 
@@ -521,21 +582,22 @@ fn load_design_files(conn: &Connection, design_id: &str) -> Result<Vec<DesignFil
              ORDER BY file_name COLLATE NOCASE",
         )
         .map_err(to_string)?;
-    let files = stmt.query_map(params![design_id], |row| {
-        Ok(DesignFile {
-            id: row.get(0)?,
-            design_id: row.get(1)?,
-            path: row.get(2)?,
-            file_name: row.get(3)?,
-            extension: row.get(4)?,
-            kind: row.get(5)?,
-            size: row.get::<_, i64>(6)? as u64,
-            modified: row.get(7)?,
+    let files = stmt
+        .query_map(params![design_id], |row| {
+            Ok(DesignFile {
+                id: row.get(0)?,
+                design_id: row.get(1)?,
+                path: row.get(2)?,
+                file_name: row.get(3)?,
+                extension: row.get(4)?,
+                kind: row.get(5)?,
+                size: row.get::<_, i64>(6)? as u64,
+                modified: row.get(7)?,
+            })
         })
-    })
-    .map_err(to_string)?
-    .collect::<Result<Vec<_>, _>>()
-    .map_err(to_string)?;
+        .map_err(to_string)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(to_string)?;
     Ok(files)
 }
 
@@ -550,7 +612,9 @@ fn load_support_counts(conn: &Connection, design_id: &str) -> Result<SupportCoun
         )
         .map_err(to_string)?;
     let rows = stmt
-        .query_map(params![design_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+        .query_map(params![design_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
         .map_err(to_string)?;
 
     for row in rows {
@@ -582,7 +646,8 @@ fn load_auto_tags(conn: &Connection, design_id: &str) -> Result<Vec<String>, Str
              ORDER BY tags.name COLLATE NOCASE",
         )
         .map_err(to_string)?;
-    let tags = stmt.query_map(params![design_id], |row| row.get::<_, String>(0))
+    let tags = stmt
+        .query_map(params![design_id], |row| row.get::<_, String>(0))
         .map_err(to_string)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(to_string)?;
@@ -591,10 +656,18 @@ fn load_auto_tags(conn: &Connection, design_id: &str) -> Result<Vec<String>, Str
 
 fn build_stats_from_db(conn: &Connection) -> Result<LibraryStats, String> {
     let designs = conn
-        .query_row("SELECT COUNT(*) FROM designs WHERE missing = 0", [], |row| row.get::<_, i64>(0))
+        .query_row(
+            "SELECT COUNT(*) FROM designs WHERE missing = 0",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
         .map_err(to_string)? as usize;
     let missing = conn
-        .query_row("SELECT COUNT(*) FROM designs WHERE missing = 1", [], |row| row.get::<_, i64>(0))
+        .query_row(
+            "SELECT COUNT(*) FROM designs WHERE missing = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
         .map_err(to_string)? as usize;
 
     let mut by_extension = BTreeMap::new();
@@ -611,7 +684,13 @@ fn build_stats_from_db(conn: &Connection) -> Result<LibraryStats, String> {
         )
         .map_err(to_string)?;
     let rows = stmt
-        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?)))
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
         .map_err(to_string)?;
 
     for row in rows {
@@ -634,6 +713,16 @@ fn build_stats_from_db(conn: &Connection) -> Result<LibraryStats, String> {
         missing,
         by_extension,
     })
+}
+
+fn active_design_count(conn: &Connection) -> Result<usize, String> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM designs WHERE missing = 0",
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|count| count as usize)
+    .map_err(to_string)
 }
 
 fn open_database(app: &AppHandle) -> Result<Connection, String> {
@@ -789,7 +878,10 @@ fn collect_designs(root: &Path) -> Result<Vec<CollectedDesign>, String> {
     collect_designs_from_walk_roots(root, &[root.to_path_buf()])
 }
 
-fn collect_designs_from_walk_roots(root: &Path, walk_roots: &[PathBuf]) -> Result<Vec<CollectedDesign>, String> {
+fn collect_designs_from_walk_roots(
+    root: &Path,
+    walk_roots: &[PathBuf],
+) -> Result<Vec<CollectedDesign>, String> {
     let mut groups: BTreeMap<String, GroupBuilder> = BTreeMap::new();
     let root = root.to_path_buf();
 
@@ -877,7 +969,9 @@ fn collect_designs_from_walk_roots(root: &Path, walk_roots: &[PathBuf]) -> Resul
 
     let mut designs = Vec::with_capacity(groups.len());
     for (_, mut group) in groups {
-        group.files.sort_by(|left, right| left.file_name.cmp(&right.file_name));
+        group
+            .files
+            .sort_by(|left, right| left.file_name.cmp(&right.file_name));
         let design_id = stable_id(&normalize_path_for_id(&group.key_path));
         for file in &mut group.files {
             file.design_id = design_id.clone();
@@ -885,7 +979,12 @@ fn collect_designs_from_walk_roots(root: &Path, walk_roots: &[PathBuf]) -> Resul
 
         let preview_path = choose_preview(&group.files).map(PathBuf::from);
         let counts = build_counts(&group.files);
-        let updated_at = group.files.iter().map(|file| file.modified).max().unwrap_or(0);
+        let updated_at = group
+            .files
+            .iter()
+            .map(|file| file.modified)
+            .max()
+            .unwrap_or(0);
         let (auto_category, auto_tags) = classify_design(&group.name, &group.files);
 
         designs.push(CollectedDesign {
@@ -954,9 +1053,18 @@ fn persist_design(conn: &Connection, design: &CollectedDesign) -> Result<(), Str
     let now = now_i64();
     let path = path_to_string(&design.path);
     let directory = path_to_string(&design.directory);
-    let preview_path = design.preview_path.as_ref().map(|path| path_to_string(path));
-    let preview_cache_path = design.preview_cache_path.as_ref().map(|path| path_to_string(path));
-    let thumbnail_path = design.thumbnail_path.as_ref().map(|path| path_to_string(path));
+    let preview_path = design
+        .preview_path
+        .as_ref()
+        .map(|path| path_to_string(path));
+    let preview_cache_path = design
+        .preview_cache_path
+        .as_ref()
+        .map(|path| path_to_string(path));
+    let thumbnail_path = design
+        .thumbnail_path
+        .as_ref()
+        .map(|path| path_to_string(path));
 
     conn.execute(
         "INSERT INTO designs (
@@ -1098,7 +1206,11 @@ fn sync_auto_tags(conn: &Connection, design_id: &str, auto_tags: &[String]) -> R
     Ok(())
 }
 
-fn cached_thumbnail(app: &AppHandle, preview_path: Option<&Path>, updated_at: i64) -> Result<Option<PathBuf>, String> {
+fn cached_thumbnail(
+    app: &AppHandle,
+    preview_path: Option<&Path>,
+    updated_at: i64,
+) -> Result<Option<PathBuf>, String> {
     let Some(preview_path) = preview_path else {
         return Ok(None);
     };
@@ -1115,7 +1227,11 @@ fn cached_thumbnail(app: &AppHandle, preview_path: Option<&Path>, updated_at: i6
     }
 }
 
-fn cached_preview(app: &AppHandle, preview_path: Option<&Path>, updated_at: i64) -> Result<Option<PathBuf>, String> {
+fn cached_preview(
+    app: &AppHandle,
+    preview_path: Option<&Path>,
+    updated_at: i64,
+) -> Result<Option<PathBuf>, String> {
     let Some(preview_path) = preview_path else {
         return Ok(None);
     };
@@ -1127,20 +1243,44 @@ fn cached_preview(app: &AppHandle, preview_path: Option<&Path>, updated_at: i64)
     }
 }
 
-fn ensure_thumbnail(app: &AppHandle, preview_path: Option<&Path>, updated_at: i64) -> Result<Option<PathBuf>, String> {
+fn ensure_thumbnail(
+    app: &AppHandle,
+    preview_path: Option<&Path>,
+    updated_at: i64,
+) -> Result<Option<PathBuf>, String> {
     let Some(preview_path) = preview_path else {
         return Ok(None);
     };
 
-    ensure_cached_image(app, "thumbnails", preview_path, updated_at, 320, image::ImageFormat::WebP, "webp")
+    ensure_cached_image(
+        app,
+        "thumbnails",
+        preview_path,
+        updated_at,
+        320,
+        image::ImageFormat::WebP,
+        "webp",
+    )
 }
 
-fn ensure_preview_cache(app: &AppHandle, preview_path: Option<&Path>, updated_at: i64) -> Result<Option<PathBuf>, String> {
+fn ensure_preview_cache(
+    app: &AppHandle,
+    preview_path: Option<&Path>,
+    updated_at: i64,
+) -> Result<Option<PathBuf>, String> {
     let Some(preview_path) = preview_path else {
         return Ok(None);
     };
 
-    ensure_cached_image(app, "previews", preview_path, updated_at, 1600, image::ImageFormat::Jpeg, "jpg")
+    ensure_cached_image(
+        app,
+        "previews",
+        preview_path,
+        updated_at,
+        1600,
+        image::ImageFormat::Jpeg,
+        "jpg",
+    )
 }
 
 fn ensure_cached_image(
@@ -1169,7 +1309,13 @@ fn ensure_cached_image(
     }
 }
 
-fn image_cache_path(app: &AppHandle, cache_name: &str, preview_path: &Path, updated_at: i64, extension: &str) -> Result<PathBuf, String> {
+fn image_cache_path(
+    app: &AppHandle,
+    cache_name: &str,
+    preview_path: &Path,
+    updated_at: i64,
+    extension: &str,
+) -> Result<PathBuf, String> {
     let metadata = fs::metadata(preview_path).map_err(to_string)?;
     let cache_key = stable_id(&format!(
         "{}:{}:{}",
@@ -1207,28 +1353,176 @@ fn classify_design(name: &str, files: &[DesignFile]) -> (Option<String>, Vec<Str
         }
     };
 
-    rule(&["skate", "skater", "skateboard", "longboard"], "Skater", &["skate", "skater", "urbano"]);
-    rule(&["skull", "calavera", "dead", "death", "skeleton", "muertos"], "Calaveras", &["calavera"]);
-    rule(&["surf", "surfer", "wave", "beach", "summer", "tropical", "palms"], "Surf y playa", &["surf", "playa"]);
-    rule(&["dog", "cat", "tiger", "lion", "bear", "wolf", "panther", "shark", "crocodile", "frog", "eagle", "raven", "moth", "butterfly", "animal", "axolotl", "whale", "vulture", "turtle"], "Animales", &["animales"]);
-    rule(&["man", "men", "male", "boy", "father", "cowboy", "professor", "rider", "biker"], "Hombre", &["hombre"]);
-    rule(&["woman", "women", "female", "girl", "mother", "mujer"], "Mujer", &["mujer"]);
-    rule(&["motorcycle", "bike", "biker", "cafe-racer", "ride"], "Motos", &["motos"]);
-    rule(&["rock", "punk", "metal", "guitar"], "Rock", &["rock", "musica"]);
-    rule(&["music", "musician", "trumpet", "reggae", "cumbia", "reggaeton", "bachata", "album"], "Musica", &["musica"]);
-    rule(&["quote", "motivational", "lettering", "typography", "slogan", "frase"], "Frases", &["frases", "tipografia"]);
-    rule(&["gothic", "occult", "raven", "dark", "graveyard"], "Gotico", &["gotico"]);
-    rule(&["retro", "vintage", "80s", "y2k", "neon", "pop-art"], "Retro", &["retro", "vintage"]);
-    rule(&["flower", "nature", "sun", "moon", "desert", "cactus", "climate"], "Naturaleza", &["naturaleza"]);
+    rule(
+        &["skate", "skater", "skateboard", "longboard"],
+        "Skater",
+        &["skate", "skater", "urbano"],
+    );
+    rule(
+        &["skull", "calavera", "dead", "death", "skeleton", "muertos"],
+        "Calaveras",
+        &["calavera"],
+    );
+    rule(
+        &[
+            "surf", "surfer", "wave", "beach", "summer", "tropical", "palms",
+        ],
+        "Surf y playa",
+        &["surf", "playa"],
+    );
+    rule(
+        &[
+            "dog",
+            "cat",
+            "tiger",
+            "lion",
+            "bear",
+            "wolf",
+            "panther",
+            "shark",
+            "crocodile",
+            "frog",
+            "eagle",
+            "raven",
+            "moth",
+            "butterfly",
+            "animal",
+            "axolotl",
+            "whale",
+            "vulture",
+            "turtle",
+        ],
+        "Animales",
+        &["animales"],
+    );
+    rule(
+        &[
+            "man",
+            "men",
+            "male",
+            "boy",
+            "father",
+            "cowboy",
+            "professor",
+            "rider",
+            "biker",
+        ],
+        "Hombre",
+        &["hombre"],
+    );
+    rule(
+        &["woman", "women", "female", "girl", "mother", "mujer"],
+        "Mujer",
+        &["mujer"],
+    );
+    rule(
+        &["motorcycle", "bike", "biker", "cafe-racer", "ride"],
+        "Motos",
+        &["motos"],
+    );
+    rule(
+        &["rock", "punk", "metal", "guitar"],
+        "Rock",
+        &["rock", "musica"],
+    );
+    rule(
+        &[
+            "music",
+            "musician",
+            "trumpet",
+            "reggae",
+            "cumbia",
+            "reggaeton",
+            "bachata",
+            "album",
+        ],
+        "Musica",
+        &["musica"],
+    );
+    rule(
+        &[
+            "quote",
+            "motivational",
+            "lettering",
+            "typography",
+            "slogan",
+            "frase",
+        ],
+        "Frases",
+        &["frases", "tipografia"],
+    );
+    rule(
+        &["gothic", "occult", "raven", "dark", "graveyard"],
+        "Gotico",
+        &["gotico"],
+    );
+    rule(
+        &["retro", "vintage", "80s", "y2k", "neon", "pop-art"],
+        "Retro",
+        &["retro", "vintage"],
+    );
+    rule(
+        &[
+            "flower", "nature", "sun", "moon", "desert", "cactus", "climate",
+        ],
+        "Naturaleza",
+        &["naturaleza"],
+    );
     rule(&["love", "heart", "valentine", "mother"], "Amor", &["amor"]);
-    rule(&["halloween", "hocus", "ghost"], "Halloween", &["halloween"]);
-    rule(&["dia-de-los-muertos", "muertos"], "Dia de los muertos", &["dia de los muertos"]);
-    rule(&["football", "basket", "skiing", "hunting", "sport"], "Deportes", &["deportes"]);
-    rule(&["cowboy", "western", "wild-west", "arizona"], "Oeste", &["oeste"]);
-    rule(&["streetwear", "street-wear", "urban", "bronx", "los-angeles", "brutalism"], "Urbano", &["urbano", "streetwear"]);
-    rule(&["text-effect", "logo", "badge", "template", "poster", "emblem"], "Textos y efectos", &["editable"]);
-    rule(&["abstract", "grunge", "gradient", "pattern"], "Abstracto", &["abstracto"]);
-    rule(&["cute", "dinosaur", "bunny", "unicorn", "happy"], "Infantil", &["infantil"]);
+    rule(
+        &["halloween", "hocus", "ghost"],
+        "Halloween",
+        &["halloween"],
+    );
+    rule(
+        &["dia-de-los-muertos", "muertos"],
+        "Dia de los muertos",
+        &["dia de los muertos"],
+    );
+    rule(
+        &["football", "basket", "skiing", "hunting", "sport"],
+        "Deportes",
+        &["deportes"],
+    );
+    rule(
+        &["cowboy", "western", "wild-west", "arizona"],
+        "Oeste",
+        &["oeste"],
+    );
+    rule(
+        &[
+            "streetwear",
+            "street-wear",
+            "urban",
+            "bronx",
+            "los-angeles",
+            "brutalism",
+        ],
+        "Urbano",
+        &["urbano", "streetwear"],
+    );
+    rule(
+        &[
+            "text-effect",
+            "logo",
+            "badge",
+            "template",
+            "poster",
+            "emblem",
+        ],
+        "Textos y efectos",
+        &["editable"],
+    );
+    rule(
+        &["abstract", "grunge", "gradient", "pattern"],
+        "Abstracto",
+        &["abstracto"],
+    );
+    rule(
+        &["cute", "dinosaur", "bunny", "unicorn", "happy"],
+        "Infantil",
+        &["infantil"],
+    );
 
     if files.iter().any(|file| file.extension == ".ai") {
         tags.insert("ai".to_string());
@@ -1258,9 +1552,13 @@ fn save_setting(conn: &Connection, key: &str, value: &str) -> Result<(), String>
 }
 
 fn get_setting(conn: &Connection, key: &str) -> Result<Option<String>, String> {
-    conn.query_row("SELECT value FROM settings WHERE key = ?1", params![key], |row| row.get(0))
-        .optional()
-        .map_err(to_string)
+    conn.query_row(
+        "SELECT value FROM settings WHERE key = ?1",
+        params![key],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(to_string)
 }
 
 fn upsert_category(conn: &Connection, name: &str, user_created: bool) -> Result<(), String> {
@@ -1365,11 +1663,17 @@ fn path_to_string(path: &Path) -> String {
 
 fn stable_id(input: &str) -> String {
     let hash = Sha256::digest(input.as_bytes());
-    hash.iter().take(12).map(|byte| format!("{byte:02x}")).collect()
+    hash.iter()
+        .take(12)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn system_time_to_i64(value: SystemTime) -> Option<i64> {
-    value.duration_since(UNIX_EPOCH).ok().map(|duration| duration.as_secs() as i64)
+    value
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs() as i64)
 }
 
 fn now_i64() -> i64 {
@@ -1459,8 +1763,12 @@ mod tests {
 
         let designs = collect_designs(dir.path()).unwrap();
         assert_eq!(designs.len(), 2);
-        assert!(designs.iter().any(|design| design.group_type == "loose_file" && design.files.len() == 2));
-        assert!(designs.iter().any(|design| design.name == "Skateboard Skull" && design.counts.psd == 1));
+        assert!(designs
+            .iter()
+            .any(|design| design.group_type == "loose_file" && design.files.len() == 2));
+        assert!(designs
+            .iter()
+            .any(|design| design.name == "Skateboard Skull" && design.counts.psd == 1));
     }
 
     #[test]
