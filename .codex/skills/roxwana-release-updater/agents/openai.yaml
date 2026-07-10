@@ -1,0 +1,4 @@
+interface:
+  display_name: "ROXWANA Release Updater"
+  short_description: "Publish this app with signed updater assets"
+  default_prompt: "Use $roxwana-release-updater to publish ROXWANA Biblioteca Visual as a signed GitHub release with updater assets."
