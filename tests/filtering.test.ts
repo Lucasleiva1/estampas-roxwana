@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { classifyExtension } from "../src/lib/fileTypes";
-import { chooseRandomDesign, createDefaultFilters, filterDesigns } from "../src/lib/filtering";
+import { UNCATEGORIZED_CATEGORY, chooseRandomDesign, createDefaultFilters, filterDesigns } from "../src/lib/filtering";
+import { reorderCategoryList } from "../src/lib/categories";
 import type { Design } from "../src/lib/types";
 
 function design(overrides: Partial<Design>): Design {
@@ -51,8 +52,33 @@ describe("filtering", () => {
     expect(results[0].id).toBe("1");
   });
 
+  it("filters uncategorized designs through the Sin categoria bucket", () => {
+    const filters = createDefaultFilters();
+    filters.categories = [UNCATEGORIZED_CATEGORY];
+
+    const results = filterDesigns([
+      design({ id: "1", classification: { ...design({}).classification, category: null } }),
+      design({ id: "2", classification: { ...design({}).classification, category: "Skater" } }),
+    ], filters);
+
+    expect(results).toHaveLength(1);
+    expect(results[0].id).toBe("1");
+  });
+
   it("chooses a stable random item when a random function is provided", () => {
     expect(chooseRandomDesign(["a", "b", "c"], () => 0.5)).toBe("b");
     expect(chooseRandomDesign([], () => 0.5)).toBeNull();
+  });
+});
+
+describe("category ordering", () => {
+  it("moves a category before the drop target", () => {
+    expect(reorderCategoryList(["Skater", "Calaveras", "Surf"], "Surf", "Skater", "before"))
+      .toEqual(["Surf", "Skater", "Calaveras"]);
+  });
+
+  it("moves a category after the drop target", () => {
+    expect(reorderCategoryList(["Skater", "Calaveras", "Surf"], "Skater", "Surf", "after"))
+      .toEqual(["Calaveras", "Surf", "Skater"]);
   });
 });

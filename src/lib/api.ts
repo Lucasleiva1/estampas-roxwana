@@ -3,6 +3,14 @@ import type { Design, DesignStatus, LibraryResponse } from "./types";
 
 const DEFAULT_LIBRARY_PATH = "C:\\Users\\jaell\\Documents\\estampas-roxwana";
 
+export interface BackupInfo {
+  path: string;
+  folder: string;
+  categories: number;
+  designs: number;
+  manualCategoryDesigns: number;
+}
+
 export async function scanLibrary(rootPath = DEFAULT_LIBRARY_PATH) {
   return invoke<LibraryResponse>("scan_library", { rootPath });
 }
@@ -32,7 +40,23 @@ export async function updateStatus(designId: string, status: DesignStatus) {
 }
 
 export async function updateCategory(designId: string, category: string | null) {
-  await invoke("update_design_category", { designId, category });
+  return invoke<string | null>("update_design_category", { designId, category });
+}
+
+export async function createCategory(name: string) {
+  return invoke<string>("create_category", { name });
+}
+
+export async function renameCategory(currentName: string, newName: string) {
+  return invoke<string>("rename_category", { currentName, newName });
+}
+
+export async function deleteCategory(name: string) {
+  await invoke("delete_category", { name });
+}
+
+export async function reorderCategories(categories: string[]) {
+  return invoke<string[]>("reorder_categories", { categories });
 }
 
 export async function addTag(designId: string, tag: string) {
@@ -57,4 +81,16 @@ export async function openDesignFolder(path: string) {
 
 export async function revealDesignFile(path: string) {
   await invoke("reveal_design_file", { path });
+}
+
+export async function saveDatabaseBackup() {
+  return invoke<BackupInfo>("save_database_backup");
+}
+
+export async function openBackupFolder() {
+  return invoke<string>("open_backup_folder");
+}
+
+export async function restoreDatabaseBackup(backupPath: string) {
+  return invoke<LibraryResponse>("restore_database_backup", { backupPath });
 }

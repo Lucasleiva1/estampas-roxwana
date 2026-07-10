@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -17,6 +17,8 @@ const DEFAULT_LIBRARY_PATH: &str = r"C:\Users\jaell\Documents\estampas-roxwana";
 const PREVIEW_EXTENSIONS: &[&str] = &[".jpg", ".jpeg", ".png", ".webp"];
 const SUPPORT_EXTENSIONS: &[&str] = &[".ai", ".psd", ".svg", ".pdf", ".eps", ".zip", ".txt"];
 const STATUSES: &[&str] = &["pending", "working", "ready", "discarded"];
+const BACKUP_FILE_NAME: &str = "roxwana-biblioteca-respaldo.sqlite";
+const RESTORE_SAFETY_FILE_NAME: &str = "roxwana-biblioteca-antes-de-cargar.sqlite";
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -37,6 +39,16 @@ struct LibraryStats {
     support: usize,
     missing: usize,
     by_extension: BTreeMap<String, usize>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BackupInfo {
+    path: String,
+    folder: String,
+    categories: usize,
+    designs: usize,
+    manual_category_designs: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -259,17 +271,10 @@ fn update_design_category(
     app: AppHandle,
     design_id: String,
     category: Option<String>,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     let conn = open_database(&app)?;
     ensure_database(&conn)?;
-    let normalized = category.and_then(|value| {
-        let trimmed = value.trim().to_string();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(title_caseish(&trimmed))
-        }
-    });
+    let normalized = category.and_then(|value| normalize_category(&value));
 
     if let Some(category_name) = &normalized {
         upsert_category(&conn, category_name, true)?;
@@ -280,7 +285,113 @@ fn update_design_category(
         params![normalized, design_id],
     )
     .map_err(to_string)?;
+    Ok(normalized)
+}
+
+#[tauri::command]
+fn create_category(app: AppHandle, name: String) -> Result<String, String> {
+    let category =
+        normalize_category(&name).ok_or_else(|| "La categoria esta vacia".to_string())?;
+    let conn = open_database(&app)?;
+    ensure_database(&conn)?;
+    upsert_category(&conn, &category, true)?;
+    Ok(category)
+}
+
+#[tauri::command]
+fn rename_category(
+    app: AppHandle,
+    current_name: String,
+    new_name: String,
+) -> Result<String, String> {
+    let current_lower = current_name.trim().to_lowercase();
+    if current_lower.is_empty() {
+        return Err("La categoria actual es invalida".to_string());
+    }
+
+    let renamed =
+        normalize_category(&new_name).ok_or_else(|| "La categoria esta vacia".to_string())?;
+    let renamed_lower = renamed.to_lowercase();
+    let conn = open_database(&app)?;
+    ensure_database(&conn)?;
+
+    let current_display_name: String = conn
+        .query_row(
+            "SELECT name FROM categories WHERE lower_name = ?1",
+            params![current_lower],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(to_string)?
+        .ok_or_else(|| "No encontre esa categoria".to_string())?;
+
+    if renamed_lower != current_lower {
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT name FROM categories WHERE lower_name = ?1",
+                params![renamed_lower],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(to_string)?;
+        if existing.is_some() {
+            return Err("Ya existe una categoria con ese nombre".to_string());
+        }
+    }
+
+    conn.execute(
+        "UPDATE categories SET name = ?1, lower_name = ?2, user_created = 1 WHERE lower_name = ?3",
+        params![renamed, renamed_lower, current_lower],
+    )
+    .map_err(to_string)?;
+    conn.execute(
+        "UPDATE designs SET category = ?1, category_user_set = 1 WHERE category = ?2 COLLATE NOCASE",
+        params![renamed, current_display_name],
+    )
+    .map_err(to_string)?;
+
+    Ok(renamed)
+}
+
+#[tauri::command]
+fn delete_category(app: AppHandle, name: String) -> Result<(), String> {
+    let lower_name = name.trim().to_lowercase();
+    if lower_name.is_empty() {
+        return Err("La categoria es invalida".to_string());
+    }
+
+    let conn = open_database(&app)?;
+    ensure_database(&conn)?;
+    let display_name: Option<String> = conn
+        .query_row(
+            "SELECT name FROM categories WHERE lower_name = ?1",
+            params![lower_name],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(to_string)?;
+    let Some(display_name) = display_name else {
+        return Ok(());
+    };
+
+    conn.execute(
+        "UPDATE designs SET category = NULL, category_user_set = 1 WHERE category = ?1 COLLATE NOCASE",
+        params![display_name],
+    )
+    .map_err(to_string)?;
+    conn.execute(
+        "DELETE FROM categories WHERE lower_name = ?1",
+        params![lower_name],
+    )
+    .map_err(to_string)?;
     Ok(())
+}
+
+#[tauri::command]
+fn reorder_categories(app: AppHandle, categories: Vec<String>) -> Result<Vec<String>, String> {
+    let mut conn = open_database(&app)?;
+    ensure_database(&conn)?;
+    set_category_order(&mut conn, &categories)
 }
 
 #[tauri::command]
@@ -365,6 +476,47 @@ fn reveal_design_file(path: String) -> Result<(), String> {
         .map_err(|error| format!("No se pudo mostrar el archivo: {error}"))?;
 
     Ok(())
+}
+
+#[tauri::command]
+fn save_database_backup(app: AppHandle) -> Result<BackupInfo, String> {
+    let backup_path = default_backup_path(&app)?;
+    export_database_backup(&app, &backup_path)?;
+    backup_info(&backup_path)
+}
+
+#[tauri::command]
+fn open_backup_folder(app: AppHandle) -> Result<String, String> {
+    let folder = backup_directory(&app)?;
+    Command::new("explorer")
+        .arg(&folder)
+        .spawn()
+        .map_err(|error| format!("No se pudo abrir la carpeta de copias: {error}"))?;
+    Ok(path_to_string(&folder))
+}
+
+#[tauri::command]
+fn restore_database_backup(app: AppHandle, backup_path: String) -> Result<LibraryResponse, String> {
+    let source = PathBuf::from(&backup_path);
+    validate_backup_database(&source)?;
+
+    let db_path = database_path(&app)?;
+    if db_path.exists() && !same_file(&db_path, &source) {
+        let safety_backup = backup_directory(&app)?.join(RESTORE_SAFETY_FILE_NAME);
+        export_database_backup(&app, &safety_backup)?;
+    }
+
+    if !same_file(&db_path, &source) {
+        remove_database_files(&db_path)?;
+        fs::copy(&source, &db_path)
+            .map_err(|error| format!("No se pudo cargar la copia de seguridad: {error}"))?;
+    }
+
+    let conn = open_database(&app)?;
+    ensure_database(&conn)?;
+    let root =
+        get_setting(&conn, "library_root")?.unwrap_or_else(|| DEFAULT_LIBRARY_PATH.to_string());
+    load_library_from_db(&conn, &root)
 }
 
 fn scan_library_impl(app: &AppHandle, root_path: &str) -> Result<LibraryResponse, String> {
@@ -725,13 +877,17 @@ fn active_design_count(conn: &Connection) -> Result<usize, String> {
     .map_err(to_string)
 }
 
-fn open_database(app: &AppHandle) -> Result<Connection, String> {
+fn database_path(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app
         .path()
         .app_local_data_dir()
         .map_err(|error| format!("No se pudo resolver APPLOCALDATA: {error}"))?;
     fs::create_dir_all(&dir).map_err(to_string)?;
-    let db_path = dir.join("roxwana-biblioteca.sqlite");
+    Ok(dir.join("roxwana-biblioteca.sqlite"))
+}
+
+fn open_database(app: &AppHandle) -> Result<Connection, String> {
+    let db_path = database_path(app)?;
     let conn = Connection::open(db_path).map_err(to_string)?;
     conn.execute_batch(
         "
@@ -742,6 +898,126 @@ fn open_database(app: &AppHandle) -> Result<Connection, String> {
     )
     .map_err(to_string)?;
     Ok(conn)
+}
+
+fn backup_directory(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|error| format!("No se pudo resolver APPLOCALDATA: {error}"))?
+        .join("copias-de-seguridad");
+    fs::create_dir_all(&dir).map_err(to_string)?;
+    Ok(dir)
+}
+
+fn default_backup_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(backup_directory(app)?.join(BACKUP_FILE_NAME))
+}
+
+fn export_database_backup(app: &AppHandle, target: &Path) -> Result<(), String> {
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).map_err(to_string)?;
+    }
+
+    let conn = open_database(app)?;
+    ensure_database(&conn)?;
+    conn.execute_batch("PRAGMA wal_checkpoint(FULL);")
+        .map_err(to_string)?;
+
+    let temporary = target.with_extension("sqlite.tmp");
+    remove_file_if_exists(&temporary)?;
+
+    let quoted_path = sqlite_string_literal(&path_to_string(&temporary));
+    conn.execute_batch(&format!("VACUUM INTO {quoted_path};"))
+        .map_err(to_string)?;
+    drop(conn);
+
+    remove_file_if_exists(target)?;
+    fs::rename(&temporary, target)
+        .map_err(|error| format!("No se pudo guardar la copia de seguridad: {error}"))?;
+    Ok(())
+}
+
+fn validate_backup_database(path: &Path) -> Result<(), String> {
+    if !path.is_file() {
+        return Err(format!(
+            "No existe la copia de seguridad: {}",
+            path.display()
+        ));
+    }
+
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| format!("No pude abrir la copia de seguridad: {error}"))?;
+    let integrity: String = conn
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .map_err(to_string)?;
+    if integrity != "ok" {
+        return Err(format!(
+            "La copia de seguridad no esta integra: {integrity}"
+        ));
+    }
+
+    for table in ["settings", "categories", "designs"] {
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                params![table],
+                |row| row.get(0),
+            )
+            .map_err(to_string)?;
+        if exists != 1 {
+            return Err(format!(
+                "La copia no parece ser de ROXWANA: falta la tabla {table}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn backup_info(path: &Path) -> Result<BackupInfo, String> {
+    validate_backup_database(path)?;
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| format!("No pude leer la copia de seguridad: {error}"))?;
+    let categories = count_query(&conn, "SELECT COUNT(*) FROM categories")?;
+    let designs = count_query(&conn, "SELECT COUNT(*) FROM designs WHERE missing = 0")?;
+    let manual_category_designs = count_query(
+        &conn,
+        "SELECT COUNT(*) FROM designs WHERE category_user_set = 1",
+    )?;
+    let folder = path
+        .parent()
+        .map(path_to_string)
+        .unwrap_or_else(|| String::from(""));
+
+    Ok(BackupInfo {
+        path: path_to_string(path),
+        folder,
+        categories,
+        designs,
+        manual_category_designs,
+    })
+}
+
+fn count_query(conn: &Connection, sql: &str) -> Result<usize, String> {
+    conn.query_row(sql, [], |row| row.get::<_, i64>(0))
+        .map(|count| count as usize)
+        .map_err(to_string)
+}
+
+fn remove_database_files(db_path: &Path) -> Result<(), String> {
+    remove_file_if_exists(db_path)?;
+    remove_file_if_exists(&PathBuf::from(format!("{}-wal", db_path.to_string_lossy())))?;
+    remove_file_if_exists(&PathBuf::from(format!("{}-shm", db_path.to_string_lossy())))?;
+    Ok(())
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 fn ensure_database(conn: &Connection) -> Result<(), String> {
@@ -835,6 +1111,10 @@ fn ensure_database(conn: &Connection) -> Result<(), String> {
 }
 
 fn seed_categories(conn: &Connection) -> Result<(), String> {
+    if get_setting(conn, "default_categories_seeded")?.is_some() {
+        return Ok(());
+    }
+
     let categories = [
         ("Skater", "#65a30d"),
         ("Calaveras", "#ef4444"),
@@ -871,6 +1151,7 @@ fn seed_categories(conn: &Connection) -> Result<(), String> {
         .map_err(to_string)?;
     }
 
+    save_setting(conn, "default_categories_seeded", "1")?;
     Ok(())
 }
 
@@ -1135,7 +1416,16 @@ fn persist_design(conn: &Connection, design: &CollectedDesign) -> Result<(), Str
     }
 
     if let Some(category) = &design.auto_category {
-        upsert_category(conn, category, false)?;
+        let category_user_set: i64 = conn
+            .query_row(
+                "SELECT category_user_set FROM designs WHERE id = ?1",
+                params![design.id],
+                |row| row.get(0),
+            )
+            .map_err(to_string)?;
+        if category_user_set == 0 {
+            upsert_category(conn, category, false)?;
+        }
     }
 
     Ok(())
@@ -1565,7 +1855,7 @@ fn upsert_category(conn: &Connection, name: &str, user_created: bool) -> Result<
     let normalized = title_caseish(name);
     conn.execute(
         "INSERT INTO categories (id, name, lower_name, sort_order, user_created)
-         VALUES (?1, ?2, ?3, 999, ?4)
+         VALUES (?1, ?2, ?3, COALESCE((SELECT MAX(sort_order) + 1 FROM categories), 0), ?4)
          ON CONFLICT(lower_name) DO UPDATE SET
             name = excluded.name,
             user_created = categories.user_created OR excluded.user_created",
@@ -1578,6 +1868,15 @@ fn upsert_category(conn: &Connection, name: &str, user_created: bool) -> Result<
     )
     .map_err(to_string)?;
     Ok(())
+}
+
+fn normalize_category(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(title_caseish(trimmed))
+    }
 }
 
 fn upsert_tag(conn: &Connection, tag: &str) -> Result<String, String> {
@@ -1614,6 +1913,40 @@ fn load_categories(conn: &Connection) -> Result<Vec<String>, String> {
         .collect::<Result<Vec<_>, _>>()
         .map_err(to_string)?;
     Ok(categories)
+}
+
+fn set_category_order(conn: &mut Connection, categories: &[String]) -> Result<Vec<String>, String> {
+    let existing = load_categories(conn)?;
+    let existing_names = existing
+        .iter()
+        .map(|name| name.trim().to_lowercase())
+        .collect::<BTreeSet<_>>();
+    let requested_names = categories
+        .iter()
+        .map(|name| name.trim().to_lowercase())
+        .collect::<BTreeSet<_>>();
+
+    if categories.len() != existing.len()
+        || requested_names.len() != categories.len()
+        || requested_names != existing_names
+    {
+        return Err("El orden de categorias no coincide con la biblioteca actual".to_string());
+    }
+
+    let transaction = conn.transaction().map_err(to_string)?;
+    for (index, category) in categories.iter().enumerate() {
+        let updated = transaction
+            .execute(
+                "UPDATE categories SET sort_order = ?1 WHERE lower_name = ?2",
+                params![index as i64, category.trim().to_lowercase()],
+            )
+            .map_err(to_string)?;
+        if updated != 1 {
+            return Err(format!("No se pudo ordenar la categoria: {category}"));
+        }
+    }
+    transaction.commit().map_err(to_string)?;
+    load_categories(conn)
 }
 
 fn load_tags(conn: &Connection) -> Result<Vec<String>, String> {
@@ -1653,12 +1986,23 @@ fn same_path(left: &Path, right: &Path) -> bool {
     normalize_path_for_id(left) == normalize_path_for_id(right)
 }
 
+fn same_file(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => same_path(&left, &right),
+        _ => same_path(left, right),
+    }
+}
+
 fn normalize_path_for_id(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/").to_lowercase()
 }
 
 fn path_to_string(path: &Path) -> String {
     path.to_string_lossy().to_string()
+}
+
+fn sqlite_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 fn stable_id(input: &str) -> String {
@@ -1719,6 +2063,13 @@ fn to_string<E: std::fmt::Display>(error: E) -> String {
 
 fn main() {
     tauri::Builder::default()
+        .setup(|app| {
+            if let Some(window) = app.get_webview_window("main") {
+                window.show()?;
+                window.set_focus()?;
+            }
+            Ok(())
+        })
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_persisted_scope::init())
@@ -1737,10 +2088,17 @@ fn main() {
             update_design_favorite,
             update_design_status,
             update_design_category,
+            create_category,
+            rename_category,
+            delete_category,
+            reorder_categories,
             add_design_tag,
             remove_design_tag,
             open_design_folder,
-            reveal_design_file
+            reveal_design_file,
+            save_database_backup,
+            open_backup_folder,
+            restore_database_backup
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1788,5 +2146,43 @@ mod tests {
         assert_eq!(category.as_deref(), Some("Skater"));
         assert!(tags.contains(&"skate".to_string()));
         assert!(tags.contains(&"ai".to_string()));
+    }
+
+    #[test]
+    fn persists_category_order() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        ensure_database(&conn).unwrap();
+        let mut categories = load_categories(&conn).unwrap();
+        categories.swap(0, 1);
+
+        let saved = set_category_order(&mut conn, &categories).unwrap();
+
+        assert_eq!(saved, categories);
+        assert_eq!(load_categories(&conn).unwrap(), categories);
+    }
+
+    #[test]
+    fn exports_database_backup_with_vacuum_into() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("source.sqlite");
+        let backup_path = dir.path().join("backup.sqlite");
+        let conn = Connection::open(&db_path).unwrap();
+        ensure_database(&conn).unwrap();
+        upsert_category(&conn, "Categoria prueba", true).unwrap();
+
+        conn.execute_batch("PRAGMA wal_checkpoint(FULL);").unwrap();
+        let quoted_path = sqlite_string_literal(&path_to_string(&backup_path));
+        conn.execute_batch(&format!("VACUUM INTO {quoted_path};"))
+            .unwrap();
+        drop(conn);
+
+        validate_backup_database(&backup_path).unwrap();
+        let backup =
+            Connection::open_with_flags(&backup_path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let categories = load_categories(&backup).unwrap();
+
+        assert!(categories
+            .iter()
+            .any(|category| category == "Categoria Prueba"));
     }
 }

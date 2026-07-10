@@ -1,6 +1,8 @@
 import type { Design, Filters } from "./types";
 import { designSearchText } from "./fileTypes";
 
+export const UNCATEGORIZED_CATEGORY = "Sin categoria";
+
 const defaultFilters: Filters = {
   query: "",
   favoritesOnly: false,
@@ -24,7 +26,7 @@ export function filterDesigns(designs: Design[], filters: Filters) {
     if (filters.withoutPreview && design.previewPath) return false;
     if (filters.statuses.length > 0 && !filters.statuses.includes(design.classification.status)) return false;
     if (filters.categories.length > 0) {
-      const category = design.classification.category ?? "Sin categoria";
+      const category = design.classification.category ?? UNCATEGORIZED_CATEGORY;
       if (!filters.categories.includes(category)) return false;
     }
     if (filters.tags.length > 0) {
