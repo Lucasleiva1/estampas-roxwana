@@ -9,7 +9,6 @@ import {
   Circle,
   Clock3,
   Crown,
-  FileArchive,
   FileImage,
   FileText,
   FolderOpen,
@@ -18,25 +17,19 @@ import {
   Home,
   ImageOff,
   LayoutGrid,
-  Layers,
   List,
   Loader2,
-  Maximize2,
-  Minus,
   MoreVertical,
   Music,
-  PenTool,
   Plus,
   RefreshCw,
   Search,
   Settings,
   Star,
   Tags,
-  Type,
   User,
   UserRound,
   X,
-  type LucideIcon,
 } from "lucide-react";
 import { memo, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
@@ -48,7 +41,6 @@ import {
   getInitialState,
   openDesignFolder,
   removeTag,
-  revealDesignFile,
   scanLibrary,
   updateCategory,
   updateFavorite,
@@ -60,7 +52,7 @@ import type { Design, DesignStatus, Filters, LibraryResponse } from "./lib/types
 
 const DEFAULT_LIBRARY_PATH = "C:\\Users\\jaell\\Documents\\estampas-roxwana";
 const PAGE_SIZE = 50;
-const supportFilters = [".png", ".jpg", ".ai", ".psd", ".eps", ".zip", ".txt"];
+const supportFilters = [".png", ".jpg", ".ai", ".psd", ".eps", ".txt"];
 const defaultZoom = 100;
 
 const statusOptions: Array<{ value: DesignStatus; label: string }> = [
@@ -524,20 +516,6 @@ export default function App() {
     }
   }, []);
 
-  const revealFileForDesign = useCallback(async (design: Design) => {
-    const filePath = design.previewPath ?? design.files[0]?.path;
-    if (!filePath) {
-      setError("Esta estampa no tiene archivo para mostrar.");
-      return;
-    }
-
-    try {
-      await revealDesignFile(filePath);
-    } catch (openError) {
-      setError(String(openError));
-    }
-  }, []);
-
   return (
     <main className="visual-shell">
       <Header
@@ -584,13 +562,12 @@ export default function App() {
         <Viewer
           design={selectedDesign}
           loading={loading || scanning}
-        zoom={zoom}
-        setZoom={setZoom}
-        onPrev={() => goToOffset(-1)}
-        onNext={() => goToOffset(1)}
-        onOpenFolder={openFolderForDesign}
-        onRevealFile={revealFileForDesign}
-      />
+          zoom={zoom}
+          setZoom={setZoom}
+          onPrev={() => goToOffset(-1)}
+          onNext={() => goToOffset(1)}
+          onOpenFolder={openFolderForDesign}
+        />
 
         <RightRail
           designs={visibleDesigns}
@@ -836,7 +813,6 @@ function Viewer({
   onPrev,
   onNext,
   onOpenFolder,
-  onRevealFile,
 }: {
   design: Design | null;
   loading: boolean;
@@ -845,12 +821,74 @@ function Viewer({
   onPrev: () => void;
   onNext: () => void;
   onOpenFolder: (design: Design) => void;
-  onRevealFile: (design: Design) => void;
 }) {
   const previewPath = design?.previewCachePath ?? design?.previewPath ?? null;
   const preview = previewPath ? convertFileSrc(previewPath) : null;
   const previewFile = design?.files.find((file) => file.path === design.previewPath) ?? design?.files[0] ?? null;
   const imageCount = design ? countForExtension(design, ".jpg") + countForExtension(design, ".jpeg") + countForExtension(design, ".png") + countForExtension(design, ".webp") : 0;
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const dragStart = useRef<{ pointerId: number; x: number; y: number; panX: number; panY: number } | null>(null);
+  const assetItems = design
+    ? [
+        { id: "img", kind: "image" as const, label: "Imagen", value: imageCount, tone: "red" as const },
+        { id: "ai", kind: "ai" as const, label: "Illustrator", value: countForExtension(design, ".ai"), tone: "gold" as const },
+        { id: "psd", kind: "psd" as const, label: "Photoshop", value: countForExtension(design, ".psd"), tone: "blue" as const },
+        { id: "eps", kind: "eps" as const, label: "EPS", value: countForExtension(design, ".eps"), tone: "gold" as const },
+        { id: "pdf", kind: "pdf" as const, label: "PDF", value: countForExtension(design, ".pdf"), tone: "neutral" as const },
+        { id: "txt", kind: "txt" as const, label: "Texto", value: countForExtension(design, ".txt"), tone: "neutral" as const },
+      ].filter((item) => item.value > 0)
+    : [];
+
+  const clampPan = useCallback(
+    (next: { x: number; y: number }, nextZoom = zoom) => {
+      const range = Math.max(0, nextZoom - 100) * 5;
+      return {
+        x: Math.max(-range, Math.min(range, next.x)),
+        y: Math.max(-range, Math.min(range, next.y)),
+      };
+    },
+    [zoom],
+  );
+
+  useEffect(() => {
+    setZoom(defaultZoom);
+    setPan({ x: 0, y: 0 });
+  }, [design?.id, setZoom]);
+
+  const handleWheel = useCallback(
+    (event: React.WheelEvent<HTMLDivElement>) => {
+      if (!preview) return;
+      event.preventDefault();
+      const nextZoom = Math.max(50, Math.min(300, zoom + (event.deltaY > 0 ? -10 : 10)));
+      setZoom(nextZoom);
+      setPan((current) => clampPan(current, nextZoom));
+    },
+    [clampPan, preview, setZoom, zoom],
+  );
+
+  const startPan = useCallback(
+    (event: React.PointerEvent<HTMLImageElement>) => {
+      if (zoom <= 100) return;
+      event.currentTarget.setPointerCapture(event.pointerId);
+      dragStart.current = { pointerId: event.pointerId, x: event.clientX, y: event.clientY, panX: pan.x, panY: pan.y };
+    },
+    [pan.x, pan.y, zoom],
+  );
+
+  const movePan = useCallback(
+    (event: React.PointerEvent<HTMLImageElement>) => {
+      const start = dragStart.current;
+      if (!start || start.pointerId !== event.pointerId) return;
+      setPan(clampPan({ x: start.panX + event.clientX - start.x, y: start.panY + event.clientY - start.y }));
+    },
+    [clampPan],
+  );
+
+  const endPan = useCallback((event: React.PointerEvent<HTMLImageElement>) => {
+    if (dragStart.current?.pointerId === event.pointerId) {
+      dragStart.current = null;
+    }
+  }, []);
 
   return (
     <section className="viewer-stage">
@@ -858,14 +896,28 @@ function Viewer({
         <ChevronLeft size={28} />
       </button>
 
-      <div className="artboard">
+      <div className="artboard" onWheel={handleWheel}>
         {loading && !design ? (
           <div className="viewer-empty">
             <Loader2 className="spin" size={34} />
             <span>Escaneando biblioteca</span>
           </div>
         ) : preview ? (
-          <img src={preview} alt={design?.name ?? "Estampa"} style={{ transform: `scale(${zoom / 100})` }} />
+          <img
+            src={preview}
+            alt={design?.name ?? "Estampa"}
+            className={zoom > 100 ? "is-zoomed" : ""}
+            draggable={false}
+            onDoubleClick={() => {
+              setZoom(defaultZoom);
+              setPan({ x: 0, y: 0 });
+            }}
+            onPointerDown={startPan}
+            onPointerMove={movePan}
+            onPointerUp={endPan}
+            onPointerCancel={endPan}
+            style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom / 100})` }}
+          />
         ) : design?.previewPath ? (
           <div className="viewer-empty">
             <Loader2 className="spin" size={34} />
@@ -887,14 +939,13 @@ function Viewer({
             <span>{previewFile?.fileName ?? design.name}</span>
           </div>
 
-          <div className="overlay-assets" aria-label="Archivos de esta estampa">
-            <AssetPill label="IMG" value={imageCount} tone="red" />
-            <AssetPill label="AI" value={countForExtension(design, ".ai")} tone="gold" />
-            <AssetPill label="PSD" value={countForExtension(design, ".psd")} tone="blue" />
-            <AssetPill label="EPS" value={countForExtension(design, ".eps")} tone="gold" />
-            <AssetPill label="ZIP" value={countForExtension(design, ".zip")} tone="neutral" />
-            <AssetPill label="TXT" value={countForExtension(design, ".txt")} tone="neutral" />
-          </div>
+          {assetItems.length > 0 && (
+            <div className="overlay-assets" aria-label="Archivos de esta estampa">
+              {assetItems.map((item) => (
+                <AssetPill key={item.id} kind={item.kind} label={item.label} value={item.value} tone={item.tone} />
+              ))}
+            </div>
+          )}
 
           <div className="overlay-folder" title={design.directory}>
             <span>{design.name}</span>
@@ -903,10 +954,6 @@ function Viewer({
           <button className="overlay-action primary icon-action" onClick={() => onOpenFolder(design)} title="Abrir carpeta" aria-label="Abrir carpeta">
             <FolderOpen size={16} />
           </button>
-          <button className="overlay-action" onClick={() => onRevealFile(design)}>
-            <Maximize2 size={15} />
-            Mostrar archivo
-          </button>
         </div>
       )}
 
@@ -914,28 +961,24 @@ function Viewer({
         <ChevronRight size={28} />
       </button>
 
-      <div className="zoom-controls">
-        <button onClick={() => setZoom(Math.max(40, zoom - 10))} title="Alejar">
-          <Minus size={18} />
-        </button>
-        <strong>{zoom}%</strong>
-        <button onClick={() => setZoom(Math.min(200, zoom + 10))} title="Acercar">
-          <Plus size={18} />
-        </button>
-        <button onClick={() => setZoom(defaultZoom)} title="Ajustar">
-          <Maximize2 size={17} />
-          <span>Ajustar</span>
-        </button>
-      </div>
     </section>
   );
 }
 
-function AssetPill({ label, value, tone }: { label: string; value: number; tone: "red" | "gold" | "blue" | "neutral" }) {
+type AssetKind = "image" | "ai" | "psd" | "eps" | "pdf" | "txt";
+
+function AssetIcon({ kind }: { kind: AssetKind }) {
+  if (kind === "ai") return <span className="brand-file-icon brand-ai">Ai</span>;
+  if (kind === "psd") return <span className="brand-file-icon brand-ps">Ps</span>;
+  if (kind === "eps") return <span className="brand-file-icon brand-eps">EPS</span>;
+  return kind === "image" ? <FileImage size={15} /> : <FileText size={15} />;
+}
+
+function AssetPill({ kind, label, value, tone }: { kind: AssetKind; label: string; value: number; tone: "red" | "gold" | "blue" | "neutral" }) {
   return (
-    <span className={`asset-pill ${tone} ${value > 0 ? "has-files" : ""}`}>
-      <b>{label}</b>
-      {value}
+    <span className={`asset-pill ${tone}`} title={`${label}: ${value.toLocaleString("es-AR")}`}>
+      <AssetIcon kind={kind} />
+      <small>{value.toLocaleString("es-AR")}</small>
     </span>
   );
 }
@@ -1135,7 +1178,6 @@ function BottomTray({
   design,
   categories,
   onOpenFolder,
-  onRevealFile,
   onFavorite,
   onStatus,
   onCategory,
@@ -1146,7 +1188,6 @@ function BottomTray({
   design: Design | null;
   categories: string[];
   onOpenFolder: (design: Design) => void;
-  onRevealFile: (design: Design) => void;
   onFavorite: (design: Design, favorite: boolean) => void;
   onStatus: (design: Design, status: DesignStatus) => void;
   onCategory: (design: Design, category: string | null) => void;
@@ -1170,6 +1211,14 @@ function BottomTray({
     countForExtension(design, ".png") +
     countForExtension(design, ".webp");
   const statusLabel = statusOptions.find((status) => status.value === design.classification.status)?.label ?? "Estado";
+  const metricItems = [
+    { id: "img", kind: "image" as const, label: "Imagen", value: imageCount, tone: "red" as const },
+    { id: "ai", kind: "ai" as const, label: "Illustrator", value: countForExtension(design, ".ai"), tone: "gold" as const },
+    { id: "psd", kind: "psd" as const, label: "Photoshop", value: countForExtension(design, ".psd"), tone: "blue" as const },
+    { id: "eps", kind: "eps" as const, label: "EPS", value: countForExtension(design, ".eps"), tone: "gold" as const },
+    { id: "pdf", kind: "pdf" as const, label: "PDF", value: countForExtension(design, ".pdf"), tone: "neutral" as const },
+    { id: "txt", kind: "txt" as const, label: "Texto", value: countForExtension(design, ".txt"), tone: "neutral" as const },
+  ].filter((item) => item.value > 0);
 
   return (
     <footer className={showIconLabels ? "bottom-tray labels-on" : "bottom-tray"}>
@@ -1184,13 +1233,13 @@ function BottomTray({
           </button>
         </div>
 
-        <div className="extension-metrics" title="Archivos de esta estampa">
-          <IconMetric icon={FileImage} label="Imagenes" value={imageCount} showLabel={showIconLabels} tone="red" />
-          <IconMetric icon={PenTool} label="Illustrator" value={countForExtension(design, ".ai")} showLabel={showIconLabels} tone="gold" />
-          <IconMetric icon={Layers} label="Photoshop" value={countForExtension(design, ".psd")} showLabel={showIconLabels} tone="blue" />
-          <IconMetric icon={FileArchive} label="ZIP" value={countForExtension(design, ".zip")} showLabel={showIconLabels} tone="neutral" />
-          <IconMetric icon={Type} label="TXT" value={countForExtension(design, ".txt")} showLabel={showIconLabels} tone="neutral" />
-        </div>
+        {metricItems.length > 0 && (
+          <div className="extension-metrics" title="Archivos de esta estampa">
+            {metricItems.map((item) => (
+              <IconMetric key={item.id} kind={item.kind} label={item.label} value={item.value} tone={item.tone} />
+            ))}
+          </div>
+        )}
 
         <div className="status-icon-select" title={statusLabel}>
           <Clock3 size={18} />
@@ -1212,10 +1261,6 @@ function BottomTray({
         <button className="tray-action" onClick={() => onOpenFolder(design)} title="Abrir carpeta">
           <FolderOpen size={17} />
           {showIconLabels && <span>Abrir carpeta</span>}
-        </button>
-        <button className="tray-action subtle" onClick={() => onRevealFile(design)} title="Mostrar archivo">
-          <Maximize2 size={15} />
-          {showIconLabels && <span>Mostrar archivo</span>}
         </button>
       </section>
 
@@ -1260,24 +1305,21 @@ function BottomTray({
 }
 
 function IconMetric({
-  icon: Icon,
+  kind,
   label,
   value,
-  showLabel,
   tone,
 }: {
-  icon: LucideIcon;
+  kind: AssetKind;
   label: string;
   value: number;
-  showLabel: boolean;
   tone: "red" | "gold" | "blue" | "neutral";
 }) {
   return (
     <span className={`metric metric-${tone}`} title={`${label}: ${value.toLocaleString("es-AR")}`}>
       <b>
-        <Icon size={15} />
+        <AssetIcon kind={kind} />
       </b>
-      {showLabel && <em>{label}</em>}
       {value.toLocaleString("es-AR")}
     </span>
   );

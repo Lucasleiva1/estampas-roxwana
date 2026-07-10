@@ -519,14 +519,27 @@ button:disabled {
   height: min(78%, 680px);
   display: grid;
   place-items: center;
+  overflow: hidden;
+  cursor: zoom-in;
+  touch-action: none;
 }
 
 .artboard img {
   max-width: 100%;
   max-height: 100%;
   object-fit: contain;
+  transform-origin: center center;
   transition: transform 0.16s ease;
+  user-select: none;
   filter: drop-shadow(0 28px 45px rgb(0 0 0 / 52%));
+}
+
+.artboard img.is-zoomed {
+  cursor: grab;
+}
+
+.artboard img.is-zoomed:active {
+  cursor: grabbing;
 }
 
 .viewer-empty {
@@ -606,7 +619,8 @@ button:disabled {
 
 .asset-pill {
   height: 28px;
-  gap: 5px;
+  min-width: 38px;
+  gap: 6px;
   padding: 0 7px;
   border: 1px solid #3b3d40;
   border-radius: 6px;
@@ -615,13 +629,15 @@ button:disabled {
   background: rgb(12 13 14 / 72%);
 }
 
-.asset-pill b {
+.asset-pill svg {
   color: #f6efe6;
-  font-size: 10px;
 }
 
-.asset-pill:not(.has-files) {
-  opacity: 0.45;
+.asset-pill small {
+  color: #f6efe6;
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1;
 }
 
 .asset-pill.red {
@@ -634,6 +650,36 @@ button:disabled {
 
 .asset-pill.blue {
   border-color: rgb(40 117 173 / 80%);
+}
+
+.brand-file-icon {
+  width: 22px;
+  height: 20px;
+  display: inline-grid;
+  place-items: center;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 900;
+  line-height: 1;
+}
+
+.brand-ai {
+  border: 1px solid #ff9a00;
+  color: #ffb84a;
+  background: #2b1600;
+}
+
+.brand-ps {
+  border: 1px solid #31a8ff;
+  color: #9bd6ff;
+  background: #001e36;
+}
+
+.brand-eps {
+  width: 28px;
+  border: 1px solid #d29125;
+  color: #ffdfa2;
+  background: #211403;
 }
 
 .overlay-action {
