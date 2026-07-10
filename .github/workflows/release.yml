@@ -38,15 +38,6 @@ jobs:
       - name: Run frontend tests
         run: npm run test
 
-      - name: Disable updater artifacts when signing key is missing
-        if: env.HAS_TAURI_SIGNING_PRIVATE_KEY != 'true'
-        shell: pwsh
-        run: |
-          $configPath = "src-tauri/tauri.conf.json"
-          $config = Get-Content $configPath -Raw | ConvertFrom-Json
-          $config.bundle.createUpdaterArtifacts = $false
-          $config | ConvertTo-Json -Depth 20 | Set-Content $configPath -Encoding UTF8
-
       - name: Publish Tauri app with updater
         if: env.HAS_TAURI_SIGNING_PRIVATE_KEY == 'true'
         uses: tauri-apps/tauri-action@v1
@@ -62,18 +53,4 @@ jobs:
           prerelease: false
           uploadUpdaterJson: true
           updaterJsonPreferNsis: true
-          args: --ci --bundles nsis
-
-      - name: Publish Tauri installer only
-        if: env.HAS_TAURI_SIGNING_PRIVATE_KEY != 'true'
-        uses: tauri-apps/tauri-action@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tagName: app-v__VERSION__
-          releaseName: "ROXWANA Biblioteca Visual v__VERSION__ pre-final"
-          releaseBody: "Version pre-final con categorias editables, copia de seguridad, random sin repetir y mejoras de visor. Nota: este release incluye instalador; el updater automatico requiere configurar TAURI_SIGNING_PRIVATE_KEY en los secrets de GitHub."
-          releaseDraft: false
-          prerelease: false
-          uploadUpdaterJson: false
           args: --ci --bundles nsis
