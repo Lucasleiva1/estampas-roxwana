@@ -543,6 +543,7 @@ fn scan_library_impl(app: &AppHandle, root_path: &str) -> Result<LibraryResponse
         sync_auto_tags(&conn, &design.id, &design.auto_tags)?;
     }
 
+    normalize_design_categories(&conn)?;
     load_library_from_db(&conn, root_path)
 }
 
@@ -611,6 +612,7 @@ fn rescan_paths_impl(
         sync_auto_tags(&conn, &design.id, &design.auto_tags)?;
     }
 
+    normalize_design_categories(&conn)?;
     load_library_from_db(&conn, root_path)
 }
 
@@ -1107,6 +1109,54 @@ fn ensure_database(conn: &Connection) -> Result<(), String> {
         .map_err(to_string)?;
 
     seed_categories(conn)?;
+    normalize_design_categories(conn)?;
+    Ok(())
+}
+
+fn normalize_design_categories(conn: &Connection) -> Result<(), String> {
+    conn.execute(
+        "UPDATE designs
+         SET category = (
+             SELECT c.name
+             FROM categories c
+             WHERE c.lower_name = lower(trim(designs.category))
+             LIMIT 1
+         )
+         WHERE category IS NOT NULL
+           AND trim(category) <> ''
+           AND EXISTS (
+             SELECT 1 FROM categories c
+             WHERE c.lower_name = lower(trim(designs.category))
+               AND trim(designs.category) <> c.name
+           )",
+        [],
+    )
+    .map_err(to_string)?;
+
+    conn.execute(
+        "UPDATE designs
+         SET category = NULL,
+             category_user_set = 1
+         WHERE category IS NOT NULL
+           AND trim(category) <> ''
+           AND NOT EXISTS (
+             SELECT 1 FROM categories c
+             WHERE c.lower_name = lower(trim(designs.category))
+           )",
+        [],
+    )
+    .map_err(to_string)?;
+
+    conn.execute(
+        "UPDATE designs
+         SET category = NULL,
+             category_user_set = 1
+         WHERE category IS NOT NULL
+           AND trim(category) = ''",
+        [],
+    )
+    .map_err(to_string)?;
+
     Ok(())
 }
 
@@ -1347,6 +1397,11 @@ fn persist_design(conn: &Connection, design: &CollectedDesign) -> Result<(), Str
         .as_ref()
         .map(|path| path_to_string(path));
 
+    let auto_category = design
+        .auto_category
+        .as_ref()
+        .map(|category| title_caseish(category));
+
     conn.execute(
         "INSERT INTO designs (
             id, name, path, directory, group_type, preview_path, preview_cache_path, thumbnail_path, total_files,
@@ -1383,7 +1438,7 @@ fn persist_design(conn: &Connection, design: &CollectedDesign) -> Result<(), Str
             design.files.len() as i64,
             design.updated_at,
             now,
-            design.auto_category,
+            auto_category,
         ],
     )
     .map_err(to_string)?;
@@ -2159,6 +2214,57 @@ mod tests {
 
         assert_eq!(saved, categories);
         assert_eq!(load_categories(&conn).unwrap(), categories);
+    }
+
+    #[test]
+    fn normalizes_orphan_design_categories() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_database(&conn).unwrap();
+        conn.execute(
+            "UPDATE categories SET name = 'Textos Y Efectos' WHERE lower_name = 'textos y efectos'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO designs (
+                id, name, path, directory, group_type, total_files, updated_at, first_seen, last_seen,
+                category, category_user_set
+             )
+             VALUES
+                ('canonical', 'Canonical', 'c:/canonical', 'c:/', 'folder', 1, 1, 1, 1, 'Textos y efectos', 0),
+                ('orphan', 'Orphan', 'c:/orphan', 'c:/', 'folder', 1, 1, 1, 1, 'Categoria Perdida', 0),
+                ('blank', 'Blank', 'c:/blank', 'c:/', 'folder', 1, 1, 1, 1, '   ', 0)",
+            [],
+        )
+        .unwrap();
+
+        normalize_design_categories(&conn).unwrap();
+
+        let canonical: Option<String> = conn
+            .query_row(
+                "SELECT category FROM designs WHERE id = 'canonical'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let orphan: (Option<String>, i64) = conn
+            .query_row(
+                "SELECT category, category_user_set FROM designs WHERE id = 'orphan'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let blank: (Option<String>, i64) = conn
+            .query_row(
+                "SELECT category, category_user_set FROM designs WHERE id = 'blank'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(canonical.as_deref(), Some("Textos Y Efectos"));
+        assert_eq!(orphan, (None, 1));
+        assert_eq!(blank, (None, 1));
     }
 
     #[test]
