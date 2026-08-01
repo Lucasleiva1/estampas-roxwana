@@ -1090,6 +1090,9 @@ export default function App() {
           onCategoryFilter={(category) =>
             setFilters((current) => ({ ...createDefaultFilters(), query: current.query, categories: [category] }))
           }
+          onFavoritesFilter={() =>
+            setFilters((current) => ({ ...createDefaultFilters(), query: current.query, favoritesOnly: true }))
+          }
           onClear={() => setFilters(createDefaultFilters())}
           onCreateCategory={createCategory}
           onRenameCategory={renameCategory}
@@ -1254,6 +1257,12 @@ function Header({
           </button>
           {settingsOpen && (
             <div className="settings-popover">
+              <div className="settings-library-path">
+                <small>Biblioteca actual</small>
+                <strong title={library?.rootPath ?? DEFAULT_LIBRARY_PATH}>
+                  {library?.rootPath ?? DEFAULT_LIBRARY_PATH}
+                </strong>
+              </div>
               <button className="settings-action" onClick={onRunScan} disabled={loading}>
                 <RefreshCw size={16} className={loading ? "spin" : ""} />
                 <span>Escanear biblioteca</span>
@@ -1382,6 +1391,7 @@ function LeftFilters({
   filteredCount,
   scanning,
   onCategoryFilter,
+  onFavoritesFilter,
   onClear,
   onCreateCategory,
   onRenameCategory,
@@ -1396,6 +1406,7 @@ function LeftFilters({
   filteredCount: number;
   scanning: boolean;
   onCategoryFilter: (category: string) => void;
+  onFavoritesFilter: () => void;
   onClear: () => void;
   onCreateCategory: (name: string) => Promise<string | null>;
   onRenameCategory: (currentName: string, newName: string) => Promise<string | null>;
@@ -1419,6 +1430,10 @@ function LeftFilters({
   }, [allDesigns]);
   const uncategorizedCount = useMemo(
     () => allDesigns.filter((design) => !design.classification.category).length,
+    [allDesigns],
+  );
+  const favoritesCount = useMemo(
+    () => allDesigns.filter((design) => design.classification.favorite).length,
     [allDesigns],
   );
 
@@ -1486,7 +1501,18 @@ function LeftFilters({
           </form>
         )}
         <button
-          className={filters.categories.length === 0 ? "filter-row active" : "filter-row"}
+          className={filters.favoritesOnly ? "filter-row favorites-row active" : "filter-row favorites-row"}
+          onClick={onFavoritesFilter}
+          title="Ver todas mis estampas favoritas"
+        >
+          <span className="filter-name">
+            <Heart size={17} fill={filters.favoritesOnly ? "currentColor" : "none"} />
+            Mis favoritos
+          </span>
+          <span className="favorites-count">{favoritesCount.toLocaleString("es-AR")}</span>
+        </button>
+        <button
+          className={!filters.favoritesOnly && filters.categories.length === 0 ? "filter-row active" : "filter-row"}
           onClick={onClear}
           title="Ver todos los disenos"
         >

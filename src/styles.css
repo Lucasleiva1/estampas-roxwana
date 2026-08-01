@@ -297,6 +297,30 @@ button:disabled {
   background: #151719;
 }
 
+.settings-library-path {
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--rx-line-soft);
+  color: var(--rx-muted);
+}
+
+.settings-library-path small {
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.settings-library-path strong {
+  max-width: 300px;
+  overflow: hidden;
+  color: var(--rx-text);
+  font-size: 11px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .settings-backup {
   display: grid;
   gap: 8px;
@@ -665,6 +689,33 @@ button:disabled {
   border-color: #c31b22;
   color: #f4efe6;
   background: linear-gradient(90deg, rgb(143 24 28 / 65%), rgb(35 18 15 / 75%));
+}
+
+.favorites-row {
+  min-height: 44px;
+  border: 1px solid rgb(224 20 31 / 34%);
+  border-radius: 7px;
+  color: #eee6dc;
+  background: linear-gradient(90deg, rgb(104 16 22 / 28%), rgb(28 15 16 / 72%));
+}
+
+.favorites-row svg {
+  color: var(--rx-red);
+}
+
+.favorites-row.active {
+  border-color: var(--rx-red);
+  background: linear-gradient(90deg, rgb(160 20 29 / 78%), rgb(52 16 17 / 88%));
+  box-shadow: 0 0 18px rgb(224 20 31 / 16%);
+}
+
+.favorites-count {
+  min-width: 27px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  color: #f5e9dc;
+  text-align: center;
+  background: rgb(224 20 31 / 34%);
 }
 
 .filter-row.muted {

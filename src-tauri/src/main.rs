@@ -131,6 +131,7 @@ struct GroupBuilder {
     directory: PathBuf,
     group_type: String,
     name: String,
+    folder_category: Option<String>,
     files: Vec<DesignFile>,
 }
 
@@ -140,7 +141,16 @@ fn get_initial_state(app: AppHandle) -> Result<LibraryResponse, String> {
     ensure_database(&conn)?;
     let root =
         get_setting(&conn, "library_root")?.unwrap_or_else(|| DEFAULT_LIBRARY_PATH.to_string());
-    let should_scan = PathBuf::from(&root).exists() && active_design_count(&conn)? == 0;
+    let root_exists = PathBuf::from(&root).exists();
+    let should_scan = root_exists
+        && (active_design_count(&conn)? == 0 || active_library_has_missing_paths(&conn)?);
+
+    if !root_exists {
+        conn.execute("UPDATE designs SET missing = 1", [])
+            .map_err(to_string)?;
+        conn.execute("UPDATE files SET missing = 1", [])
+            .map_err(to_string)?;
+    }
     drop(conn);
 
     if should_scan {
@@ -527,6 +537,14 @@ fn scan_library_impl(app: &AppHandle, root_path: &str) -> Result<LibraryResponse
 
     let conn = open_database(app)?;
     ensure_database(&conn)?;
+    let previous_root = get_setting(&conn, "library_root")?;
+    let relocation_matches = previous_root
+        .as_deref()
+        .filter(|previous| {
+            normalize_path_for_id(Path::new(previous)) != normalize_path_for_id(&root)
+        })
+        .map(|previous| load_relocation_matches(&conn, Path::new(previous)))
+        .transpose()?;
     save_setting(&conn, "library_root", root_path)?;
     conn.execute("UPDATE designs SET missing = 1", [])
         .map_err(to_string)?;
@@ -540,6 +558,11 @@ fn scan_library_impl(app: &AppHandle, root_path: &str) -> Result<LibraryResponse
         design.preview_cache_path =
             cached_preview(app, design.preview_path.as_deref(), design.updated_at)?;
         persist_design(&conn, design)?;
+        if let Some(matches) = &relocation_matches {
+            if let Some(previous_id) = matches.get(&relocation_key(&root, design)) {
+                copy_design_classification(&conn, previous_id, &design.id)?;
+            }
+        }
         sync_auto_tags(&conn, &design.id, &design.auto_tags)?;
     }
 
@@ -877,6 +900,144 @@ fn active_design_count(conn: &Connection) -> Result<usize, String> {
     )
     .map(|count| count as usize)
     .map_err(to_string)
+}
+
+fn active_library_has_missing_paths(conn: &Connection) -> Result<bool, String> {
+    let mut stmt = conn
+        .prepare("SELECT path, group_type FROM designs WHERE missing = 0")
+        .map_err(to_string)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(to_string)?;
+
+    for row in rows {
+        let (path, group_type) = row.map_err(to_string)?;
+        if group_type == "folder" && !PathBuf::from(path).exists() {
+            return Ok(true);
+        }
+    }
+
+    let mut files_stmt = conn
+        .prepare("SELECT path FROM files WHERE missing = 0")
+        .map_err(to_string)?;
+    let file_paths = files_stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(to_string)?;
+    for file_path in file_paths {
+        if !PathBuf::from(file_path.map_err(to_string)?).exists() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn load_relocation_matches(
+    conn: &Connection,
+    previous_root: &Path,
+) -> Result<BTreeMap<String, String>, String> {
+    let mut stmt = conn
+        .prepare("SELECT id, path FROM designs")
+        .map_err(to_string)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(to_string)?;
+    let mut matches = BTreeMap::new();
+
+    for row in rows {
+        let (design_id, path) = row.map_err(to_string)?;
+        let mut files_stmt = conn
+            .prepare(
+                "SELECT file_name, size FROM files
+                 WHERE design_id = ?1
+                 ORDER BY lower(file_name), size",
+            )
+            .map_err(to_string)?;
+        let files = files_stmt
+            .query_map(params![design_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            })
+            .map_err(to_string)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(to_string)?;
+
+        if let Some(key) = relocation_key_parts(previous_root, Path::new(&path), &files) {
+            matches.insert(key, design_id);
+        }
+    }
+
+    Ok(matches)
+}
+
+fn relocation_key(root: &Path, design: &CollectedDesign) -> String {
+    let files = design
+        .files
+        .iter()
+        .map(|file| (file.file_name.clone(), file.size))
+        .collect::<Vec<_>>();
+    relocation_key_parts(root, &design.path, &files).unwrap_or_default()
+}
+
+fn relocation_key_parts(
+    root: &Path,
+    design_path: &Path,
+    files: &[(String, u64)],
+) -> Option<String> {
+    let relative = design_path.strip_prefix(root).ok()?;
+    let mut fingerprint = files
+        .iter()
+        .map(|(name, size)| format!("{}:{size}", name.to_lowercase()))
+        .collect::<Vec<_>>();
+    fingerprint.sort();
+    Some(format!(
+        "{}|{}",
+        normalize_path_for_id(relative),
+        fingerprint.join("|")
+    ))
+}
+
+fn copy_design_classification(
+    conn: &Connection,
+    previous_id: &str,
+    current_id: &str,
+) -> Result<(), String> {
+    if previous_id == current_id {
+        return Ok(());
+    }
+
+    conn.execute(
+        "UPDATE designs
+         SET favorite = (SELECT favorite FROM designs WHERE id = ?1),
+             status = (SELECT status FROM designs WHERE id = ?1),
+             category = CASE
+                 WHEN (SELECT category_user_set FROM designs WHERE id = ?1) = 1
+                 THEN (SELECT category FROM designs WHERE id = ?1)
+                 ELSE category
+             END,
+             category_user_set = (SELECT category_user_set FROM designs WHERE id = ?1),
+             first_seen = (SELECT first_seen FROM designs WHERE id = ?1)
+         WHERE id = ?2",
+        params![previous_id, current_id],
+    )
+    .map_err(to_string)?;
+    conn.execute(
+        "INSERT OR REPLACE INTO design_tags (design_id, tag_id, source)
+         SELECT ?2, tag_id, source
+         FROM design_tags
+         WHERE design_id = ?1 AND source = 'manual'",
+        params![previous_id, current_id],
+    )
+    .map_err(to_string)?;
+    conn.execute(
+        "INSERT OR IGNORE INTO ignored_auto_tags (design_id, lower_name)
+         SELECT ?2, lower_name FROM ignored_auto_tags WHERE design_id = ?1",
+        params![previous_id, current_id],
+    )
+    .map_err(to_string)?;
+    Ok(())
 }
 
 fn database_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -1239,29 +1400,43 @@ fn collect_designs_from_walk_roots(
                 .and_then(|value| value.to_str())
                 .unwrap_or("sin-nombre")
                 .to_string();
-            let (key, key_path, directory, group_type, name) = if same_path(&parent, &root) {
-                let key_path = root.join(&file_stem);
-                (
-                    format!("root:{}", file_stem.to_lowercase()),
-                    key_path,
-                    root.clone(),
-                    "loose_file".to_string(),
-                    title_from_slug(&file_stem),
-                )
-            } else {
-                let dir_name = parent
-                    .file_name()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or("sin-nombre")
-                    .to_string();
-                (
-                    normalize_path_for_id(&parent),
-                    parent.clone(),
-                    parent.clone(),
-                    "folder".to_string(),
-                    title_from_slug(&dir_name),
-                )
-            };
+            let folder_category = complete_folder_category(&root, &parent);
+            let is_direct_category_file = folder_category
+                .as_ref()
+                .is_some_and(|(_, category_dir)| same_path(category_dir, &parent));
+            let (key, key_path, directory, group_type, name) =
+                if same_path(&parent, &root) || is_direct_category_file {
+                    let key_path = root.join(&file_stem);
+                    let key_path = if is_direct_category_file {
+                        parent.join(&file_stem)
+                    } else {
+                        key_path
+                    };
+                    (
+                        format!(
+                            "loose:{}:{}",
+                            normalize_path_for_id(&parent),
+                            file_stem.to_lowercase()
+                        ),
+                        key_path,
+                        parent.clone(),
+                        "loose_file".to_string(),
+                        title_from_slug(&file_stem),
+                    )
+                } else {
+                    let dir_name = parent
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("sin-nombre")
+                        .to_string();
+                    (
+                        normalize_path_for_id(&parent),
+                        parent.clone(),
+                        parent.clone(),
+                        "folder".to_string(),
+                        title_from_slug(&dir_name),
+                    )
+                };
 
             let metadata = fs::metadata(&path).map_err(to_string)?;
             let modified = metadata
@@ -1291,6 +1466,7 @@ fn collect_designs_from_walk_roots(
                     directory,
                     group_type,
                     name,
+                    folder_category: folder_category.map(|(category, _)| category),
                     files: Vec::new(),
                 })
                 .files
@@ -1316,7 +1492,8 @@ fn collect_designs_from_walk_roots(
             .map(|file| file.modified)
             .max()
             .unwrap_or(0);
-        let (auto_category, auto_tags) = classify_design(&group.name, &group.files);
+        let (classified_category, auto_tags) = classify_design(&group.name, &group.files);
+        let auto_category = group.folder_category.or(classified_category);
 
         designs.push(CollectedDesign {
             id: design_id,
@@ -1337,6 +1514,35 @@ fn collect_designs_from_walk_roots(
 
     designs.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(designs)
+}
+
+fn complete_folder_category(root: &Path, parent: &Path) -> Option<(String, PathBuf)> {
+    let root_is_complete = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("1-COMPLETAS"));
+    let relative = parent.strip_prefix(root).ok()?;
+    let mut components = relative.components();
+    let (complete_root, category_component) = if root_is_complete {
+        (root.to_path_buf(), components.next()?)
+    } else {
+        let complete_component = components.next()?;
+        if !complete_component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|name| name.eq_ignore_ascii_case("1-COMPLETAS"))
+        {
+            return None;
+        }
+        (
+            root.join(complete_component.as_os_str()),
+            components.next()?,
+        )
+    };
+    let category_folder = complete_root.join(category_component.as_os_str());
+    let raw_name = category_component.as_os_str().to_str()?;
+    let category = normalize_category(&title_from_slug(raw_name))?;
+    Some((category, category_folder))
 }
 
 fn choose_preview(files: &[DesignFile]) -> Option<String> {
@@ -2182,6 +2388,86 @@ mod tests {
         assert!(designs
             .iter()
             .any(|design| design.name == "Skateboard Skull" && design.counts.psd == 1));
+    }
+
+    #[test]
+    fn imports_complete_folders_as_categories_and_keeps_each_image_separate() {
+        let dir = tempdir().unwrap();
+        let category = dir.path().join("1-COMPLETAS").join("Ninos y bebes");
+        fs::create_dir_all(&category).unwrap();
+        fs::write(category.join("osito.png"), b"image-one").unwrap();
+        fs::write(category.join("dinosaurio.jpg"), b"image-two").unwrap();
+
+        let designs = collect_designs(dir.path()).unwrap();
+
+        assert_eq!(designs.len(), 2);
+        assert!(designs.iter().all(|design| {
+            design.auto_category.as_deref() == Some("Ninos Y Bebes")
+                && design.group_type == "loose_file"
+                && design.files.len() == 1
+        }));
+    }
+
+    #[test]
+    fn applies_complete_folder_category_to_nested_design_folders() {
+        let dir = tempdir().unwrap();
+        let complete_root = dir.path().join("1-COMPLETAS");
+        let design_dir = complete_root.join("Animales").join("tigre-editable");
+        fs::create_dir_all(&design_dir).unwrap();
+        fs::write(design_dir.join("preview.png"), b"image").unwrap();
+        fs::write(design_dir.join("editable.psd"), b"support").unwrap();
+
+        let designs = collect_designs(&complete_root).unwrap();
+
+        assert_eq!(designs.len(), 1);
+        assert_eq!(designs[0].auto_category.as_deref(), Some("Animales"));
+        assert_eq!(designs[0].files.len(), 2);
+    }
+
+    #[test]
+    fn preserves_manual_classification_when_library_root_moves() {
+        let dir = tempdir().unwrap();
+        let previous_root = dir.path().join("anterior");
+        let current_root = dir.path().join("actual");
+        fs::create_dir_all(previous_root.join("diseno")).unwrap();
+        fs::create_dir_all(current_root.join("diseno")).unwrap();
+        fs::write(
+            previous_root.join("diseno").join("preview.png"),
+            b"same-image",
+        )
+        .unwrap();
+        fs::write(
+            current_root.join("diseno").join("preview.png"),
+            b"same-image",
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_database(&conn).unwrap();
+        let previous = collect_designs(&previous_root).unwrap().remove(0);
+        persist_design(&conn, &previous).unwrap();
+        upsert_category(&conn, "Mi rubro", true).unwrap();
+        conn.execute(
+            "UPDATE designs SET favorite = 1, status = 'ready', category = 'Mi Rubro', category_user_set = 1 WHERE id = ?1",
+            params![previous.id],
+        )
+        .unwrap();
+        conn.execute("UPDATE designs SET missing = 1", []).unwrap();
+        conn.execute("UPDATE files SET missing = 1", []).unwrap();
+
+        let matches = load_relocation_matches(&conn, &previous_root).unwrap();
+        let current = collect_designs(&current_root).unwrap().remove(0);
+        persist_design(&conn, &current).unwrap();
+        let previous_id = matches
+            .get(&relocation_key(&current_root, &current))
+            .unwrap();
+        copy_design_classification(&conn, previous_id, &current.id).unwrap();
+        let classification = load_classification(&conn, &current.id).unwrap();
+
+        assert!(classification.favorite);
+        assert_eq!(classification.status, "ready");
+        assert_eq!(classification.category.as_deref(), Some("Mi Rubro"));
+        assert!(classification.category_user_set);
     }
 
     #[test]

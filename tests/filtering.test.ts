@@ -65,6 +65,19 @@ describe("filtering", () => {
     expect(results[0].id).toBe("1");
   });
 
+  it("shows favorites independently of their category", () => {
+    const filters = createDefaultFilters();
+    filters.favoritesOnly = true;
+
+    const results = filterDesigns([
+      design({ id: "1", classification: { ...design({}).classification, favorite: true, category: "Skater" } }),
+      design({ id: "2", classification: { ...design({}).classification, favorite: true, category: "Infantil" } }),
+      design({ id: "3", classification: { ...design({}).classification, favorite: false, category: "Skater" } }),
+    ], filters);
+
+    expect(results.map((item) => item.id)).toEqual(["1", "2"]);
+  });
+
   it("chooses a stable random item when a random function is provided", () => {
     expect(chooseRandomDesign(["a", "b", "c"], () => 0.5)).toBe("b");
     expect(chooseRandomDesign([], () => 0.5)).toBeNull();
