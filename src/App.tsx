@@ -10,7 +10,6 @@ import {
   ChevronLeft,
   ChevronRight,
   Clock3,
-  Crown,
   FileImage,
   FileText,
   FolderOpen,
@@ -48,10 +47,12 @@ import {
   generatePreviewsBulk,
   generateThumbnail,
   generateThumbnailsBulk,
+  getBrandLogo,
   getDesignDetail,
   getInitialState,
   openDesignFolder,
   openBackupFolder,
+  removeBrandLogo,
   removeTag,
   rescanPaths,
   renameCategory as renameLibraryCategory,
@@ -61,9 +62,11 @@ import {
   restoreDatabaseBackup,
   scanLibrary,
   saveDatabaseBackup,
+  saveBrandLogo,
   updateCategory,
   updateFavorite,
   updateStatus,
+  type BrandLogo,
 } from "./lib/api";
 import { UNCATEGORIZED_CATEGORY, chooseRandomDesign, countForExtension, createDefaultFilters, filterDesigns } from "./lib/filtering";
 import {
@@ -155,6 +158,11 @@ type BackupState = {
   phase: "idle" | "saving" | "saved" | "opening" | "loading" | "loaded" | "error";
   message: string | null;
   path: string | null;
+};
+
+type BrandLogoState = {
+  phase: "idle" | "saving" | "saved" | "removing" | "removed" | "error";
+  message: string | null;
 };
 
 type RandomProgress = {
@@ -290,6 +298,8 @@ export default function App() {
   const [thumbnailPrep, setThumbnailPrep] = useState<ThumbnailPrepState>(initialThumbnailPrepState);
   const [previewPrep, setPreviewPrep] = useState<ThumbnailPrepState>(initialThumbnailPrepState);
   const [backupState, setBackupState] = useState<BackupState>(initialBackupState);
+  const [brandLogo, setBrandLogo] = useState<BrandLogo | null>(null);
+  const [brandLogoState, setBrandLogoState] = useState<BrandLogoState>({ phase: "idle", message: null });
   const [randomProgress, setRandomProgress] = useState<RandomProgress>({ seen: 0, total: 0 });
   const [pointerDrag, setPointerDrag] = useState<PointerDragState | null>(null);
   const attemptedPreviews = useRef<Set<string>>(new Set());
@@ -419,12 +429,31 @@ export default function App() {
     };
   }, [applyLibrary]);
 
+  useEffect(() => {
+    let alive = true;
+    getBrandLogo()
+      .then((logo) => {
+        if (alive) setBrandLogo(logo);
+      })
+      .catch((logoError) => {
+        if (alive) {
+          setBrandLogo(null);
+          setBrandLogoState({ phase: "error", message: `No se pudo cargar el logo guardado: ${String(logoError)}` });
+        }
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
   // Mantiene la biblioteca sincronizada con los archivos nuevos, modificados o
   // borrados. Se agrupan los eventos para que copiar una carpeta completa haga
   // un solo rescaneo localizado en vez de miles de rescaneos individuales.
   useEffect(() => {
     const rootPath = library?.rootPath;
     if (!rootPath) return;
+    const normalizedRoot = rootPath.replace(/\\/g, "/").replace(/\/$/, "").toLocaleLowerCase();
+    const referencesPrefix = `${normalizedRoot}/referencias`;
 
     let disposed = false;
     let stopWatching: (() => void) | null = null;
@@ -463,6 +492,7 @@ export default function App() {
         for (const path of event.paths) {
           const normalized = path.replace(/\\/g, "/").toLocaleLowerCase();
           if (normalized.split("/").includes("_roxwana-cache")) continue;
+          if (normalized === referencesPrefix || normalized.startsWith(`${referencesPrefix}/`)) continue;
           pendingPaths.add(path);
         }
         if (pendingPaths.size > 0) scheduleFlush();
@@ -591,6 +621,42 @@ export default function App() {
     });
     if (typeof selected === "string") await runScan(selected);
   };
+
+  const saveBrandLogoPath = useCallback(async (selected: string) => {
+    setBrandLogoState({ phase: "saving", message: "Preparando y guardando el logo..." });
+    try {
+      const saved = await saveBrandLogo(selected);
+      setBrandLogo(saved);
+      setBrandLogoState({
+        phase: "saved",
+        message: `Logo guardado (${saved.width} × ${saved.height} px).`,
+      });
+    } catch (logoError) {
+      setBrandLogoState({ phase: "error", message: `No se pudo guardar el logo: ${String(logoError)}` });
+    }
+  }, []);
+
+  const chooseBrandLogo = useCallback(async () => {
+    const selected = await openDialog({
+      directory: false,
+      multiple: false,
+      title: "Elegir logo de marca",
+      filters: [{ name: "Imagen", extensions: ["png", "jpg", "jpeg", "webp"] }],
+    });
+    if (typeof selected === "string") await saveBrandLogoPath(selected);
+  }, [saveBrandLogoPath]);
+
+  const clearBrandLogo = useCallback(async () => {
+    if (!brandLogo || !window.confirm("Quitar el logo de marca guardado?")) return;
+    setBrandLogoState({ phase: "removing", message: "Quitando el logo..." });
+    try {
+      await removeBrandLogo();
+      setBrandLogo(null);
+      setBrandLogoState({ phase: "removed", message: "Logo quitado." });
+    } catch (logoError) {
+      setBrandLogoState({ phase: "error", message: `No se pudo quitar el logo: ${String(logoError)}` });
+    }
+  }, [brandLogo]);
 
   const setFavorite = useCallback(async (design: Design, favorite: boolean) => {
     updateDesignLocal(design.id, (item) => ({ ...item, classification: { ...item.classification, favorite } }));
@@ -1355,11 +1421,11 @@ export default function App() {
     const selected = await openDialog({
       directory: false,
       multiple: false,
-      title: "Cargar copia de seguridad de ROXWANA",
-      filters: [{ name: "Copia de seguridad ROXWANA", extensions: ["sqlite", "db"] }],
+      title: "Cargar copia de seguridad de Biblioteca Visual",
+      filters: [{ name: "Copia de seguridad Biblioteca Visual", extensions: ["sqlite", "db"] }],
     });
     if (typeof selected !== "string") return;
-    if (!window.confirm("Cargar esta copia reemplaza el guardado actual de ROXWANA. Antes de reemplazarlo, la app guarda una copia de seguridad del estado actual. Continuar?")) return;
+    if (!window.confirm("Cargar esta copia reemplaza el guardado actual de Biblioteca Visual. Antes de reemplazarlo, la app guarda una copia de seguridad del estado actual. Continuar?")) return;
 
     setBackupState({ phase: "loading", message: "Cargando copia de seguridad...", path: selected });
     try {
@@ -1377,32 +1443,50 @@ export default function App() {
     }
   }, [applyLibrary]);
 
+  if (settingsOpen) {
+    return (
+      <main className="settings-shell">
+        <SettingsScreen
+          library={library}
+          brandLogo={brandLogo}
+          brandLogoState={brandLogoState}
+          onChooseBrandLogo={chooseBrandLogo}
+          onDropBrandLogo={saveBrandLogoPath}
+          onRemoveBrandLogo={clearBrandLogo}
+          loading={loading || scanning}
+          onChooseFolder={chooseFolder}
+          onRunScan={() => runScan()}
+          updateState={updateState}
+          onCheckForUpdates={checkForUpdates}
+          thumbnailPrep={thumbnailPrep}
+          onPrepareThumbnails={prepareThumbnails}
+          previewPrep={previewPrep}
+          onPreparePreviews={preparePreviews}
+          backupState={backupState}
+          onSaveBackup={saveBackupCopy}
+          onOpenBackupFolder={openBackupLocation}
+          onRestoreBackup={restoreBackupCopy}
+          error={error}
+          onDismissError={() => setError(null)}
+          onBack={() => setSettingsOpen(false)}
+        />
+      </main>
+    );
+  }
+
   return (
     <main className="visual-shell">
       <Header
-        library={library}
+        brandLogo={brandLogo}
         setFilters={setFilters}
-        selectedDesign={selectedDesign}
         loading={loading || scanning}
         onChooseFolder={chooseFolder}
         onRunScan={() => runScan()}
-        onFavorite={setFavorite}
         onRandomDesign={chooseRandom}
         randomProgress={randomProgress}
         showIconLabels={showIconLabels}
         setShowIconLabels={setShowIconLabels}
-        settingsOpen={settingsOpen}
         setSettingsOpen={setSettingsOpen}
-        updateState={updateState}
-        onCheckForUpdates={checkForUpdates}
-        thumbnailPrep={thumbnailPrep}
-        onPrepareThumbnails={prepareThumbnails}
-        previewPrep={previewPrep}
-        onPreparePreviews={preparePreviews}
-        backupState={backupState}
-        onSaveBackup={saveBackupCopy}
-        onOpenBackupFolder={openBackupLocation}
-        onRestoreBackup={restoreBackupCopy}
         uiScale={uiScale}
         setUiScale={setUiScale}
       />
@@ -1509,61 +1593,37 @@ export default function App() {
 }
 
 function Header({
-  library,
+  brandLogo,
   setFilters,
-  selectedDesign,
   loading,
   onChooseFolder,
   onRunScan,
-  onFavorite,
   onRandomDesign,
   randomProgress,
   showIconLabels,
   setShowIconLabels,
-  settingsOpen,
   setSettingsOpen,
-  updateState,
-  onCheckForUpdates,
-  thumbnailPrep,
-  onPrepareThumbnails,
-  previewPrep,
-  onPreparePreviews,
-  backupState,
-  onSaveBackup,
-  onOpenBackupFolder,
-  onRestoreBackup,
   uiScale,
   setUiScale,
 }: {
-  library: LibraryResponse | null;
+  brandLogo: BrandLogo | null;
   setFilters: React.Dispatch<React.SetStateAction<Filters>>;
-  selectedDesign: Design | null;
   loading: boolean;
   onChooseFolder: () => void;
   onRunScan: () => void;
-  onFavorite: (design: Design, favorite: boolean) => void;
   onRandomDesign: () => void;
   randomProgress: RandomProgress;
   showIconLabels: boolean;
   setShowIconLabels: (show: boolean) => void;
-  settingsOpen: boolean;
   setSettingsOpen: (open: boolean) => void;
-  updateState: AppUpdateState;
-  onCheckForUpdates: () => void;
-  thumbnailPrep: ThumbnailPrepState;
-  onPrepareThumbnails: () => void;
-  previewPrep: ThumbnailPrepState;
-  onPreparePreviews: () => void;
-  backupState: BackupState;
-  onSaveBackup: () => void;
-  onOpenBackupFolder: () => void;
-  onRestoreBackup: () => void;
   uiScale: number;
   setUiScale: (scale: number) => void;
 }) {
   // El zoom cambia el tamano del propio deslizador, asi que mientras se
   // arrastra solo se mueve este borrador y el zoom se aplica al soltar.
   const [scaleDraft, setScaleDraft] = useState<number | null>(null);
+  const [interfaceOpen, setInterfaceOpen] = useState(false);
+  const interfaceMenuRef = useRef<HTMLDivElement>(null);
   const scaleValue = scaleDraft ?? uiScale;
 
   const commitScale = useCallback(() => {
@@ -1583,27 +1643,43 @@ function Header({
     };
   }, [commitScale, scaleDraft]);
 
+  useEffect(() => {
+    if (!interfaceOpen) return;
+    const closeInterfaceMenu = (event: PointerEvent) => {
+      if (!interfaceMenuRef.current?.contains(event.target as Node)) setInterfaceOpen(false);
+    };
+    const closeWithEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setInterfaceOpen(false);
+    };
+    window.addEventListener("pointerdown", closeInterfaceMenu);
+    window.addEventListener("keydown", closeWithEscape);
+    return () => {
+      window.removeEventListener("pointerdown", closeInterfaceMenu);
+      window.removeEventListener("keydown", closeWithEscape);
+    };
+  }, [interfaceOpen]);
+
   const applyScale = (scale: number) => {
     setScaleDraft(null);
     setUiScale(scale);
   };
 
-  const updateBusy = updateState.phase === "checking" || updateState.phase === "downloading" || updateState.phase === "installing";
-  const thumbnailBusy = thumbnailPrep.phase === "running";
-  const thumbnailProgress = thumbnailPrep.total > 0 ? Math.round((thumbnailPrep.done / thumbnailPrep.total) * 100) : null;
-  const previewBusy = previewPrep.phase === "running";
-  const previewProgress = previewPrep.total > 0 ? Math.round((previewPrep.done / previewPrep.total) * 100) : null;
-  const backupBusy = backupState.phase === "saving" || backupState.phase === "opening" || backupState.phase === "loading";
   const randomRemaining = Math.max(0, randomProgress.total - randomProgress.seen);
 
   return (
     <header className="visual-header">
-      <section className="logo-area" title={library?.rootPath ?? DEFAULT_LIBRARY_PATH}>
-        <div className="rx-logo">
-          <Crown size={17} />
-          <strong>RXW</strong>
-          <span>Visual Library</span>
-        </div>
+      <section className={brandLogo ? "logo-area has-logo" : "logo-area empty"} aria-label="Logo de marca">
+        {brandLogo && (
+          <img
+            className="brand-logo"
+            src={brandLogo.dataUrl}
+            alt="Logo de la marca"
+            draggable={false}
+            onError={(event) => {
+              event.currentTarget.hidden = true;
+            }}
+          />
+        )}
       </section>
 
       <section className="window-actions">
@@ -1627,100 +1703,21 @@ function Header({
           <Shuffle size={15} />
         </button>
         <div className="settings-menu">
-          <button className={settingsOpen ? "icon-only active" : "icon-only"} title="Ajustes" onClick={() => setSettingsOpen(!settingsOpen)}>
+          <button className="icon-only" title="Ajustes" onClick={() => setSettingsOpen(true)}>
             <Settings size={18} />
           </button>
-          {settingsOpen && (
-            <div className="settings-popover">
-              <div className="settings-library-path">
-                <small>Biblioteca actual</small>
-                <strong title={library?.rootPath ?? DEFAULT_LIBRARY_PATH}>
-                  {library?.rootPath ?? DEFAULT_LIBRARY_PATH}
-                </strong>
-              </div>
-              <button className="settings-action" onClick={onRunScan} disabled={loading}>
-                <RefreshCw size={16} className={loading ? "spin" : ""} />
-                <span>Escanear biblioteca</span>
-              </button>
-              <button className="settings-action secondary" onClick={onPrepareThumbnails} disabled={thumbnailBusy || !library}>
-                {thumbnailBusy ? <Loader2 size={16} className="spin" /> : <FileImage size={16} />}
-                <span>{thumbnailBusy ? "Preparando..." : "Preparar miniaturas"}</span>
-              </button>
-              {thumbnailPrep.message && (
-                <div className={`update-status ${thumbnailPrep.phase}`}>
-                  <span>{thumbnailPrep.message}</span>
-                  {thumbnailPrep.total > 0 && (
-                    <>
-                      <small>
-                        {thumbnailPrep.done.toLocaleString("es-AR")} de {thumbnailPrep.total.toLocaleString("es-AR")}
-                      </small>
-                      <div className="update-progress" aria-label={`Progreso ${thumbnailProgress ?? 0}%`}>
-                        <span style={{ width: `${thumbnailProgress ?? 0}%` }} />
-                      </div>
-                    </>
-                  )}
-                </div>
-              )}
-              <button className="settings-action secondary" onClick={onPreparePreviews} disabled={previewBusy || !library}>
-                {previewBusy ? <Loader2 size={16} className="spin" /> : <Maximize2 size={16} />}
-                <span>{previewBusy ? "Optimizando visor..." : "Optimizar visor"}</span>
-              </button>
-              {previewPrep.message && (
-                <div className={`update-status ${previewPrep.phase}`}>
-                  <span>{previewPrep.message}</span>
-                  {previewPrep.total > 0 && (
-                    <>
-                      <small>
-                        {previewPrep.done.toLocaleString("es-AR")} de {previewPrep.total.toLocaleString("es-AR")}
-                      </small>
-                      <div className="update-progress" aria-label={`Progreso ${previewProgress ?? 0}%`}>
-                        <span style={{ width: `${previewProgress ?? 0}%` }} />
-                      </div>
-                    </>
-                  )}
-                </div>
-              )}
-              <div className="settings-backup">
-                <div className="settings-section-label">Copia de seguridad</div>
-                <div className="settings-backup-actions">
-                  <button type="button" onClick={onSaveBackup} disabled={backupBusy} title="Guardar copia de seguridad">
-                    {backupState.phase === "saving" ? <Loader2 size={15} className="spin" /> : <Save size={15} />}
-                    <span>Guardar</span>
-                  </button>
-                  <button type="button" onClick={onOpenBackupFolder} disabled={backupBusy} title="Abrir carpeta de copias">
-                    <FolderOpen size={15} />
-                    <span>Carpeta</span>
-                  </button>
-                  <button type="button" onClick={onRestoreBackup} disabled={backupBusy} title="Cargar copia de seguridad">
-                    {backupState.phase === "loading" ? <Loader2 size={15} className="spin" /> : <Upload size={15} />}
-                    <span>Cargar</span>
-                  </button>
-                </div>
-                {backupState.message && (
-                  <div className={`update-status ${backupState.phase}`}>
-                    <span>{backupState.message}</span>
-                    {backupState.path && <small>{backupState.path}</small>}
-                  </div>
-                )}
-              </div>
-              <button className="settings-action secondary" onClick={onCheckForUpdates} disabled={updateBusy}>
-                {updateState.phase === "done" || updateState.phase === "none" ? (
-                  <Check size={16} />
-                ) : (
-                  <RefreshCw size={16} className={updateBusy ? "spin" : ""} />
-                )}
-                <span>{updateBusy ? "Actualizando..." : "Buscar actualizacion"}</span>
-              </button>
-              {updateState.message && (
-                <div className={`update-status ${updateState.phase}`}>
-                  <span>{updateState.message}</span>
-                  {updateState.progress !== null && (
-                    <div className="update-progress" aria-label={`Progreso ${updateState.progress}%`}>
-                      <span style={{ width: `${updateState.progress}%` }} />
-                    </div>
-                  )}
-                </div>
-              )}
+        </div>
+        <div ref={interfaceMenuRef} className="interface-menu">
+          <button
+            type="button"
+            className={interfaceOpen ? "interface-trigger active" : "interface-trigger"}
+            onClick={() => setInterfaceOpen((open) => !open)}
+            aria-expanded={interfaceOpen}
+          >
+            Interfaz
+          </button>
+          {interfaceOpen && (
+            <div className="interface-popover">
               <div className="settings-scale">
                 <div className="settings-scale-label">
                   <span>Tamano de la interfaz</span>
@@ -1795,6 +1792,312 @@ function Header({
         </div>
       </section>
     </header>
+  );
+}
+
+function SettingsScreen({
+  library,
+  brandLogo,
+  brandLogoState,
+  onChooseBrandLogo,
+  onDropBrandLogo,
+  onRemoveBrandLogo,
+  loading,
+  onChooseFolder,
+  onRunScan,
+  updateState,
+  onCheckForUpdates,
+  thumbnailPrep,
+  onPrepareThumbnails,
+  previewPrep,
+  onPreparePreviews,
+  backupState,
+  onSaveBackup,
+  onOpenBackupFolder,
+  onRestoreBackup,
+  error,
+  onDismissError,
+  onBack,
+}: {
+  library: LibraryResponse | null;
+  brandLogo: BrandLogo | null;
+  brandLogoState: BrandLogoState;
+  onChooseBrandLogo: () => void;
+  onDropBrandLogo: (path: string) => void | Promise<void>;
+  onRemoveBrandLogo: () => void;
+  loading: boolean;
+  onChooseFolder: () => void;
+  onRunScan: () => void;
+  updateState: AppUpdateState;
+  onCheckForUpdates: () => void;
+  thumbnailPrep: ThumbnailPrepState;
+  onPrepareThumbnails: () => void;
+  previewPrep: ThumbnailPrepState;
+  onPreparePreviews: () => void;
+  backupState: BackupState;
+  onSaveBackup: () => void;
+  onOpenBackupFolder: () => void;
+  onRestoreBackup: () => void;
+  error: string | null;
+  onDismissError: () => void;
+  onBack: () => void;
+}) {
+  const [brandDragActive, setBrandDragActive] = useState(false);
+  const brandDropRef = useRef<HTMLDivElement>(null);
+  const draggedBrandPathsRef = useRef<string[]>([]);
+  const updateBusy = updateState.phase === "checking" || updateState.phase === "downloading" || updateState.phase === "installing";
+  const thumbnailBusy = thumbnailPrep.phase === "running";
+  const thumbnailProgress = thumbnailPrep.total > 0 ? Math.round((thumbnailPrep.done / thumbnailPrep.total) * 100) : null;
+  const previewBusy = previewPrep.phase === "running";
+  const previewProgress = previewPrep.total > 0 ? Math.round((previewPrep.done / previewPrep.total) * 100) : null;
+  const backupBusy = backupState.phase === "saving" || backupState.phase === "opening" || backupState.phase === "loading";
+  const brandLogoBusy = brandLogoState.phase === "saving" || brandLogoState.phase === "removing";
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onBack();
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [onBack]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+
+    const isInsideBrandDrop = (position: { x: number; y: number }) => {
+      const bounds = brandDropRef.current?.getBoundingClientRect();
+      if (!bounds) return false;
+      const pixelRatio = window.devicePixelRatio || 1;
+      const x = position.x / pixelRatio;
+      const y = position.y / pixelRatio;
+      return x >= bounds.left && x <= bounds.right && y >= bounds.top && y <= bounds.bottom;
+    };
+
+    void getCurrentWebview()
+      .onDragDropEvent((event) => {
+        if (disposed) return;
+        const payload = event.payload;
+        if (payload.type === "enter") {
+          draggedBrandPathsRef.current = payload.paths;
+          setBrandDragActive(payload.paths.length > 0 && isInsideBrandDrop(payload.position));
+          return;
+        }
+        if (payload.type === "over") {
+          setBrandDragActive(draggedBrandPathsRef.current.length > 0 && isInsideBrandDrop(payload.position));
+          return;
+        }
+        if (payload.type === "drop") {
+          const droppedPath = payload.paths[0];
+          const shouldSave = droppedPath && isInsideBrandDrop(payload.position);
+          draggedBrandPathsRef.current = [];
+          setBrandDragActive(false);
+          if (shouldSave) void onDropBrandLogo(droppedPath);
+          return;
+        }
+        draggedBrandPathsRef.current = [];
+        setBrandDragActive(false);
+      })
+      .then((stop) => {
+        if (disposed) stop();
+        else unlisten = stop;
+      })
+      .catch(() => {
+        if (!disposed) setBrandDragActive(false);
+      });
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [onDropBrandLogo]);
+
+  return (
+    <section className="settings-screen">
+      <header className="settings-screen-header">
+        <button type="button" className="settings-back" onClick={onBack} title="Volver a la biblioteca">
+          <ChevronLeft size={20} />
+          <span>Volver</span>
+        </button>
+        <div className="settings-screen-title">
+          <Settings size={22} />
+          <div>
+            <h1>Configuracion</h1>
+            <p>Personaliza la aplicacion y administra la biblioteca.</p>
+          </div>
+        </div>
+      </header>
+
+      {error && (
+        <div className="error-strip settings-error">
+          <span>{error}</span>
+          <button onClick={onDismissError} title="Cerrar">
+            <X size={16} />
+          </button>
+        </div>
+      )}
+
+      <div className="settings-screen-scroll">
+        <div className="settings-grid">
+          <section className="settings-card">
+            <div className="settings-card-header">
+              <FileImage size={19} />
+              <div>
+                <h2>Identidad de marca</h2>
+                <p>Logo que aparece en la esquina superior de la aplicacion.</p>
+              </div>
+            </div>
+            <div className="settings-brand">
+              <div
+                ref={brandDropRef}
+                className={`settings-brand-preview brand-drop-zone ${brandLogo ? "has-logo" : "empty"} ${brandDragActive ? "drag-active" : ""}`}
+              >
+                {brandDragActive ? (
+                  <div className="brand-drop-prompt">
+                    <Upload size={24} />
+                    <strong>Solta la imagen para usarla como logo</strong>
+                  </div>
+                ) : brandLogo ? (
+                  <img src={brandLogo.dataUrl} alt="Vista previa del logo" />
+                ) : (
+                  <>
+                    <ImageOff size={20} />
+                    <span>Arrastra una imagen aca o usa el boton</span>
+                  </>
+                )}
+              </div>
+              <div className="settings-brand-actions">
+                <button type="button" onClick={onChooseBrandLogo} disabled={brandLogoBusy}>
+                  {brandLogoState.phase === "saving" ? <Loader2 size={15} className="spin" /> : <Upload size={15} />}
+                  <span>{brandLogo ? "Cambiar imagen" : "Cargar imagen"}</span>
+                </button>
+                {brandLogo && (
+                  <button type="button" className="danger" onClick={onRemoveBrandLogo} disabled={brandLogoBusy} title="Quitar logo">
+                    {brandLogoState.phase === "removing" ? <Loader2 size={15} className="spin" /> : <Trash2 size={15} />}
+                  </button>
+                )}
+              </div>
+              <small>Arrastra una imagen sobre la vista previa o elegila con el boton. PNG, JPG o WebP.</small>
+              {brandLogoState.message && (
+                <div className={`update-status ${brandLogoState.phase}`} aria-live="polite">
+                  <span>{brandLogoState.message}</span>
+                </div>
+              )}
+            </div>
+          </section>
+
+          <section className="settings-card">
+            <div className="settings-card-header">
+              <FolderOpen size={19} />
+              <div>
+                <h2>Biblioteca y rendimiento</h2>
+                <p>Ubicacion de las estampas y caches visuales.</p>
+              </div>
+            </div>
+            <div className="settings-library-path">
+              <small>Biblioteca actual</small>
+              <strong title={library?.rootPath ?? DEFAULT_LIBRARY_PATH}>{library?.rootPath ?? DEFAULT_LIBRARY_PATH}</strong>
+            </div>
+            <div className="settings-action-list">
+              <button className="settings-action secondary" onClick={onChooseFolder} disabled={loading}>
+                <FolderOpen size={16} />
+                <span>Cambiar biblioteca</span>
+              </button>
+              <button className="settings-action" onClick={onRunScan} disabled={loading}>
+                <RefreshCw size={16} className={loading ? "spin" : ""} />
+                <span>Escanear biblioteca</span>
+              </button>
+              <button className="settings-action secondary" onClick={onPrepareThumbnails} disabled={thumbnailBusy || !library}>
+                {thumbnailBusy ? <Loader2 size={16} className="spin" /> : <FileImage size={16} />}
+                <span>{thumbnailBusy ? "Preparando..." : "Preparar miniaturas"}</span>
+              </button>
+              {thumbnailPrep.message && (
+                <div className={`update-status ${thumbnailPrep.phase}`} aria-live="polite">
+                  <span>{thumbnailPrep.message}</span>
+                  {thumbnailPrep.total > 0 && (
+                    <>
+                      <small>{thumbnailPrep.done.toLocaleString("es-AR")} de {thumbnailPrep.total.toLocaleString("es-AR")}</small>
+                      <div className="update-progress" aria-label={`Progreso ${thumbnailProgress ?? 0}%`}>
+                        <span style={{ width: `${thumbnailProgress ?? 0}%` }} />
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
+              <button className="settings-action secondary" onClick={onPreparePreviews} disabled={previewBusy || !library}>
+                {previewBusy ? <Loader2 size={16} className="spin" /> : <Maximize2 size={16} />}
+                <span>{previewBusy ? "Optimizando visor..." : "Optimizar visor"}</span>
+              </button>
+              {previewPrep.message && (
+                <div className={`update-status ${previewPrep.phase}`} aria-live="polite">
+                  <span>{previewPrep.message}</span>
+                  {previewPrep.total > 0 && (
+                    <>
+                      <small>{previewPrep.done.toLocaleString("es-AR")} de {previewPrep.total.toLocaleString("es-AR")}</small>
+                      <div className="update-progress" aria-label={`Progreso ${previewProgress ?? 0}%`}>
+                        <span style={{ width: `${previewProgress ?? 0}%` }} />
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
+            </div>
+          </section>
+
+          <section className="settings-card">
+            <div className="settings-card-header">
+              <Save size={19} />
+              <div>
+                <h2>Datos y actualizaciones</h2>
+                <p>Copias de seguridad y mantenimiento de la aplicacion.</p>
+              </div>
+            </div>
+            <div className="settings-backup">
+              <div className="settings-section-label">Copia de seguridad</div>
+              <div className="settings-backup-actions">
+                <button type="button" onClick={onSaveBackup} disabled={backupBusy} title="Guardar copia de seguridad">
+                  {backupState.phase === "saving" ? <Loader2 size={15} className="spin" /> : <Save size={15} />}
+                  <span>Guardar</span>
+                </button>
+                <button type="button" onClick={onOpenBackupFolder} disabled={backupBusy} title="Abrir carpeta de copias">
+                  <FolderOpen size={15} />
+                  <span>Carpeta</span>
+                </button>
+                <button type="button" onClick={onRestoreBackup} disabled={backupBusy} title="Cargar copia de seguridad">
+                  {backupState.phase === "loading" ? <Loader2 size={15} className="spin" /> : <Upload size={15} />}
+                  <span>Cargar</span>
+                </button>
+              </div>
+              {backupState.message && (
+                <div className={`update-status ${backupState.phase}`} aria-live="polite">
+                  <span>{backupState.message}</span>
+                  {backupState.path && <small>{backupState.path}</small>}
+                </div>
+              )}
+            </div>
+            <button className="settings-action secondary" onClick={onCheckForUpdates} disabled={updateBusy}>
+              {updateState.phase === "done" || updateState.phase === "none" ? (
+                <Check size={16} />
+              ) : (
+                <RefreshCw size={16} className={updateBusy ? "spin" : ""} />
+              )}
+              <span>{updateBusy ? "Actualizando..." : "Buscar actualizacion"}</span>
+            </button>
+            {updateState.message && (
+              <div className={`update-status ${updateState.phase}`} aria-live="polite">
+                <span>{updateState.message}</span>
+                {updateState.progress !== null && (
+                  <div className="update-progress" aria-label={`Progreso ${updateState.progress}%`}>
+                    <span style={{ width: `${updateState.progress}%` }} />
+                  </div>
+                )}
+              </div>
+            )}
+          </section>
+
+        </div>
+      </div>
+    </section>
   );
 }
 
@@ -2316,16 +2619,15 @@ function Viewer({
   const showingOriginal = Boolean(originalPath) && previewPath === originalPath;
   const previewFile = design?.files.find((file) => file.path === design.previewPath) ?? design?.files[0] ?? null;
   const imageCount = design ? countForExtension(design, ".jpg") + countForExtension(design, ".jpeg") + countForExtension(design, ".png") + countForExtension(design, ".webp") : 0;
+  const applicationAssets = design ? editableApplicationAssets(design) : [];
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const artboardRef = useRef<HTMLDivElement | null>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
   const dragStart = useRef<{ pointerId: number; x: number; y: number; panX: number; panY: number } | null>(null);
   const assetItems = design
-    ? [
-        { id: "img", kind: "image" as const, label: "Imagen", value: imageCount, tone: "red" as const },
-        { id: "ai", kind: "ai" as const, label: "Illustrator", value: countForExtension(design, ".ai"), tone: "gold" as const },
-        { id: "psd", kind: "psd" as const, label: "Photoshop", value: countForExtension(design, ".psd"), tone: "blue" as const },
-        { id: "eps", kind: "eps" as const, label: "EPS", value: countForExtension(design, ".eps"), tone: "gold" as const },
+      ? [
+          { id: "img", kind: "image" as const, label: "Imagen", value: imageCount, tone: "red" as const },
+          { id: "eps", kind: "eps" as const, label: "EPS", value: countForExtension(design, ".eps"), tone: "gold" as const },
         { id: "pdf", kind: "pdf" as const, label: "PDF", value: countForExtension(design, ".pdf"), tone: "neutral" as const },
         { id: "txt", kind: "txt" as const, label: "Texto", value: countForExtension(design, ".txt"), tone: "neutral" as const },
       ].filter((item) => item.value > 0)
@@ -2535,6 +2837,21 @@ function Viewer({
             <span>{previewFile?.fileName ?? design.name}</span>
           </div>
 
+          {applicationAssets.length > 0 && (
+            <div className="viewer-app-badges" aria-label="Aplicaciones de los archivos editables">
+              {applicationAssets.map((asset) => (
+                <span
+                  key={asset.kind}
+                  className={`viewer-app-badge ${asset.kind}`}
+                  title={`${asset.label}: ${asset.count.toLocaleString("es-AR")} archivo${asset.count === 1 ? "" : "s"}`}
+                >
+                  <AssetIcon kind={asset.kind} />
+                  <small>{asset.count.toLocaleString("es-AR")}</small>
+                </span>
+              ))}
+            </div>
+          )}
+
           {assetItems.length > 0 && (
             <div className="overlay-assets" aria-label="Archivos de esta estampa">
               {assetItems.map((item) => (
@@ -2562,6 +2879,17 @@ function Viewer({
 }
 
 type AssetKind = "image" | "ai" | "psd" | "eps" | "pdf" | "txt";
+
+function editableApplicationAssets(design: Design) {
+  return [
+    {
+      kind: "ai" as const,
+      label: "Illustrator",
+      count: countForExtension(design, ".ai") + countForExtension(design, ".eps"),
+    },
+    { kind: "psd" as const, label: "Photoshop", count: countForExtension(design, ".psd") },
+  ].filter((asset) => asset.count > 0);
+}
 
 function AssetIcon({ kind }: { kind: AssetKind }) {
   if (kind === "ai") return <img className="brand-file-logo" src={illustratorIcon} alt="" />;
@@ -2786,10 +3114,7 @@ const ThumbCard = memo(function ThumbCard({
   const source = sourcePath ? convertFileSrc(sourcePath) : null;
   const previewFile = design.files.find((file) => file.path === design.previewPath);
   const currentCategory = design.classification.category;
-  const editableAssets = [
-    { kind: "ai" as const, label: "Illustrator", count: countForExtension(design, ".ai") },
-    { kind: "psd" as const, label: "Photoshop", count: countForExtension(design, ".psd") },
-  ].filter((asset) => asset.count > 0);
+  const editableAssets = editableApplicationAssets(design);
 
   useEffect(() => {
     setSourceIndex(0);

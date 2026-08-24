@@ -12,6 +12,12 @@ export interface BackupInfo {
   manualCategoryDesigns: number;
 }
 
+export interface BrandLogo {
+  dataUrl: string;
+  width: number;
+  height: number;
+}
+
 export async function scanLibrary(rootPath = DEFAULT_LIBRARY_PATH) {
   return invoke<LibraryResponse>("scan_library", { rootPath });
 }
@@ -22,6 +28,18 @@ export async function rescanPaths(rootPath: string, paths: string[]) {
 
 export async function getInitialState() {
   return invoke<LibraryResponse>("get_initial_state");
+}
+
+export async function getBrandLogo() {
+  return invoke<BrandLogo | null>("get_brand_logo");
+}
+
+export async function saveBrandLogo(sourcePath: string) {
+  return invoke<BrandLogo>("save_brand_logo", { sourcePath });
+}
+
+export async function removeBrandLogo() {
+  await invoke("remove_brand_logo");
 }
 
 export async function getLibraryFromDb() {
