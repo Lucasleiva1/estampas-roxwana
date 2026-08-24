@@ -1,3 +1,5 @@
+import type { SidebarNode } from "./categories";
+
 export type DesignStatus = "pending" | "working" | "ready" | "discarded";
 export type ViewMode = "grid" | "masonry" | "list" | "detail";
 
@@ -65,6 +67,7 @@ export interface LibraryResponse {
   designs: Design[];
   stats: LibraryStats;
   categories: string[];
+  sidebar: SidebarNode[];
   tags: string[];
 }
 

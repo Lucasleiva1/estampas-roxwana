@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -27,7 +27,30 @@ struct LibraryResponse {
     designs: Vec<Design>,
     stats: LibraryStats,
     categories: Vec<String>,
+    sidebar: Vec<SidebarNode>,
     tags: Vec<String>,
+}
+
+/// One row of the category panel: either a loose category or a group that holds
+/// categories inside it.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SidebarNode {
+    kind: String,
+    name: String,
+    collapsed: bool,
+    children: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SidebarNodeInput {
+    kind: String,
+    name: String,
+    #[serde(default)]
+    collapsed: bool,
+    #[serde(default)]
+    children: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -139,6 +162,7 @@ struct GroupBuilder {
 fn get_initial_state(app: AppHandle) -> Result<LibraryResponse, String> {
     let conn = open_database(&app)?;
     ensure_database(&conn)?;
+    migrate_legacy_cache_to_portable(&app, &conn)?;
     let root =
         get_setting(&conn, "library_root")?.unwrap_or_else(|| DEFAULT_LIBRARY_PATH.to_string());
     let root_exists = PathBuf::from(&root).exists();
@@ -217,6 +241,129 @@ async fn generate_thumbnail(
         }
 
         Ok(thumbnail.map(|path| path_to_string(&path)))
+    })
+    .await
+    .map_err(to_string)?
+}
+
+/// Cantidad de hilos para convertir imagenes en paralelo. Deja nucleos libres
+/// para que la ventana de la app siga respondiendo mientras trabaja.
+fn worker_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(2).max(1))
+        .unwrap_or(1)
+}
+
+/// Genera las miniaturas de un lote completo repartiendo el trabajo entre
+/// varios hilos, con una sola escritura a la base de datos al final. Antes se
+/// hacia de a una desde el frontend, con un hilo y una conexion a la base por
+/// imagen: con miles de imagenes eso tardaba horas.
+#[tauri::command]
+async fn generate_thumbnails_bulk(
+    app: AppHandle,
+    items: Vec<(String, i64)>,
+) -> Result<Vec<(String, Option<String>)>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let workers = worker_count().min(items.len().max(1));
+        let queue = std::sync::Mutex::new(items.into_iter());
+        let results = std::sync::Mutex::new(Vec::new());
+
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| loop {
+                    let Some((preview_path, updated_at)) =
+                        queue.lock().ok().and_then(|mut q| q.next())
+                    else {
+                        break;
+                    };
+                    let path = PathBuf::from(&preview_path);
+                    let thumbnail = ensure_thumbnail(&app, Some(&path), updated_at)
+                        .ok()
+                        .flatten()
+                        .map(|found| path_to_string(&found));
+                    if let Ok(mut sink) = results.lock() {
+                        sink.push((preview_path, thumbnail));
+                    }
+                });
+            }
+        });
+
+        let done = results
+            .into_inner()
+            .map_err(|_| "hilo interrumpido".to_string())?;
+
+        let mut conn = open_database(&app)?;
+        ensure_database(&conn)?;
+        let tx = conn.transaction().map_err(to_string)?;
+        for (preview_path, thumbnail) in &done {
+            if let Some(thumbnail_path) = thumbnail {
+                tx.execute(
+                    "UPDATE designs SET thumbnail_path = ?1 WHERE preview_path = ?2",
+                    params![thumbnail_path, preview_path],
+                )
+                .map_err(to_string)?;
+            }
+        }
+        tx.commit().map_err(to_string)?;
+
+        Ok(done)
+    })
+    .await
+    .map_err(to_string)?
+}
+
+/// Prepara las vistas grandes que usa el visor usando todos los trabajadores
+/// reservados para cache. `worker_count` ya deja dos procesadores logicos
+/// libres para que la ventana siga respondiendo.
+#[tauri::command]
+async fn generate_previews_bulk(
+    app: AppHandle,
+    items: Vec<(String, i64)>,
+) -> Result<Vec<(String, Option<String>)>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let workers = worker_count().min(items.len().max(1));
+        let queue = std::sync::Mutex::new(items.into_iter());
+        let results = std::sync::Mutex::new(Vec::new());
+
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| loop {
+                    let Some((preview_path, updated_at)) =
+                        queue.lock().ok().and_then(|mut queue| queue.next())
+                    else {
+                        break;
+                    };
+                    let path = PathBuf::from(&preview_path);
+                    let preview = ensure_preview_cache(&app, Some(&path), updated_at)
+                        .ok()
+                        .flatten()
+                        .map(|found| path_to_string(&found));
+                    if let Ok(mut sink) = results.lock() {
+                        sink.push((preview_path, preview));
+                    }
+                });
+            }
+        });
+
+        let done = results
+            .into_inner()
+            .map_err(|_| "hilo interrumpido".to_string())?;
+
+        let mut conn = open_database(&app)?;
+        ensure_database(&conn)?;
+        let tx = conn.transaction().map_err(to_string)?;
+        for (preview_path, preview) in &done {
+            if let Some(preview_cache_path) = preview {
+                tx.execute(
+                    "UPDATE designs SET preview_cache_path = ?1 WHERE preview_path = ?2",
+                    params![preview_cache_path, preview_path],
+                )
+                .map_err(to_string)?;
+            }
+        }
+        tx.commit().map_err(to_string)?;
+
+        Ok(done)
     })
     .await
     .map_err(to_string)?
@@ -304,6 +451,12 @@ fn create_category(app: AppHandle, name: String) -> Result<String, String> {
         normalize_category(&name).ok_or_else(|| "La categoria esta vacia".to_string())?;
     let conn = open_database(&app)?;
     ensure_database(&conn)?;
+    ensure_sidebar_name_free(
+        &conn,
+        &category.to_lowercase(),
+        None,
+        Some(&category.to_lowercase()),
+    )?;
     upsert_category(&conn, &category, true)?;
     Ok(category)
 }
@@ -398,10 +551,115 @@ fn delete_category(app: AppHandle, name: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn reorder_categories(app: AppHandle, categories: Vec<String>) -> Result<Vec<String>, String> {
+fn save_sidebar_layout(
+    app: AppHandle,
+    nodes: Vec<SidebarNodeInput>,
+) -> Result<Vec<SidebarNode>, String> {
     let mut conn = open_database(&app)?;
     ensure_database(&conn)?;
-    set_category_order(&mut conn, &categories)
+    write_sidebar_layout(&mut conn, &nodes)
+}
+
+#[tauri::command]
+fn create_category_group(app: AppHandle, name: String) -> Result<String, String> {
+    let group = normalize_category(&name).ok_or_else(|| "El grupo esta vacio".to_string())?;
+    let lower = group.to_lowercase();
+    let conn = open_database(&app)?;
+    ensure_database(&conn)?;
+    ensure_sidebar_name_free(&conn, &lower, None, None)?;
+
+    conn.execute(
+        "INSERT INTO category_groups (id, name, lower_name, sort_order, collapsed)
+         VALUES (?1, ?2, ?3, COALESCE((SELECT MAX(sort_order) + 1 FROM category_groups), 0), 0)",
+        params![stable_id(&format!("group:{lower}")), group, lower],
+    )
+    .map_err(to_string)?;
+    Ok(group)
+}
+
+#[tauri::command]
+fn rename_category_group(
+    app: AppHandle,
+    current_name: String,
+    new_name: String,
+) -> Result<String, String> {
+    let current_lower = current_name.trim().to_lowercase();
+    if current_lower.is_empty() {
+        return Err("El grupo actual es invalido".to_string());
+    }
+    let renamed = normalize_category(&new_name).ok_or_else(|| "El grupo esta vacio".to_string())?;
+    let renamed_lower = renamed.to_lowercase();
+
+    let conn = open_database(&app)?;
+    ensure_database(&conn)?;
+    ensure_sidebar_name_free(&conn, &renamed_lower, Some(&current_lower), None)?;
+
+    let updated = conn
+        .execute(
+            "UPDATE category_groups SET name = ?1, lower_name = ?2 WHERE lower_name = ?3",
+            params![renamed, renamed_lower, current_lower],
+        )
+        .map_err(to_string)?;
+    if updated == 0 {
+        return Err("No encontre ese grupo".to_string());
+    }
+    Ok(renamed)
+}
+
+/// Deleting a group only removes the box: the categories inside go back to the
+/// panel, keeping the spot the group had.
+#[tauri::command]
+fn delete_category_group(app: AppHandle, name: String) -> Result<(), String> {
+    let lower = name.trim().to_lowercase();
+    if lower.is_empty() {
+        return Err("El grupo es invalido".to_string());
+    }
+
+    let mut conn = open_database(&app)?;
+    ensure_database(&conn)?;
+
+    let group: Option<(String, i64)> = conn
+        .query_row(
+            "SELECT id, sort_order FROM category_groups WHERE lower_name = ?1",
+            params![lower],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(to_string)?;
+    let (group_id, sort_order) = group.ok_or_else(|| "No encontre ese grupo".to_string())?;
+
+    let transaction = conn.transaction().map_err(to_string)?;
+    transaction
+        .execute(
+            "UPDATE categories SET group_id = NULL, sort_order = ?1 WHERE group_id = ?2",
+            params![sort_order, group_id],
+        )
+        .map_err(to_string)?;
+    transaction
+        .execute(
+            "DELETE FROM category_groups WHERE id = ?1",
+            params![group_id],
+        )
+        .map_err(to_string)?;
+    transaction.commit().map_err(to_string)?;
+    Ok(())
+}
+
+#[tauri::command]
+fn set_category_group_collapsed(
+    app: AppHandle,
+    name: String,
+    collapsed: bool,
+) -> Result<(), String> {
+    let lower = name.trim().to_lowercase();
+    let conn = open_database(&app)?;
+    ensure_database(&conn)?;
+    conn.execute(
+        "UPDATE category_groups SET collapsed = ?1 WHERE lower_name = ?2",
+        params![collapsed as i32, lower],
+    )
+    .map_err(to_string)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -662,7 +920,8 @@ fn load_library_from_db(conn: &Connection, root_path: &str) -> Result<LibraryRes
     }
 
     let stats = build_stats_from_db(conn)?;
-    let categories = load_categories(conn)?;
+    let sidebar = load_sidebar(conn)?;
+    let categories = flatten_sidebar(&sidebar);
     let tags = load_tags(conn)?;
 
     Ok(LibraryResponse {
@@ -670,6 +929,7 @@ fn load_library_from_db(conn: &Connection, root_path: &str) -> Result<LibraryRes
         designs,
         stats,
         categories,
+        sidebar,
         tags,
     })
 }
@@ -1200,6 +1460,14 @@ fn ensure_database(conn: &Connection) -> Result<(), String> {
             user_created INTEGER NOT NULL DEFAULT 0
         );
 
+        CREATE TABLE IF NOT EXISTS category_groups (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            lower_name TEXT NOT NULL UNIQUE,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            collapsed INTEGER NOT NULL DEFAULT 0
+        );
+
         CREATE TABLE IF NOT EXISTS designs (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
@@ -1260,6 +1528,16 @@ fn ensure_database(conn: &Connection) -> Result<(), String> {
     .map_err(to_string)?;
 
     conn.execute("ALTER TABLE designs ADD COLUMN preview_cache_path TEXT", [])
+        .or_else(|error| {
+            if error.to_string().contains("duplicate column name") {
+                Ok(0)
+            } else {
+                Err(error)
+            }
+        })
+        .map_err(to_string)?;
+
+    conn.execute("ALTER TABLE categories ADD COLUMN group_id TEXT", [])
         .or_else(|error| {
             if error.to_string().contains("duplicate column name") {
                 Ok(0)
@@ -1382,7 +1660,11 @@ fn collect_designs_from_walk_roots(
             continue;
         }
 
-        for entry in WalkDir::new(walk_root).follow_links(false).into_iter() {
+        for entry in WalkDir::new(walk_root)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|entry| !is_portable_cache_path(entry.path()))
+        {
             let entry = entry.map_err(to_string)?;
             if !entry.file_type().is_file() {
                 continue;
@@ -1757,25 +2039,57 @@ fn sync_auto_tags(conn: &Connection, design_id: &str, auto_tags: &[String]) -> R
     Ok(())
 }
 
-fn cached_thumbnail(
+/// Extensiones que puede tener una imagen cacheada, en orden de preferencia.
+/// WebP conserva transparencia; JPG es mas liviano para imagenes opacas.
+const CACHE_EXTENSIONS: [&str; 2] = ["webp", "jpg"];
+
+/// Lado maximo de una miniatura de la grilla.
+const THUMBNAIL_MAX_SIDE: u32 = 320;
+
+/// Lado maximo de la vista previa grande. Las imagenes mas chicas no se agrandan.
+const PREVIEW_MAX_SIDE: u32 = 1600;
+
+/// Calidad del JPG cacheado. Solo se usa para imagenes sin transparencia.
+const JPEG_QUALITY: u8 = 75;
+
+/// Nombre reservado para la cache que viaja junto a cada carpeta de originales.
+const PORTABLE_CACHE_DIR_NAME: &str = "_roxwana-cache";
+
+/// Busca una imagen ya cacheada probando cada extension posible.
+fn cached_image(
     app: &AppHandle,
+    cache_name: &str,
     preview_path: Option<&Path>,
     updated_at: i64,
 ) -> Result<Option<PathBuf>, String> {
     let Some(preview_path) = preview_path else {
         return Ok(None);
     };
-    let target = image_cache_path(app, "thumbnails", preview_path, updated_at, "webp")?;
-    if target.exists() {
-        return Ok(Some(target));
+    for extension in CACHE_EXTENSIONS {
+        let target = portable_image_cache_path(cache_name, preview_path, extension)?;
+        if portable_cache_is_fresh(&target, preview_path) {
+            return Ok(Some(target));
+        }
     }
 
-    let legacy_target = image_cache_path(app, "thumbnails", preview_path, updated_at, "jpg")?;
-    if legacy_target.exists() {
-        Ok(Some(legacy_target))
-    } else {
-        Ok(None)
+    // Compatibilidad transitoria con instalaciones anteriores. La migracion de
+    // inicio copia estos archivos a cada carpeta; este respaldo evita una vista
+    // vacia si la aplicacion se interrumpiera mientras migra.
+    for extension in CACHE_EXTENSIONS {
+        let target = legacy_image_cache_path(app, cache_name, preview_path, updated_at, extension)?;
+        if target.exists() {
+            return Ok(Some(target));
+        }
     }
+    Ok(None)
+}
+
+fn cached_thumbnail(
+    app: &AppHandle,
+    preview_path: Option<&Path>,
+    updated_at: i64,
+) -> Result<Option<PathBuf>, String> {
+    cached_image(app, "thumbnails", preview_path, updated_at)
 }
 
 fn cached_preview(
@@ -1783,15 +2097,7 @@ fn cached_preview(
     preview_path: Option<&Path>,
     updated_at: i64,
 ) -> Result<Option<PathBuf>, String> {
-    let Some(preview_path) = preview_path else {
-        return Ok(None);
-    };
-    let target = image_cache_path(app, "previews", preview_path, updated_at, "jpg")?;
-    if target.exists() {
-        Ok(Some(target))
-    } else {
-        Ok(None)
-    }
+    cached_image(app, "previews", preview_path, updated_at)
 }
 
 fn ensure_thumbnail(
@@ -1808,9 +2114,7 @@ fn ensure_thumbnail(
         "thumbnails",
         preview_path,
         updated_at,
-        320,
-        image::ImageFormat::WebP,
-        "webp",
+        THUMBNAIL_MAX_SIDE,
     )
 }
 
@@ -1823,44 +2127,153 @@ fn ensure_preview_cache(
         return Ok(None);
     };
 
-    ensure_cached_image(
-        app,
-        "previews",
-        preview_path,
-        updated_at,
-        1600,
-        image::ImageFormat::Jpeg,
-        "jpg",
-    )
+    ensure_cached_image(app, "previews", preview_path, updated_at, PREVIEW_MAX_SIDE)
 }
 
+/// True si la imagen tiene al menos un pixel que no es totalmente opaco.
+/// Un PNG puede declarar canal alfa sin usarlo; en ese caso conviene el JPG liviano.
+fn uses_transparency(image: &image::DynamicImage) -> bool {
+    use image::GenericImageView;
+
+    if !image.color().has_alpha() {
+        return false;
+    }
+    image.pixels().any(|(_, _, pixel)| pixel.0[3] < 255)
+}
+
+/// Genera la copia cacheada de una imagen.
+///
+/// Reglas:
+/// - Nunca agranda: si la imagen ya entra en `max_side`, se guarda en su tamano original.
+/// - Si hay que achicar, usa Lanczos3 (mas nitido que el filtro rapido).
+/// - Con transparencia real guarda WebP sin perdida; sin transparencia, JPG.
 fn ensure_cached_image(
     app: &AppHandle,
     cache_name: &str,
     preview_path: &Path,
     updated_at: i64,
     max_side: u32,
-    format: image::ImageFormat,
-    extension: &str,
 ) -> Result<Option<PathBuf>, String> {
-    let target = image_cache_path(app, cache_name, preview_path, updated_at, extension)?;
-    if target.exists() {
-        return Ok(Some(target));
+    if let Some(existing) = cached_image(app, cache_name, Some(preview_path), updated_at)? {
+        return Ok(Some(existing));
     }
 
-    match image::open(preview_path) {
-        Ok(image) => {
-            let cached = image.thumbnail(max_side, max_side);
+    let Ok(source) = image::open(preview_path) else {
+        return Ok(None);
+    };
+
+    let (width, height) = (source.width(), source.height());
+    let cached = if width > max_side || height > max_side {
+        // Reduccion en dos pasos. Lanczos3 directo sobre una imagen enorme
+        // (8000x8000 = 69 millones de pixeles) tarda decenas de segundos, asi
+        // que primero se baja el grueso con el filtro rapido y solo el tramo
+        // final se hace con Lanczos3, que es el que aporta la nitidez.
+        let prescale = max_side.saturating_mul(3);
+        let reduced = if width > prescale || height > prescale {
+            source.thumbnail(prescale, prescale)
+        } else {
+            source
+        };
+        reduced.resize(max_side, max_side, image::imageops::FilterType::Lanczos3)
+    } else {
+        source
+    };
+
+    let (extension, format) = if uses_transparency(&cached) {
+        ("webp", image::ImageFormat::WebP)
+    } else {
+        ("jpg", image::ImageFormat::Jpeg)
+    };
+
+    let target = portable_image_cache_path(cache_name, preview_path, extension)?;
+    let cache_dir = target
+        .parent()
+        .ok_or_else(|| "La ruta de cache portatil no tiene carpeta padre".to_string())?;
+    fs::create_dir_all(cache_dir).map_err(to_string)?;
+    let sequence = CACHE_TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temporary = target.with_extension(format!(
+        "{extension}.{}.{}.part",
+        std::process::id(),
+        sequence
+    ));
+    let write_result = match format {
+        image::ImageFormat::Jpeg => {
+            let mut file = fs::File::create(&temporary).map_err(to_string)?;
+            let encoder =
+                image::codecs::jpeg::JpegEncoder::new_with_quality(&mut file, JPEG_QUALITY);
             cached
-                .save_with_format(&target, format)
-                .map_err(to_string)?;
-            Ok(Some(target))
+                .to_rgb8()
+                .write_with_encoder(encoder)
+                .map_err(to_string)
         }
-        Err(_) => Ok(None),
+        _ => cached
+            .into_rgba8()
+            .save_with_format(&temporary, format)
+            .map_err(to_string),
+    };
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+
+    if target.exists() {
+        fs::remove_file(&target).map_err(to_string)?;
+    }
+    if let Err(error) = fs::rename(&temporary, &target) {
+        let _ = fs::remove_file(&temporary);
+        if target.exists() {
+            return Ok(Some(target));
+        }
+        return Err(to_string(error));
+    }
+    Ok(Some(target))
+}
+
+static CACHE_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn portable_image_cache_path(
+    cache_name: &str,
+    preview_path: &Path,
+    extension: &str,
+) -> Result<PathBuf, String> {
+    let parent = preview_path.parent().ok_or_else(|| {
+        format!(
+            "La imagen no tiene carpeta padre: {}",
+            preview_path.display()
+        )
+    })?;
+    let file_name = preview_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("imagen")
+        .to_lowercase();
+    let cache_key = stable_id(&file_name);
+    Ok(parent
+        .join(PORTABLE_CACHE_DIR_NAME)
+        .join(cache_name)
+        .join(format!("{cache_key}.{extension}")))
+}
+
+fn portable_cache_is_fresh(cache_path: &Path, source_path: &Path) -> bool {
+    if !cache_path.exists() {
+        return false;
+    }
+
+    let Ok(source_metadata) = fs::metadata(source_path) else {
+        // Si falta temporalmente el original, conservar la vista previa que ya
+        // viajo en la carpeta es mejor que dejar el visor vacio.
+        return true;
+    };
+    let Ok(cache_metadata) = fs::metadata(cache_path) else {
+        return false;
+    };
+    match (source_metadata.modified(), cache_metadata.modified()) {
+        (Ok(source_modified), Ok(cache_modified)) => cache_modified >= source_modified,
+        _ => true,
     }
 }
 
-fn image_cache_path(
+fn legacy_image_cache_path(
     app: &AppHandle,
     cache_name: &str,
     preview_path: &Path,
@@ -1879,8 +2292,89 @@ fn image_cache_path(
         .app_local_data_dir()
         .map_err(|error| format!("No se pudo resolver APPLOCALDATA: {error}"))?
         .join(cache_name);
-    fs::create_dir_all(&cache_dir).map_err(to_string)?;
     Ok(cache_dir.join(format!("{cache_key}.{extension}")))
+}
+
+fn is_portable_cache_path(path: &Path) -> bool {
+    path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(PORTABLE_CACHE_DIR_NAME)
+    })
+}
+
+/// Copia la cache central de versiones anteriores al lado de cada original y
+/// actualiza la base. No borra el origen: la eliminacion se hace solo despues
+/// de una verificacion externa completa y de conservar una copia de seguridad.
+fn migrate_legacy_cache_to_portable(app: &AppHandle, conn: &Connection) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT preview_path, updated_at, thumbnail_path, preview_cache_path
+             FROM designs
+             WHERE missing = 0 AND preview_path IS NOT NULL",
+        )
+        .map_err(to_string)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .map_err(to_string)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(to_string)?;
+    drop(stmt);
+
+    for (preview_path, _updated_at, thumbnail_path, preview_cache_path) in rows {
+        let source_image = PathBuf::from(&preview_path);
+        for (cache_name, stored_path, column) in [
+            ("thumbnails", thumbnail_path, "thumbnail_path"),
+            ("previews", preview_cache_path, "preview_cache_path"),
+        ] {
+            let Some(stored_path) = stored_path else {
+                continue;
+            };
+            let legacy = PathBuf::from(&stored_path);
+            if !legacy.exists() || is_portable_cache_path(&legacy) {
+                continue;
+            }
+            let Some(extension) = legacy.extension().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            let target = portable_image_cache_path(cache_name, &source_image, extension)?;
+            if !target.exists() {
+                let target_dir = target
+                    .parent()
+                    .ok_or_else(|| "La cache portatil no tiene carpeta padre".to_string())?;
+                fs::create_dir_all(target_dir).map_err(to_string)?;
+                let sequence =
+                    CACHE_TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let temporary = target.with_extension(format!(
+                    "{extension}.migration.{}.{}.part",
+                    std::process::id(),
+                    sequence
+                ));
+                let copied = fs::copy(&legacy, &temporary).map_err(to_string)?;
+                if copied == 0 || copied != fs::metadata(&legacy).map_err(to_string)?.len() {
+                    let _ = fs::remove_file(&temporary);
+                    return Err(format!("La copia quedo incompleta: {}", legacy.display()));
+                }
+                fs::rename(&temporary, &target).map_err(to_string)?;
+            }
+            let sql = format!("UPDATE designs SET {column} = ?1 WHERE preview_path = ?2");
+            conn.execute(&sql, params![path_to_string(&target), preview_path])
+                .map_err(to_string)?;
+        }
+    }
+
+    // Resolver la ruta valida aqui tambien mantiene fallos de configuracion
+    // visibles durante la migracion, aunque no haya filas antiguas.
+    let _ = app.path().app_local_data_dir().map_err(to_string)?;
+    Ok(())
 }
 
 fn classify_design(name: &str, files: &[DesignFile]) -> (Option<String>, Vec<String>) {
@@ -2164,50 +2658,230 @@ fn get_tag_id(conn: &Connection, lower_name: &str) -> Result<Option<String>, Str
     .map_err(to_string)
 }
 
+/// Categories in the order the panel shows them: loose categories and groups by
+/// their position, with the categories of a group right after their group.
 fn load_categories(conn: &Connection) -> Result<Vec<String>, String> {
-    let mut stmt = conn
-        .prepare("SELECT name FROM categories ORDER BY sort_order, name COLLATE NOCASE")
+    Ok(flatten_sidebar(&load_sidebar(conn)?))
+}
+
+fn flatten_sidebar(sidebar: &[SidebarNode]) -> Vec<String> {
+    let mut names = Vec::new();
+    for node in sidebar {
+        if node.kind == "group" {
+            names.extend(node.children.iter().cloned());
+        } else {
+            names.push(node.name.clone());
+        }
+    }
+    names
+}
+
+fn load_sidebar(conn: &Connection) -> Result<Vec<SidebarNode>, String> {
+    let mut group_stmt = conn
+        .prepare(
+            "SELECT id, name, sort_order, collapsed FROM category_groups
+             ORDER BY sort_order, name COLLATE NOCASE",
+        )
         .map_err(to_string)?;
-    let categories = stmt
+    let groups = group_stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)? != 0,
+            ))
+        })
+        .map_err(to_string)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(to_string)?;
+
+    let mut category_stmt = conn
+        .prepare(
+            "SELECT name, sort_order, group_id FROM categories
+             ORDER BY sort_order, name COLLATE NOCASE",
+        )
+        .map_err(to_string)?;
+    let categories = category_stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .map_err(to_string)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(to_string)?;
+
+    let group_ids = groups
+        .iter()
+        .map(|(id, _, _, _)| id.clone())
+        .collect::<BTreeSet<_>>();
+
+    let mut children: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut roots: Vec<(i64, String, SidebarNode)> = Vec::new();
+
+    for (name, sort_order, group_id) in categories {
+        match group_id {
+            Some(id) if group_ids.contains(&id) => {
+                children.entry(id).or_default().push(name);
+            }
+            _ => {
+                let lower = name.to_lowercase();
+                roots.push((
+                    sort_order,
+                    lower,
+                    SidebarNode {
+                        kind: String::from("category"),
+                        name,
+                        collapsed: false,
+                        children: Vec::new(),
+                    },
+                ));
+            }
+        }
+    }
+
+    for (id, name, sort_order, collapsed) in groups {
+        let group_children = children.remove(&id).unwrap_or_default();
+        let lower = name.to_lowercase();
+        roots.push((
+            sort_order,
+            lower,
+            SidebarNode {
+                kind: String::from("group"),
+                name,
+                collapsed,
+                children: group_children,
+            },
+        ));
+    }
+
+    roots.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    Ok(roots.into_iter().map(|(_, _, node)| node).collect())
+}
+
+fn load_group_names(conn: &Connection) -> Result<Vec<String>, String> {
+    let mut stmt = conn
+        .prepare("SELECT name FROM category_groups ORDER BY sort_order, name COLLATE NOCASE")
+        .map_err(to_string)?;
+    let names = stmt
         .query_map([], |row| row.get::<_, String>(0))
         .map_err(to_string)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(to_string)?;
-    Ok(categories)
+    Ok(names)
 }
 
-fn set_category_order(conn: &mut Connection, categories: &[String]) -> Result<Vec<String>, String> {
-    let existing = load_categories(conn)?;
-    let existing_names = existing
+/// Groups and categories share the panel, so a name can only belong to one of them.
+fn ensure_sidebar_name_free(
+    conn: &Connection,
+    lower_name: &str,
+    allow_group: Option<&str>,
+    allow_category: Option<&str>,
+) -> Result<(), String> {
+    let group_taken: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM category_groups WHERE lower_name = ?1 AND lower_name <> ?2",
+            params![lower_name, allow_group.unwrap_or("")],
+            |row| row.get(0),
+        )
+        .map_err(to_string)?;
+    if group_taken > 0 {
+        return Err("Ya existe un grupo con ese nombre".to_string());
+    }
+
+    let category_taken: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM categories WHERE lower_name = ?1 AND lower_name <> ?2",
+            params![lower_name, allow_category.unwrap_or("")],
+            |row| row.get(0),
+        )
+        .map_err(to_string)?;
+    if category_taken > 0 {
+        return Err("Ya existe una categoria con ese nombre".to_string());
+    }
+
+    Ok(())
+}
+
+fn write_sidebar_layout(
+    conn: &mut Connection,
+    nodes: &[SidebarNodeInput],
+) -> Result<Vec<SidebarNode>, String> {
+    let existing_categories = load_categories(conn)?
         .iter()
         .map(|name| name.trim().to_lowercase())
         .collect::<BTreeSet<_>>();
-    let requested_names = categories
+    let existing_groups = load_group_names(conn)?
         .iter()
         .map(|name| name.trim().to_lowercase())
         .collect::<BTreeSet<_>>();
 
-    if categories.len() != existing.len()
-        || requested_names.len() != categories.len()
-        || requested_names != existing_names
-    {
-        return Err("El orden de categorias no coincide con la biblioteca actual".to_string());
+    let mut seen_categories = BTreeSet::new();
+    let mut seen_groups = BTreeSet::new();
+    for node in nodes {
+        let lower = node.name.trim().to_lowercase();
+        if node.kind == "group" {
+            if !seen_groups.insert(lower) {
+                return Err("El panel tiene grupos repetidos".to_string());
+            }
+            for child in &node.children {
+                if !seen_categories.insert(child.trim().to_lowercase()) {
+                    return Err("El panel tiene categorias repetidas".to_string());
+                }
+            }
+        } else {
+            if !node.children.is_empty() {
+                return Err("Una categoria no puede contener otras".to_string());
+            }
+            if !seen_categories.insert(lower) {
+                return Err("El panel tiene categorias repetidas".to_string());
+            }
+        }
+    }
+
+    if seen_categories != existing_categories || seen_groups != existing_groups {
+        return Err("El orden del panel no coincide con la biblioteca actual".to_string());
     }
 
     let transaction = conn.transaction().map_err(to_string)?;
-    for (index, category) in categories.iter().enumerate() {
-        let updated = transaction
-            .execute(
-                "UPDATE categories SET sort_order = ?1 WHERE lower_name = ?2",
-                params![index as i64, category.trim().to_lowercase()],
-            )
-            .map_err(to_string)?;
-        if updated != 1 {
-            return Err(format!("No se pudo ordenar la categoria: {category}"));
+    for (index, node) in nodes.iter().enumerate() {
+        let lower = node.name.trim().to_lowercase();
+        if node.kind == "group" {
+            transaction
+                .execute(
+                    "UPDATE category_groups SET sort_order = ?1, collapsed = ?2 WHERE lower_name = ?3",
+                    params![index as i64, node.collapsed as i32, lower],
+                )
+                .map_err(to_string)?;
+            let group_id: String = transaction
+                .query_row(
+                    "SELECT id FROM category_groups WHERE lower_name = ?1",
+                    params![lower],
+                    |row| row.get(0),
+                )
+                .map_err(to_string)?;
+            for (child_index, child) in node.children.iter().enumerate() {
+                transaction
+                    .execute(
+                        "UPDATE categories SET group_id = ?1, sort_order = ?2 WHERE lower_name = ?3",
+                        params![group_id, child_index as i64, child.trim().to_lowercase()],
+                    )
+                    .map_err(to_string)?;
+            }
+        } else {
+            transaction
+                .execute(
+                    "UPDATE categories SET group_id = NULL, sort_order = ?1 WHERE lower_name = ?2",
+                    params![index as i64, lower],
+                )
+                .map_err(to_string)?;
         }
     }
     transaction.commit().map_err(to_string)?;
-    load_categories(conn)
+    load_sidebar(conn)
 }
 
 fn load_tags(conn: &Connection) -> Result<Vec<String>, String> {
@@ -2345,14 +3019,20 @@ fn main() {
             scan_library,
             rescan_paths,
             generate_thumbnail,
+            generate_thumbnails_bulk,
             generate_preview,
+            generate_previews_bulk,
             update_design_favorite,
             update_design_status,
             update_design_category,
             create_category,
             rename_category,
             delete_category,
-            reorder_categories,
+            save_sidebar_layout,
+            create_category_group,
+            rename_category_group,
+            delete_category_group,
+            set_category_group_collapsed,
             add_design_tag,
             remove_design_tag,
             open_design_folder,
@@ -2490,16 +3170,26 @@ mod tests {
     }
 
     #[test]
-    fn persists_category_order() {
+    fn persists_sidebar_order() {
         let mut conn = Connection::open_in_memory().unwrap();
         ensure_database(&conn).unwrap();
-        let mut categories = load_categories(&conn).unwrap();
-        categories.swap(0, 1);
+        let mut sidebar = load_sidebar(&conn).unwrap();
+        sidebar.swap(0, 1);
+        let nodes = sidebar
+            .iter()
+            .map(|node| SidebarNodeInput {
+                kind: node.kind.clone(),
+                name: node.name.clone(),
+                collapsed: node.collapsed,
+                children: node.children.clone(),
+            })
+            .collect::<Vec<_>>();
+        let expected = flatten_sidebar(&sidebar);
 
-        let saved = set_category_order(&mut conn, &categories).unwrap();
+        let saved = write_sidebar_layout(&mut conn, &nodes).unwrap();
 
-        assert_eq!(saved, categories);
-        assert_eq!(load_categories(&conn).unwrap(), categories);
+        assert_eq!(flatten_sidebar(&saved), expected);
+        assert_eq!(load_categories(&conn).unwrap(), expected);
     }
 
     #[test]

@@ -1,7 +1,14 @@
 import { describe, expect, it } from "vitest";
 import { classifyExtension } from "../src/lib/fileTypes";
 import { UNCATEGORIZED_CATEGORY, chooseRandomDesign, createDefaultFilters, filterDesigns } from "../src/lib/filtering";
-import { reorderCategoryList } from "../src/lib/categories";
+import {
+  categoryNode,
+  flattenSidebar,
+  moveSidebarNode,
+  removeGroupFromSidebar,
+  sidebarFromCategories,
+  type SidebarNode,
+} from "../src/lib/categories";
 import type { Design } from "../src/lib/types";
 
 function design(overrides: Partial<Design>): Design {
@@ -84,14 +91,50 @@ describe("filtering", () => {
   });
 });
 
-describe("category ordering", () => {
+function group(name: string, children: string[], collapsed = false): SidebarNode {
+  return { kind: "group", name, collapsed, children };
+}
+
+describe("category panel layout", () => {
+  const layout = sidebarFromCategories(["Skater", "Calaveras", "Surf"]);
+
   it("moves a category before the drop target", () => {
-    expect(reorderCategoryList(["Skater", "Calaveras", "Surf"], "Surf", "Skater", "before"))
-      .toEqual(["Surf", "Skater", "Calaveras"]);
+    const next = moveSidebarNode(layout, { kind: "category", name: "Surf" }, { kind: "category", name: "Skater" }, "before");
+    expect(flattenSidebar(next)).toEqual(["Surf", "Skater", "Calaveras"]);
   });
 
   it("moves a category after the drop target", () => {
-    expect(reorderCategoryList(["Skater", "Calaveras", "Surf"], "Skater", "Surf", "after"))
-      .toEqual(["Calaveras", "Surf", "Skater"]);
+    const next = moveSidebarNode(layout, { kind: "category", name: "Skater" }, { kind: "category", name: "Surf" }, "after");
+    expect(flattenSidebar(next)).toEqual(["Calaveras", "Surf", "Skater"]);
+  });
+
+  it("drops a category inside a group", () => {
+    const withGroup = [categoryNode("Skater"), group("Verano", ["Surf"]), categoryNode("Calaveras")];
+    const next = moveSidebarNode(withGroup, { kind: "category", name: "Calaveras" }, { kind: "group", name: "Verano" }, "inside");
+    expect(next).toEqual([categoryNode("Skater"), group("Verano", ["Surf", "Calaveras"])]);
+  });
+
+  it("orders the categories a group already holds", () => {
+    const withGroup = [group("Verano", ["Surf", "Playa", "Palmeras"])];
+    const next = moveSidebarNode(withGroup, { kind: "category", name: "Palmeras" }, { kind: "category", name: "Surf" }, "before");
+    expect(next).toEqual([group("Verano", ["Palmeras", "Surf", "Playa"])]);
+  });
+
+  it("takes a category out of a group when it lands on a loose one", () => {
+    const withGroup = [categoryNode("Skater"), group("Verano", ["Surf", "Playa"])];
+    const next = moveSidebarNode(withGroup, { kind: "category", name: "Playa" }, { kind: "category", name: "Skater" }, "before");
+    expect(next).toEqual([categoryNode("Playa"), categoryNode("Skater"), group("Verano", ["Surf"])]);
+  });
+
+  it("moves a group between the categories without nesting it", () => {
+    const withGroup = [categoryNode("Skater"), group("Verano", ["Surf"]), group("Invierno", ["Nieve"])];
+    const next = moveSidebarNode(withGroup, { kind: "group", name: "Invierno" }, { kind: "group", name: "Verano" }, "inside");
+    expect(next).toEqual([categoryNode("Skater"), group("Verano", ["Surf"]), group("Invierno", ["Nieve"])]);
+  });
+
+  it("keeps the categories of a deleted group in its spot", () => {
+    const withGroup = [categoryNode("Skater"), group("Verano", ["Surf", "Playa"]), categoryNode("Calaveras")];
+    expect(flattenSidebar(removeGroupFromSidebar(withGroup, "Verano")))
+      .toEqual(["Skater", "Surf", "Playa", "Calaveras"]);
   });
 });

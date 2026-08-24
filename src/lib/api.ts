@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { SidebarNode } from "./categories";
 import type { Design, DesignStatus, LibraryResponse } from "./types";
 
 const DEFAULT_LIBRARY_PATH = "C:\\Users\\jaell\\Documents\\estampas-roxwana";
@@ -55,8 +56,24 @@ export async function deleteCategory(name: string) {
   await invoke("delete_category", { name });
 }
 
-export async function reorderCategories(categories: string[]) {
-  return invoke<string[]>("reorder_categories", { categories });
+export async function saveSidebarLayout(nodes: SidebarNode[]) {
+  return invoke<SidebarNode[]>("save_sidebar_layout", { nodes });
+}
+
+export async function createCategoryGroup(name: string) {
+  return invoke<string>("create_category_group", { name });
+}
+
+export async function renameCategoryGroup(currentName: string, newName: string) {
+  return invoke<string>("rename_category_group", { currentName, newName });
+}
+
+export async function deleteCategoryGroup(name: string) {
+  await invoke("delete_category_group", { name });
+}
+
+export async function setCategoryGroupCollapsed(name: string, collapsed: boolean) {
+  await invoke("set_category_group_collapsed", { name, collapsed });
 }
 
 export async function addTag(designId: string, tag: string) {
@@ -71,8 +88,16 @@ export async function generateThumbnail(previewPath: string, updatedAt: number) 
   return invoke<string | null>("generate_thumbnail", { previewPath, updatedAt });
 }
 
+export async function generateThumbnailsBulk(items: Array<[string, number]>) {
+  return invoke<Array<[string, string | null]>>("generate_thumbnails_bulk", { items });
+}
+
 export async function generatePreview(previewPath: string, updatedAt: number) {
   return invoke<string | null>("generate_preview", { previewPath, updatedAt });
+}
+
+export async function generatePreviewsBulk(items: Array<[string, number]>) {
+  return invoke<Array<[string, string | null]>>("generate_previews_bulk", { items });
 }
 
 export async function openDesignFolder(path: string) {

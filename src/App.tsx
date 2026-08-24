@@ -1,10 +1,12 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { watch } from "@tauri-apps/plugin-fs";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type DownloadEvent } from "@tauri-apps/plugin-updater";
 import {
   Check,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
   Clock3,
@@ -12,6 +14,7 @@ import {
   FileImage,
   FileText,
   FolderOpen,
+  FolderPlus,
   Grid2X2,
   Heart,
   ImageOff,
@@ -38,16 +41,23 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   addTag,
   createCategory as createLibraryCategory,
+  createCategoryGroup as createLibraryGroup,
   deleteCategory as deleteLibraryCategory,
+  deleteCategoryGroup as deleteLibraryGroup,
   generatePreview,
+  generatePreviewsBulk,
   generateThumbnail,
+  generateThumbnailsBulk,
   getDesignDetail,
   getInitialState,
   openDesignFolder,
   openBackupFolder,
   removeTag,
+  rescanPaths,
   renameCategory as renameLibraryCategory,
-  reorderCategories as reorderLibraryCategories,
+  renameCategoryGroup as renameLibraryGroup,
+  saveSidebarLayout,
+  setCategoryGroupCollapsed,
   restoreDatabaseBackup,
   scanLibrary,
   saveDatabaseBackup,
@@ -56,7 +66,19 @@ import {
   updateStatus,
 } from "./lib/api";
 import { UNCATEGORIZED_CATEGORY, chooseRandomDesign, countForExtension, createDefaultFilters, filterDesigns } from "./lib/filtering";
-import { reorderCategoryList, type CategoryDropPosition } from "./lib/categories";
+import {
+  categoryNode,
+  flattenSidebar,
+  moveSidebarNode,
+  removeCategoryFromSidebar,
+  removeGroupFromSidebar,
+  renameInSidebar,
+  sidebarFromCategories,
+  type CategoryDropPosition,
+  type SidebarDragSource,
+  type SidebarNode,
+  type SidebarNodeKind,
+} from "./lib/categories";
 import { formatBytes } from "./lib/fileTypes";
 import type { Design, DesignStatus, Filters, LibraryResponse } from "./lib/types";
 import illustratorIcon from "./assets/illustrator.png";
@@ -67,9 +89,10 @@ const PAGE_SIZE = 50;
 const supportFilters = [".png", ".jpg", ".ai", ".psd", ".eps", ".txt"];
 const defaultZoom = 100;
 const UI_SCALE_STORAGE_KEY = "roxwana-ui-scale";
-const UI_SCALE_MIN = 70;
+const UI_SCALE_MIN = 60;
 const UI_SCALE_MAX = 125;
 const UI_SCALE_STEP = 5;
+const UI_SCALE_PRESETS = [60, 65, 70, 75, 80, 85, 90, 95];
 const LEFT_PANEL_WIDTH_STORAGE_KEY = "roxwana-left-panel-width";
 const LEFT_PANEL_WIDTH_DEFAULT = 210;
 const LEFT_PANEL_WIDTH_MIN = 170;
@@ -99,7 +122,7 @@ function getInitialUiScale() {
 function getInitialLeftPanelWidth() {
   try {
     const stored = Number(window.localStorage.getItem(LEFT_PANEL_WIDTH_STORAGE_KEY));
-    if (Number.isFinite(stored)) return clampNumber(stored, LEFT_PANEL_WIDTH_MIN, getMaxLeftPanelWidth());
+    if (Number.isFinite(stored)) return Math.round(clampNumber(stored, LEFT_PANEL_WIDTH_MIN, getMaxLeftPanelWidth()));
   } catch {
     // Keep the default width when local storage is unavailable.
   }
@@ -144,8 +167,14 @@ type RandomHistory = {
   usedIds: string[];
 };
 
+type DropTarget = {
+  kind: SidebarDragSource["kind"];
+  name: string;
+  position: CategoryDropPosition;
+};
+
 type PointerDragState = {
-  kind: "category" | "design";
+  kind: "category" | "group" | "design";
   id: string;
   pointerId: number;
   startX: number;
@@ -153,19 +182,52 @@ type PointerDragState = {
   x: number;
   y: number;
   active: boolean;
-  targetCategory: string | null;
-  targetPosition: CategoryDropPosition;
+  target: DropTarget | null;
 };
 
-function categoryTargetAt(x: number, y: number) {
-  const row = document.elementFromPoint(x, y)?.closest<HTMLElement>("[data-category-drop]");
-  const category = row?.dataset.categoryDrop ?? null;
-  if (!row || !category) return { category: null, position: "after" as CategoryDropPosition };
+const GROUP_EDGE_ZONE = 11;
+/** Mantener presionado este tiempo muestra el cursor de arrastre; un clic normal no llega. */
+const HOLD_CURSOR_DELAY_MS = 190;
+
+/**
+ * A category row splits in halves (drop above or below). A group header keeps
+ * thin edges for those two and gives the middle to "drop inside the group".
+ */
+function dropTargetAt(x: number, y: number): DropTarget | null {
+  const row = document.elementFromPoint(x, y)?.closest<HTMLElement>("[data-drop-name]");
+  const name = row?.dataset.dropName ?? "";
+  if (!row || !name) return null;
   const bounds = row.getBoundingClientRect();
+
+  if (row.dataset.dropKind === "group-body") {
+    return { kind: "group", name, position: "inside" };
+  }
+
+  if (row.dataset.dropKind === "group") {
+    const edge = Math.min(GROUP_EDGE_ZONE, bounds.height / 3);
+    if (y < bounds.top + edge) return { kind: "group", name, position: "before" };
+    if (y > bounds.bottom - edge) return { kind: "group", name, position: "after" };
+    return { kind: "group", name, position: "inside" };
+  }
+
   return {
-    category,
-    position: (y < bounds.top + bounds.height / 2 ? "before" : "after") as CategoryDropPosition,
+    kind: "category",
+    name,
+    position: y < bounds.top + bounds.height / 2 ? "before" : "after",
   };
+}
+
+function sameDropTarget(left: DropTarget | null, right: DropTarget | null) {
+  if (!left || !right) return left === right;
+  return left.kind === right.kind && left.name === right.name && left.position === right.position;
+}
+
+/** A design only lands on a category: groups just hold categories. */
+function dropTargetForDrag(dragKind: PointerDragState["kind"], id: string, target: DropTarget | null) {
+  if (!target) return null;
+  if (dragKind === "design") return target.kind === "category" ? target : null;
+  if (target.kind === dragKind && sameCategory(id, target.name)) return null;
+  return target;
 }
 
 const initialUpdateState: AppUpdateState = {
@@ -226,6 +288,7 @@ export default function App() {
   const [isChangingPage, setIsChangingPage] = useState(false);
   const [updateState, setUpdateState] = useState<AppUpdateState>(initialUpdateState);
   const [thumbnailPrep, setThumbnailPrep] = useState<ThumbnailPrepState>(initialThumbnailPrepState);
+  const [previewPrep, setPreviewPrep] = useState<ThumbnailPrepState>(initialThumbnailPrepState);
   const [backupState, setBackupState] = useState<BackupState>(initialBackupState);
   const [randomProgress, setRandomProgress] = useState<RandomProgress>({ seen: 0, total: 0 });
   const [pointerDrag, setPointerDrag] = useState<PointerDragState | null>(null);
@@ -233,6 +296,7 @@ export default function App() {
   const pointerDragRef = useRef<PointerDragState | null>(null);
   const leftPanelResizeRef = useRef<{ pointerId: number; startX: number; startWidth: number } | null>(null);
   const suppressClickUntil = useRef(0);
+  const holdCursorTimer = useRef(0);
   const deferredFilters = useDeferredValue(filters);
 
   useEffect(() => {
@@ -262,7 +326,7 @@ export default function App() {
 
   useEffect(() => {
     const handleResize = () => {
-      setLeftPanelWidth((current) => clampNumber(current, LEFT_PANEL_WIDTH_MIN, getMaxLeftPanelWidth()));
+      setLeftPanelWidth((current) => Math.round(clampNumber(current, LEFT_PANEL_WIDTH_MIN, getMaxLeftPanelWidth())));
     };
 
     window.addEventListener("resize", handleResize);
@@ -277,7 +341,7 @@ export default function App() {
       if (!resize || event.pointerId !== resize.pointerId) return;
       event.preventDefault();
       const nextWidth = resize.startWidth + event.clientX - resize.startX;
-      setLeftPanelWidth(clampNumber(nextWidth, LEFT_PANEL_WIDTH_MIN, getMaxLeftPanelWidth()));
+      setLeftPanelWidth(Math.round(clampNumber(nextWidth, LEFT_PANEL_WIDTH_MIN, getMaxLeftPanelWidth())));
     };
 
     const stopResize = (event: PointerEvent) => {
@@ -355,6 +419,71 @@ export default function App() {
     };
   }, [applyLibrary]);
 
+  // Mantiene la biblioteca sincronizada con los archivos nuevos, modificados o
+  // borrados. Se agrupan los eventos para que copiar una carpeta completa haga
+  // un solo rescaneo localizado en vez de miles de rescaneos individuales.
+  useEffect(() => {
+    const rootPath = library?.rootPath;
+    if (!rootPath) return;
+
+    let disposed = false;
+    let stopWatching: (() => void) | null = null;
+    let flushTimer = 0;
+    let rescanRunning = false;
+    const pendingPaths = new Set<string>();
+
+    const scheduleFlush = () => {
+      window.clearTimeout(flushTimer);
+      flushTimer = window.setTimeout(() => void flushChanges(), 1200);
+    };
+
+    const flushChanges = async () => {
+      if (disposed || rescanRunning || pendingPaths.size === 0) return;
+      const paths = Array.from(pendingPaths);
+      pendingPaths.clear();
+      rescanRunning = true;
+      try {
+        const response = await rescanPaths(rootPath, paths);
+        if (!disposed) {
+          applyLibrary(response);
+          setDetailsById({});
+        }
+      } catch (watchError) {
+        if (!disposed) setError(`No pude actualizar los cambios de la biblioteca: ${String(watchError)}`);
+      } finally {
+        rescanRunning = false;
+        if (!disposed && pendingPaths.size > 0) scheduleFlush();
+      }
+    };
+
+    void watch(
+      rootPath,
+      (event) => {
+        if (typeof event.type === "object" && "access" in event.type) return;
+        for (const path of event.paths) {
+          const normalized = path.replace(/\\/g, "/").toLocaleLowerCase();
+          if (normalized.split("/").includes("_roxwana-cache")) continue;
+          pendingPaths.add(path);
+        }
+        if (pendingPaths.size > 0) scheduleFlush();
+      },
+      { recursive: true, delayMs: 750 },
+    )
+      .then((stop) => {
+        if (disposed) stop();
+        else stopWatching = stop;
+      })
+      .catch((watchError) => {
+        if (!disposed) setError(`No pude vigilar la carpeta de estampas: ${String(watchError)}`);
+      });
+
+    return () => {
+      disposed = true;
+      window.clearTimeout(flushTimer);
+      stopWatching?.();
+    };
+  }, [applyLibrary, library?.rootPath]);
+
   const filteredDesigns = useMemo(() => filterDesigns(library?.designs ?? [], deferredFilters), [deferredFilters, library?.designs]);
   const randomDesigns = useMemo(() => (library?.designs ?? []).filter((design) => design.previewPath), [library?.designs]);
   const totalPages = Math.max(1, Math.ceil(filteredDesigns.length / PAGE_SIZE));
@@ -431,7 +560,7 @@ export default function App() {
   }, [detailsById, filteredDesigns, selectedIndex, selectedSummary]);
 
   useEffect(() => {
-    if (!selectedDesign?.previewPath || selectedDesign.previewCachePath) return;
+    if (!selectedDesign?.previewPath || selectedDesign.previewCachePath || previewPrep.phase === "running") return;
     const key = `${selectedDesign.previewPath}:${selectedDesign.updatedAt}`;
     if (attemptedPreviews.current.has(key)) return;
     attemptedPreviews.current.add(key);
@@ -451,7 +580,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [selectedDesign?.id, selectedDesign?.previewCachePath, selectedDesign?.previewPath, selectedDesign?.updatedAt, updateDesignLocal]);
+  }, [previewPrep.phase, selectedDesign?.id, selectedDesign?.previewCachePath, selectedDesign?.previewPath, selectedDesign?.updatedAt, updateDesignLocal]);
 
   const chooseFolder = async () => {
     const selected = await openDialog({
@@ -490,7 +619,11 @@ export default function App() {
     }));
     setLibrary((current) => {
       if (!current || !normalized || current.categories.includes(normalized)) return current;
-      return { ...current, categories: [...current.categories, normalized].sort((a, b) => a.localeCompare(b)) };
+      return {
+        ...current,
+        categories: [...current.categories, normalized],
+        sidebar: [...current.sidebar, categoryNode(normalized)],
+      };
     });
     try {
       const savedCategory = await updateCategory(design.id, normalized);
@@ -502,7 +635,11 @@ export default function App() {
       }
       setLibrary((current) => {
         if (!current || !savedCategory || current.categories.some((item) => sameCategory(item, savedCategory))) return current;
-        return { ...current, categories: [...current.categories, savedCategory] };
+        return {
+          ...current,
+          categories: [...current.categories, savedCategory],
+          sidebar: [...current.sidebar, categoryNode(savedCategory)],
+        };
       });
     } catch (categoryError) {
       setError(String(categoryError));
@@ -514,7 +651,11 @@ export default function App() {
       const category = await createLibraryCategory(name);
       setLibrary((current) => {
         if (!current || current.categories.some((item) => sameCategory(item, category))) return current;
-        return { ...current, categories: [...current.categories, category] };
+        return {
+          ...current,
+          categories: [...current.categories, category],
+          sidebar: [...current.sidebar, categoryNode(category)],
+        };
       });
       return category;
     } catch (categoryError) {
@@ -531,6 +672,7 @@ export default function App() {
         return {
           ...current,
           categories: current.categories.map((category) => (sameCategory(category, currentName) ? renamed : category)),
+          sidebar: renameInSidebar(current.sidebar, currentName, renamed),
           designs: current.designs.map((design) =>
             sameCategory(design.classification.category, currentName)
               ? { ...design, classification: { ...design.classification, category: renamed, categoryUserSet: true } }
@@ -566,6 +708,7 @@ export default function App() {
         return {
           ...current,
           categories: current.categories.filter((item) => !sameCategory(item, category)),
+          sidebar: removeCategoryFromSidebar(current.sidebar, category),
           designs: current.designs.map((design) =>
             sameCategory(design.classification.category, category)
               ? { ...design, classification: { ...design.classification, category: null, categoryUserSet: true } }
@@ -593,31 +736,110 @@ export default function App() {
     }
   }, []);
 
-  const saveCategoryOrder = useCallback(async (nextOrder: string[]) => {
-    const previousOrder = library?.categories ?? [];
-    if (
-      nextOrder.length !== previousOrder.length
-      || nextOrder.every((category, index) => sameCategory(category, previousOrder[index]))
-    ) return;
-    setLibrary((current) => (current ? { ...current, categories: nextOrder } : current));
+  const saveLayout = useCallback(async (nextLayout: SidebarNode[]) => {
+    const previousLayout = library?.sidebar ?? [];
+    setLibrary((current) =>
+      current ? { ...current, sidebar: nextLayout, categories: flattenSidebar(nextLayout) } : current,
+    );
 
     try {
-      const savedOrder = await reorderLibraryCategories(nextOrder);
-      setLibrary((current) => (current ? { ...current, categories: savedOrder } : current));
-    } catch (categoryError) {
-      setLibrary((current) => (current ? { ...current, categories: previousOrder } : current));
-      setError(String(categoryError));
+      const savedLayout = await saveSidebarLayout(nextLayout);
+      setLibrary((current) =>
+        current ? { ...current, sidebar: savedLayout, categories: flattenSidebar(savedLayout) } : current,
+      );
+    } catch (layoutError) {
+      setLibrary((current) =>
+        current ? { ...current, sidebar: previousLayout, categories: flattenSidebar(previousLayout) } : current,
+      );
+      setError(String(layoutError));
     }
-  }, [library?.categories]);
+  }, [library?.sidebar]);
+
+  const createGroup = useCallback(async (name: string) => {
+    try {
+      const group = await createLibraryGroup(name);
+      setLibrary((current) =>
+        current
+          ? { ...current, sidebar: [...current.sidebar, { kind: "group", name: group, collapsed: false, children: [] }] }
+          : current,
+      );
+      return group;
+    } catch (groupError) {
+      setError(String(groupError));
+      return null;
+    }
+  }, []);
+
+  const renameGroup = useCallback(async (currentName: string, newName: string) => {
+    try {
+      const renamed = await renameLibraryGroup(currentName, newName);
+      setLibrary((current) =>
+        current
+          ? {
+              ...current,
+              sidebar: current.sidebar.map((node) =>
+                node.kind === "group" && sameCategory(node.name, currentName) ? { ...node, name: renamed } : node,
+              ),
+            }
+          : current,
+      );
+      return renamed;
+    } catch (groupError) {
+      setError(String(groupError));
+      return null;
+    }
+  }, []);
+
+  const removeGroup = useCallback(async (group: string) => {
+    const previousLayout = library?.sidebar ?? [];
+    try {
+      await deleteLibraryGroup(group);
+    } catch (groupError) {
+      setError(String(groupError));
+      return false;
+    }
+    // Las categorias que quedan sueltas guardan la posicion que tenia el grupo.
+    await saveLayout(removeGroupFromSidebar(previousLayout, group));
+    return true;
+  }, [library?.sidebar, saveLayout]);
+
+  const toggleGroup = useCallback((group: string) => {
+    const node = library?.sidebar.find((item) => item.kind === "group" && sameCategory(item.name, group));
+    if (!node) return;
+    const collapsed = !node.collapsed;
+    setLibrary((current) =>
+      current
+        ? {
+            ...current,
+            sidebar: current.sidebar.map((item) =>
+              item.kind === "group" && sameCategory(item.name, group) ? { ...item, collapsed } : item,
+            ),
+          }
+        : current,
+    );
+    void setCategoryGroupCollapsed(group, collapsed).catch((groupError) => setError(String(groupError)));
+  }, [library?.sidebar]);
 
   const assignCategoryFromDrop = useCallback((designId: string, category: string) => {
     const design = library?.designs.find((item) => item.id === designId);
     if (design) void saveCategory(design, sameCategory(category, UNCATEGORIZED_CATEGORY) ? null : category);
   }, [library?.designs, saveCategory]);
 
+  const clearHoldCursor = useCallback(() => {
+    if (holdCursorTimer.current) {
+      window.clearTimeout(holdCursorTimer.current);
+      holdCursorTimer.current = 0;
+    }
+    document.body.classList.remove("pointer-holding");
+  }, []);
+
   const startPointerDrag = useCallback(
     (kind: PointerDragState["kind"], id: string, event: React.PointerEvent<HTMLElement>) => {
       if (event.button !== 0) return;
+      clearHoldCursor();
+      holdCursorTimer.current = window.setTimeout(() => {
+        if (pointerDragRef.current) document.body.classList.add("pointer-holding");
+      }, HOLD_CURSOR_DELAY_MS);
       const next: PointerDragState = {
         kind,
         id,
@@ -627,8 +849,7 @@ export default function App() {
         x: event.clientX,
         y: event.clientY,
         active: false,
-        targetCategory: null,
-        targetPosition: "after",
+        target: null,
       };
       pointerDragRef.current = next;
       setPointerDrag(next);
@@ -638,7 +859,7 @@ export default function App() {
         // Window-level listeners continue tracking if capture is unavailable.
       }
     },
-    [],
+    [clearHoldCursor],
   );
 
   const shouldSuppressDragClick = useCallback(() => {
@@ -652,17 +873,12 @@ export default function App() {
     if (trackedPointerId === undefined) return;
 
     const updateAt = (current: PointerDragState, x: number, y: number) => {
-      const target = categoryTargetAt(x, y);
-      const targetCategory = current.kind === "category" && target.category && sameCategory(current.id, target.category)
-        ? null
-        : target.category;
       const next = {
         ...current,
         x,
         y,
         active: true,
-        targetCategory,
-        targetPosition: target.position,
+        target: dropTargetForDrag(current.kind, current.id, dropTargetAt(x, y)),
       };
       pointerDragRef.current = next;
       setPointerDrag(next);
@@ -675,6 +891,7 @@ export default function App() {
       const distance = Math.hypot(event.clientX - current.startX, event.clientY - current.startY);
       if (!current.active && distance < 6) return;
       event.preventDefault();
+      clearHoldCursor();
       document.body.classList.add("pointer-dragging");
       updateAt(current, event.clientX, event.clientY);
     };
@@ -685,20 +902,22 @@ export default function App() {
       const finalState = current;
       if (finalState.active) {
         suppressClickUntil.current = Date.now() + 350;
-        if (finalState.targetCategory) {
-          if (finalState.kind === "category") {
-            const nextOrder = reorderCategoryList(
-              library?.categories ?? [],
-              finalState.id,
-              finalState.targetCategory,
-              finalState.targetPosition,
+        const target = finalState.target;
+        if (target) {
+          if (finalState.kind === "design") {
+            assignCategoryFromDrop(finalState.id, target.name);
+          } else if (library?.sidebar) {
+            const nextLayout = moveSidebarNode(
+              library.sidebar,
+              { kind: finalState.kind, name: finalState.id },
+              { kind: target.kind, name: target.name },
+              target.position,
             );
-            void saveCategoryOrder(nextOrder);
-          } else {
-            assignCategoryFromDrop(finalState.id, finalState.targetCategory);
+            if (nextLayout !== library.sidebar) void saveLayout(nextLayout);
           }
         }
       }
+      clearHoldCursor();
       document.body.classList.remove("pointer-dragging");
       pointerDragRef.current = null;
       setPointerDrag(null);
@@ -706,6 +925,7 @@ export default function App() {
 
     const cancelPointerDrag = (event: PointerEvent) => {
       if (event.pointerId !== trackedPointerId) return;
+      clearHoldCursor();
       document.body.classList.remove("pointer-dragging");
       pointerDragRef.current = null;
       setPointerDrag(null);
@@ -719,7 +939,7 @@ export default function App() {
       window.removeEventListener("pointerup", finishPointerDrag);
       window.removeEventListener("pointercancel", cancelPointerDrag);
     };
-  }, [assignCategoryFromDrop, library?.categories, pointerDrag?.pointerId, saveCategoryOrder]);
+  }, [assignCategoryFromDrop, clearHoldCursor, library?.sidebar, pointerDrag?.pointerId, saveLayout]);
 
   useEffect(() => {
     if (!pointerDrag?.active) return;
@@ -739,12 +959,9 @@ export default function App() {
           scrolled = true;
         }
         if (scrolled) {
-          const target = categoryTargetAt(current.x, current.y);
-          const targetCategory = current.kind === "category" && target.category && sameCategory(current.id, target.category)
-            ? null
-            : target.category;
-          if (targetCategory !== current.targetCategory || target.position !== current.targetPosition) {
-            const next = { ...current, targetCategory, targetPosition: target.position };
+          const target = dropTargetForDrag(current.kind, current.id, dropTargetAt(current.x, current.y));
+          if (!sameDropTarget(target, current.target)) {
+            const next = { ...current, target };
             pointerDragRef.current = next;
             setPointerDrag(next);
           }
@@ -844,28 +1061,39 @@ export default function App() {
       message: "Preparando miniaturas cacheadas...",
     });
 
+    // Lotes de 32 procesados en paralelo del lado de Rust (varios hilos a la
+    // vez). Antes se pedia una imagen por vez desde aca, que dejaba el motor
+    // trabajando con un solo hilo sin importar cuantos nucleos tuviera la PC.
+    const BATCH_SIZE = 32;
     let completed = 0;
     let failed = 0;
-    for (const design of queue) {
+    for (let i = 0; i < queue.length; i += BATCH_SIZE) {
+      const batch = queue.slice(i, i + BATCH_SIZE);
       try {
-        const thumbnailPath = await generateThumbnail(design.previewPath!, design.updatedAt);
-        if (thumbnailPath) {
-          updateDesignLocal(design.id, (item) => ({ ...item, thumbnailPath }));
+        const results = await generateThumbnailsBulk(
+          batch.map((design) => [design.previewPath!, design.updatedAt]),
+        );
+        const byPath = new Map(results);
+        for (const design of batch) {
+          const thumbnailPath = byPath.get(design.previewPath!);
+          if (thumbnailPath) {
+            updateDesignLocal(design.id, (item) => ({ ...item, thumbnailPath }));
+          } else {
+            failed += 1;
+          }
         }
       } catch {
         // Some source files can be invalid or too large; keep preparing the rest.
-        failed += 1;
+        failed += batch.length;
       }
 
-      completed += 1;
+      completed += batch.length;
       setThumbnailPrep({
         phase: "running",
         done: completed,
         total: queue.length,
         message: "Preparando miniaturas cacheadas...",
       });
-
-      await new Promise((resolve) => window.setTimeout(resolve, 35));
     }
 
     setThumbnailPrep({
@@ -878,6 +1106,115 @@ export default function App() {
           : "Miniaturas preparadas. La galeria lateral ya usa cache.",
     });
   }, [library, thumbnailPrep.phase, updateDesignLocal]);
+
+  const preparePreviews = useCallback(async () => {
+    if (!library || previewPrep.phase === "running") return;
+
+    const queue = library.designs.filter((design) => design.previewPath && !design.previewCachePath);
+    if (queue.length === 0) {
+      setPreviewPrep({
+        phase: "done",
+        done: 0,
+        total: 0,
+        message: "Todos los previews del visor ya estan optimizados.",
+      });
+      return;
+    }
+
+    setPreviewPrep({
+      phase: "running",
+      done: 0,
+      total: queue.length,
+      message: "Optimizando previews del visor en segundo plano...",
+    });
+
+    const BATCH_SIZE = 24;
+    let completed = 0;
+    let failed = 0;
+    for (let i = 0; i < queue.length; i += BATCH_SIZE) {
+      const batch = queue.slice(i, i + BATCH_SIZE);
+      try {
+        const results = await generatePreviewsBulk(
+          batch.map((design) => [design.previewPath!, design.updatedAt]),
+        );
+        const byPath = new Map(results);
+        for (const design of batch) {
+          const previewCachePath = byPath.get(design.previewPath!);
+          if (previewCachePath) {
+            updateDesignLocal(design.id, (item) => ({ ...item, previewCachePath }));
+          } else {
+            failed += 1;
+          }
+        }
+      } catch {
+        failed += batch.length;
+      }
+
+      completed += batch.length;
+      setPreviewPrep({
+        phase: "running",
+        done: completed,
+        total: queue.length,
+        message: "Optimizando previews del visor en segundo plano...",
+      });
+    }
+
+    setPreviewPrep({
+      phase: "done",
+      done: completed,
+      total: queue.length,
+      message:
+        failed > 0
+          ? `Previews optimizados. ${failed} imagenes no se pudieron convertir.`
+          : "Previews optimizados. El visor ya abre las imagenes desde cache liviano.",
+    });
+  }, [library, previewPrep.phase, updateDesignLocal]);
+
+  // Las miniaturas se preparan solas en segundo plano: sin ellas la grilla
+  // termina cargando las vistas previas grandes para cada tarjeta.
+  const pendingBaseline = useRef<number | null>(null);
+  const prepareThumbnailsRef = useRef(prepareThumbnails);
+  useEffect(() => {
+    prepareThumbnailsRef.current = prepareThumbnails;
+  }, [prepareThumbnails]);
+  useEffect(() => {
+    if (!library || thumbnailPrep.phase === "running") return;
+    const pending = library.designs.filter(
+      (design) => design.previewPath && !design.thumbnailPath,
+    ).length;
+    const previous = pendingBaseline.current;
+    pendingBaseline.current = pending;
+    if (pending === 0) return;
+    // Arranca en la primera carga y cada vez que aparecen estampas nuevas sin
+    // miniatura (por ejemplo despues de un rescaneo). Comparar contra la marca
+    // anterior evita reintentar en bucle los archivos que no se pueden convertir.
+    if (previous !== null && pending <= previous) return;
+    // Sin cleanup: la biblioteca se actualiza sola mientras corre el cache y
+    // cancelar el temporizador dejaria las miniaturas sin generar nunca.
+    window.setTimeout(() => void prepareThumbnailsRef.current(), 2500);
+  }, [library, thumbnailPrep.phase]);
+
+  const previewPendingBaseline = useRef<number | null>(null);
+  const preparePreviewsRef = useRef(preparePreviews);
+  useEffect(() => {
+    preparePreviewsRef.current = preparePreviews;
+  }, [preparePreviews]);
+  useEffect(() => {
+    if (!library || thumbnailPrep.phase === "running" || previewPrep.phase === "running") return;
+    const thumbnailsPending = library.designs.some(
+      (design) => design.previewPath && !design.thumbnailPath,
+    );
+    if (thumbnailsPending) return;
+
+    const pending = library.designs.filter(
+      (design) => design.previewPath && !design.previewCachePath,
+    ).length;
+    const previous = previewPendingBaseline.current;
+    previewPendingBaseline.current = pending;
+    if (pending === 0) return;
+    if (previous !== null && pending <= previous) return;
+    window.setTimeout(() => void preparePreviewsRef.current(), 3500);
+  }, [library, previewPrep.phase, thumbnailPrep.phase]);
 
   const goToPage = useCallback((nextPageIndex: number) => {
     if (isChangingPage) return;
@@ -1060,6 +1397,8 @@ export default function App() {
         onCheckForUpdates={checkForUpdates}
         thumbnailPrep={thumbnailPrep}
         onPrepareThumbnails={prepareThumbnails}
+        previewPrep={previewPrep}
+        onPreparePreviews={preparePreviews}
         backupState={backupState}
         onSaveBackup={saveBackupCopy}
         onOpenBackupFolder={openBackupLocation}
@@ -1083,7 +1422,7 @@ export default function App() {
       >
         <LeftFilters
           filters={filters}
-          categories={library?.categories ?? []}
+          sidebar={library?.sidebar ?? sidebarFromCategories(library?.categories ?? [])}
           allDesigns={library?.designs ?? []}
           filteredCount={filteredDesigns.length}
           scanning={scanning}
@@ -1097,8 +1436,13 @@ export default function App() {
           onCreateCategory={createCategory}
           onRenameCategory={renameCategory}
           onDeleteCategory={removeCategory}
+          onCreateGroup={createGroup}
+          onRenameGroup={renameGroup}
+          onDeleteGroup={removeGroup}
+          onToggleGroup={toggleGroup}
           dragState={pointerDrag?.active ? pointerDrag : null}
           onStartCategoryDrag={(category, event) => startPointerDrag("category", category, event)}
+          onStartGroupDrag={(group, event) => startPointerDrag("group", group, event)}
           shouldSuppressDragClick={shouldSuppressDragClick}
         />
 
@@ -1149,11 +1493,13 @@ export default function App() {
           className={`pointer-drag-ghost ${pointerDrag.kind}`}
           style={{ left: pointerDrag.x + 16, top: pointerDrag.y + 16 }}
         >
-          {pointerDrag.kind === "category" ? <Tags size={15} /> : <FileImage size={15} />}
+          {pointerDrag.kind === "design" ? <FileImage size={15} /> : null}
+          {pointerDrag.kind === "category" ? <Tags size={15} /> : null}
+          {pointerDrag.kind === "group" ? <FolderPlus size={15} /> : null}
           <span>
-            {pointerDrag.kind === "category"
-              ? pointerDrag.id
-              : library?.designs.find((design) => design.id === pointerDrag.id)?.name ?? "Estampa"}
+            {pointerDrag.kind === "design"
+              ? library?.designs.find((design) => design.id === pointerDrag.id)?.name ?? "Estampa"
+              : pointerDrag.id}
           </span>
         </div>
       )}
@@ -1180,6 +1526,8 @@ function Header({
   onCheckForUpdates,
   thumbnailPrep,
   onPrepareThumbnails,
+  previewPrep,
+  onPreparePreviews,
   backupState,
   onSaveBackup,
   onOpenBackupFolder,
@@ -1204,6 +1552,8 @@ function Header({
   onCheckForUpdates: () => void;
   thumbnailPrep: ThumbnailPrepState;
   onPrepareThumbnails: () => void;
+  previewPrep: ThumbnailPrepState;
+  onPreparePreviews: () => void;
   backupState: BackupState;
   onSaveBackup: () => void;
   onOpenBackupFolder: () => void;
@@ -1211,9 +1561,38 @@ function Header({
   uiScale: number;
   setUiScale: (scale: number) => void;
 }) {
+  // El zoom cambia el tamano del propio deslizador, asi que mientras se
+  // arrastra solo se mueve este borrador y el zoom se aplica al soltar.
+  const [scaleDraft, setScaleDraft] = useState<number | null>(null);
+  const scaleValue = scaleDraft ?? uiScale;
+
+  const commitScale = useCallback(() => {
+    if (scaleDraft === null) return;
+    if (scaleDraft !== uiScale) setUiScale(scaleDraft);
+    setScaleDraft(null);
+  }, [scaleDraft, setUiScale, uiScale]);
+
+  useEffect(() => {
+    if (scaleDraft === null) return;
+    const release = () => commitScale();
+    window.addEventListener("pointerup", release);
+    window.addEventListener("pointercancel", release);
+    return () => {
+      window.removeEventListener("pointerup", release);
+      window.removeEventListener("pointercancel", release);
+    };
+  }, [commitScale, scaleDraft]);
+
+  const applyScale = (scale: number) => {
+    setScaleDraft(null);
+    setUiScale(scale);
+  };
+
   const updateBusy = updateState.phase === "checking" || updateState.phase === "downloading" || updateState.phase === "installing";
   const thumbnailBusy = thumbnailPrep.phase === "running";
   const thumbnailProgress = thumbnailPrep.total > 0 ? Math.round((thumbnailPrep.done / thumbnailPrep.total) * 100) : null;
+  const previewBusy = previewPrep.phase === "running";
+  const previewProgress = previewPrep.total > 0 ? Math.round((previewPrep.done / previewPrep.total) * 100) : null;
   const backupBusy = backupState.phase === "saving" || backupState.phase === "opening" || backupState.phase === "loading";
   const randomRemaining = Math.max(0, randomProgress.total - randomProgress.seen);
 
@@ -1232,24 +1611,20 @@ function Header({
           <FolderOpen size={17} />
           <span>Elegir biblioteca</span>
         </button>
-        <button className="icon-only danger" disabled={!selectedDesign} onClick={() => selectedDesign && onFavorite(selectedDesign, !selectedDesign.classification.favorite)} title="Favorita">
-          <Heart size={18} fill={selectedDesign?.classification.favorite ? "currentColor" : "none"} />
-        </button>
-        <button className="icon-only" onClick={onRunScan} title="Reescanear">
+        <button className="action-button rescan-action" onClick={onRunScan} title="Rescanear la biblioteca">
           <RefreshCw size={18} className={loading ? "spin" : ""} />
+          <span>Rescaneo</span>
         </button>
         <button className="icon-only" onClick={() => setFilters(createDefaultFilters())} title="Limpiar filtros">
           <MoreVertical size={18} />
         </button>
         <button
-          className="action-button random-action"
+          className="icon-only random-action"
           onClick={onRandomDesign}
           disabled={randomProgress.total === 0}
           title={`Elegir una estampa al azar sin repetir. Quedan ${randomRemaining.toLocaleString("es-AR")} de ${randomProgress.total.toLocaleString("es-AR")}.`}
         >
-          <Shuffle size={17} />
-          <span>Random</span>
-          <b>{randomRemaining.toLocaleString("es-AR")}</b>
+          <Shuffle size={15} />
         </button>
         <div className="settings-menu">
           <button className={settingsOpen ? "icon-only active" : "icon-only"} title="Ajustes" onClick={() => setSettingsOpen(!settingsOpen)}>
@@ -1281,6 +1656,25 @@ function Header({
                       </small>
                       <div className="update-progress" aria-label={`Progreso ${thumbnailProgress ?? 0}%`}>
                         <span style={{ width: `${thumbnailProgress ?? 0}%` }} />
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
+              <button className="settings-action secondary" onClick={onPreparePreviews} disabled={previewBusy || !library}>
+                {previewBusy ? <Loader2 size={16} className="spin" /> : <Maximize2 size={16} />}
+                <span>{previewBusy ? "Optimizando visor..." : "Optimizar visor"}</span>
+              </button>
+              {previewPrep.message && (
+                <div className={`update-status ${previewPrep.phase}`}>
+                  <span>{previewPrep.message}</span>
+                  {previewPrep.total > 0 && (
+                    <>
+                      <small>
+                        {previewPrep.done.toLocaleString("es-AR")} de {previewPrep.total.toLocaleString("es-AR")}
+                      </small>
+                      <div className="update-progress" aria-label={`Progreso ${previewProgress ?? 0}%`}>
+                        <span style={{ width: `${previewProgress ?? 0}%` }} />
                       </div>
                     </>
                   )}
@@ -1330,12 +1724,12 @@ function Header({
               <div className="settings-scale">
                 <div className="settings-scale-label">
                   <span>Tamano de la interfaz</span>
-                  <strong>{uiScale}%</strong>
+                  <strong>{scaleValue}%</strong>
                 </div>
                 <div className="settings-scale-controls">
                   <button
                     type="button"
-                    onClick={() => setUiScale(Math.max(UI_SCALE_MIN, uiScale - UI_SCALE_STEP))}
+                    onClick={() => applyScale(Math.max(UI_SCALE_MIN, uiScale - UI_SCALE_STEP))}
                     disabled={uiScale <= UI_SCALE_MIN}
                     title="Achicar interfaz"
                     aria-label="Achicar interfaz"
@@ -1347,13 +1741,17 @@ function Header({
                     min={UI_SCALE_MIN}
                     max={UI_SCALE_MAX}
                     step={UI_SCALE_STEP}
-                    value={uiScale}
-                    onChange={(event) => setUiScale(Number(event.target.value))}
+                    value={scaleValue}
+                    onChange={(event) => setScaleDraft(Number(event.target.value))}
+                    onPointerUp={commitScale}
+                    onKeyUp={commitScale}
+                    onBlur={commitScale}
                     aria-label="Tamano de la interfaz"
+                    title="Arrastra tranquilo: el tamano cambia cuando soltas"
                   />
                   <button
                     type="button"
-                    onClick={() => setUiScale(Math.min(UI_SCALE_MAX, uiScale + UI_SCALE_STEP))}
+                    onClick={() => applyScale(Math.min(UI_SCALE_MAX, uiScale + UI_SCALE_STEP))}
                     disabled={uiScale >= UI_SCALE_MAX}
                     title="Agrandar interfaz"
                     aria-label="Agrandar interfaz"
@@ -1362,7 +1760,7 @@ function Header({
                   </button>
                   <button
                     type="button"
-                    onClick={() => setUiScale(100)}
+                    onClick={() => applyScale(100)}
                     disabled={uiScale === 100}
                     title="Restablecer al 100%"
                     aria-label="Restablecer tamano"
@@ -1370,6 +1768,22 @@ function Header({
                     <RotateCcw size={14} />
                   </button>
                 </div>
+                <div className="settings-scale-presets">
+                  {UI_SCALE_PRESETS.map((preset) => (
+                    <button
+                      key={preset}
+                      type="button"
+                      className={uiScale === preset ? "active" : ""}
+                      onClick={() => applyScale(preset)}
+                      title={`Interfaz al ${preset}%`}
+                    >
+                      {preset}
+                    </button>
+                  ))}
+                </div>
+                {scaleDraft !== null && scaleDraft !== uiScale && (
+                  <p className="settings-scale-hint">Solta para aplicar el {scaleDraft}%</p>
+                )}
               </div>
               <label className="settings-toggle">
                 <input type="checkbox" checked={showIconLabels} onChange={(event) => setShowIconLabels(event.target.checked)} />
@@ -1386,7 +1800,7 @@ function Header({
 
 function LeftFilters({
   filters,
-  categories,
+  sidebar,
   allDesigns,
   filteredCount,
   scanning,
@@ -1396,12 +1810,17 @@ function LeftFilters({
   onCreateCategory,
   onRenameCategory,
   onDeleteCategory,
+  onCreateGroup,
+  onRenameGroup,
+  onDeleteGroup,
+  onToggleGroup,
   dragState,
   onStartCategoryDrag,
+  onStartGroupDrag,
   shouldSuppressDragClick,
 }: {
   filters: Filters;
-  categories: string[];
+  sidebar: SidebarNode[];
   allDesigns: Design[];
   filteredCount: number;
   scanning: boolean;
@@ -1411,14 +1830,22 @@ function LeftFilters({
   onCreateCategory: (name: string) => Promise<string | null>;
   onRenameCategory: (currentName: string, newName: string) => Promise<string | null>;
   onDeleteCategory: (category: string) => Promise<boolean>;
+  onCreateGroup: (name: string) => Promise<string | null>;
+  onRenameGroup: (currentName: string, newName: string) => Promise<string | null>;
+  onDeleteGroup: (group: string) => Promise<boolean>;
+  onToggleGroup: (group: string) => void;
   dragState: PointerDragState | null;
   onStartCategoryDrag: (category: string, event: React.PointerEvent<HTMLElement>) => void;
+  onStartGroupDrag: (group: string, event: React.PointerEvent<HTMLElement>) => void;
   shouldSuppressDragClick: () => boolean;
 }) {
-  const [addingCategory, setAddingCategory] = useState(false);
-  const [newCategoryName, setNewCategoryName] = useState("");
-  const [editingCategory, setEditingCategory] = useState<string | null>(null);
+  const [adding, setAdding] = useState<SidebarNodeKind | null>(null);
+  const [newName, setNewName] = useState("");
+  const [createMenuOpen, setCreateMenuOpen] = useState(false);
+  const [editing, setEditing] = useState<SidebarDragSource | null>(null);
   const [editingName, setEditingName] = useState("");
+  const [pendingDelete, setPendingDelete] = useState<SidebarDragSource | null>(null);
+  const [deleting, setDeleting] = useState(false);
   const renameCancelled = useRef(false);
   const categoryCounts = useMemo(() => {
     const counts = new Map<string, number>();
@@ -1437,41 +1864,272 @@ function LeftFilters({
     [allDesigns],
   );
 
-  const submitNewCategory = async (event: React.FormEvent<HTMLFormElement>) => {
+  useEffect(() => {
+    if (!createMenuOpen) return;
+    const closeMenu = (event: Event) => {
+      if (event instanceof KeyboardEvent && event.key !== "Escape") return;
+      if (event.type === "pointerdown" && (event.target as HTMLElement | null)?.closest(".create-menu-anchor")) return;
+      setCreateMenuOpen(false);
+    };
+    window.addEventListener("pointerdown", closeMenu);
+    window.addEventListener("keydown", closeMenu);
+    return () => {
+      window.removeEventListener("pointerdown", closeMenu);
+      window.removeEventListener("keydown", closeMenu);
+    };
+  }, [createMenuOpen]);
+
+  useEffect(() => {
+    if (!pendingDelete) return;
+    const cancelOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      setPendingDelete(null);
+    };
+    window.addEventListener("keydown", cancelOnEscape);
+    return () => window.removeEventListener("keydown", cancelOnEscape);
+  }, [pendingDelete]);
+
+  const startAdding = (kind: SidebarNodeKind) => {
+    setCreateMenuOpen(false);
+    setNewName("");
+    setAdding((current) => (current === kind ? null : kind));
+  };
+
+  const submitNew = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    const created = await onCreateCategory(newCategoryName);
+    const created = adding === "group" ? await onCreateGroup(newName) : await onCreateCategory(newName);
     if (created) {
-      setNewCategoryName("");
-      setAddingCategory(false);
+      setNewName("");
+      setAdding(null);
     }
   };
 
-  const commitRename = async (category: string) => {
-    if (sameCategory(category, editingName.trim())) {
-      setEditingCategory(null);
+  const commitRename = async (node: SidebarDragSource) => {
+    if (sameCategory(node.name, editingName.trim())) {
+      setEditing(null);
       setEditingName("");
       return;
     }
-    const renamed = await onRenameCategory(category, editingName);
+    const renamed = node.kind === "group"
+      ? await onRenameGroup(node.name, editingName)
+      : await onRenameCategory(node.name, editingName);
     if (renamed) {
-      setEditingCategory(null);
+      setEditing(null);
       setEditingName("");
     }
   };
 
-  const beginRename = (category: string) => {
+  const beginRename = (node: SidebarDragSource) => {
     renameCancelled.current = false;
-    setEditingCategory(category);
-    setEditingName(category);
+    setEditing(node);
+    setEditingName(node.name);
   };
 
-  const deleteCurrentCategory = async (category: string) => {
-    if (!window.confirm(`Eliminar la categoria "${category}"? Las estampas quedaran sin categoria.`)) return;
-    const deleted = await onDeleteCategory(category);
-    if (deleted && editingCategory === category) {
-      setEditingCategory(null);
+  const isEditing = (node: SidebarDragSource) =>
+    editing?.kind === node.kind && sameCategory(editing.name, node.name);
+
+  const confirmDelete = async () => {
+    const node = pendingDelete;
+    if (!node || deleting) return;
+    setDeleting(true);
+    const deleted = node.kind === "group" ? await onDeleteGroup(node.name) : await onDeleteCategory(node.name);
+    setDeleting(false);
+    if (!deleted) return;
+    if (isEditing(node)) {
+      setEditing(null);
       setEditingName("");
     }
+    setPendingDelete(null);
+  };
+
+  const renameForm = (node: SidebarDragSource) => (
+    <form
+      className="category-edit-form inline-rename"
+      onSubmit={(event) => {
+        event.preventDefault();
+        (event.currentTarget.elements.namedItem("categoryName") as HTMLInputElement | null)?.blur();
+      }}
+    >
+      <input
+        name="categoryName"
+        autoFocus
+        value={editingName}
+        onChange={(event) => setEditingName(event.target.value)}
+        onFocus={() => { renameCancelled.current = false; }}
+        onBlur={() => {
+          if (!renameCancelled.current) void commitRename(node);
+        }}
+        onKeyDown={(event) => {
+          if (event.key === "Escape") {
+            renameCancelled.current = true;
+            setEditing(null);
+            setEditingName("");
+          }
+        }}
+        aria-label={`Renombrar ${node.name}`}
+      />
+    </form>
+  );
+
+  const deleteExplanation = (node: SidebarDragSource) => {
+    if (node.kind === "group") {
+      const inside = sidebar.find((item) => item.kind === "group" && sameCategory(item.name, node.name))?.children ?? [];
+      if (inside.length === 0) return "El grupo esta vacio. No se borra ninguna categoria ni ninguna estampa.";
+      return inside.length === 1
+        ? "La categoria que tiene adentro vuelve al panel. No se borra ninguna categoria ni ninguna estampa."
+        : `Las ${inside.length.toLocaleString("es-AR")} categorias que tiene adentro vuelven al panel. No se borra ninguna categoria ni ninguna estampa.`;
+    }
+    const count = categoryCounts.get(node.name) ?? 0;
+    if (count === 0) return "La categoria esta vacia. No se borra ningun archivo.";
+    return count === 1
+      ? "La estampa que tiene queda sin categoria. No se borra ningun archivo."
+      : `Las ${count.toLocaleString("es-AR")} estampas que tiene quedan sin categoria. No se borra ningun archivo.`;
+  };
+
+  const dropsOn = (kind: SidebarNodeKind, name: string) =>
+    dragState?.target && dragState.target.kind === kind && sameCategory(dragState.target.name, name)
+      ? dragState.target.position
+      : null;
+
+  const renderCategoryRow = (category: string, insideGroup: boolean) => {
+    const node: SidebarDragSource = { kind: "category", name: category };
+    const dropPosition = dropsOn("category", category);
+    const rowClassName = [
+      "category-row",
+      insideGroup ? "grouped-category-row" : "",
+      dragState?.kind === "category" && sameCategory(dragState.id, category) ? "category-dragging" : "",
+      dragState?.kind === "design" && dropPosition ? "design-drop-target" : "",
+      dragState?.kind !== "design" && dropPosition ? `category-drop-${dropPosition}` : "",
+    ].filter(Boolean).join(" ");
+
+    return (
+      <div
+        key={category}
+        className={rowClassName}
+        data-drop-name={category}
+        data-drop-kind="category"
+        title="Arrastrar para ordenar o meter en un grupo. Doble clic para renombrar."
+      >
+        {isEditing(node) ? renameForm(node) : (
+          <>
+            <button
+              className={filters.categories.some((item) => sameCategory(item, category)) ? "filter-row active" : "filter-row"}
+              onPointerDown={(event) => onStartCategoryDrag(category, event)}
+              onClick={(event) => {
+                if (shouldSuppressDragClick()) {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  return;
+                }
+                onCategoryFilter(category);
+              }}
+              onDoubleClick={(event) => {
+                event.preventDefault();
+                beginRename(node);
+              }}
+            >
+              <span className="filter-name">
+                <span className="category-count" aria-label={`${(categoryCounts.get(category) ?? 0).toLocaleString("es-AR")} estampas`}>
+                  {(categoryCounts.get(category) ?? 0).toLocaleString("es-AR")}
+                </span>
+                <span className="category-label">{category}</span>
+              </span>
+            </button>
+            <div className="category-actions">
+              <button
+                className="category-action delete"
+                draggable={false}
+                title={`Eliminar ${category}`}
+                aria-label={`Eliminar ${category}`}
+                onMouseDown={(event) => event.stopPropagation()}
+                onClick={() => setPendingDelete(node)}
+              >
+                <Trash2 size={14} />
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+    );
+  };
+
+  const renderGroup = (group: SidebarNode) => {
+    const node: SidebarDragSource = { kind: "group", name: group.name };
+    const dropPosition = dropsOn("group", group.name);
+    const total = group.children.reduce((sum, child) => sum + (categoryCounts.get(child) ?? 0), 0);
+    const groupClassName = [
+      "category-group",
+      group.collapsed ? "collapsed" : "",
+      dragState?.kind === "group" && sameCategory(dragState.id, group.name) ? "category-dragging" : "",
+      dropPosition === "inside" ? "group-drop-inside" : "",
+    ].filter(Boolean).join(" ");
+    const headClassName = [
+      "category-row",
+      "group-head",
+      dropPosition && dropPosition !== "inside" ? `category-drop-${dropPosition}` : "",
+    ].filter(Boolean).join(" ");
+
+    return (
+      <div key={`group:${group.name}`} className={groupClassName}>
+        <div
+          className={headClassName}
+          data-drop-name={group.name}
+          data-drop-kind="group"
+          title="Clic para desplegar o plegar. Arrastrar para mover el grupo. Doble clic para renombrar."
+        >
+          {isEditing(node) ? renameForm(node) : (
+            <>
+              <button
+                className="filter-row group-row"
+                onPointerDown={(event) => onStartGroupDrag(group.name, event)}
+                onClick={(event) => {
+                  if (shouldSuppressDragClick()) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    return;
+                  }
+                  onToggleGroup(group.name);
+                }}
+                onDoubleClick={(event) => {
+                  event.preventDefault();
+                  beginRename(node);
+                }}
+                aria-expanded={!group.collapsed}
+              >
+                <span className="filter-name">
+                  {group.collapsed ? <ChevronRight size={15} /> : <ChevronDown size={15} />}
+                  <span className="category-count" aria-label={`${total.toLocaleString("es-AR")} estampas`}>
+                    {total.toLocaleString("es-AR")}
+                  </span>
+                  <span className="category-label">{group.name}</span>
+                </span>
+              </button>
+              <div className="category-actions">
+                <button
+                  className="category-action delete"
+                  draggable={false}
+                  title={`Eliminar grupo ${group.name}`}
+                  aria-label={`Eliminar grupo ${group.name}`}
+                  onMouseDown={(event) => event.stopPropagation()}
+                  onClick={() => setPendingDelete(node)}
+                >
+                  <Trash2 size={14} />
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+
+        {!group.collapsed && (
+          <div className="group-children" data-drop-name={group.name} data-drop-kind="group-body">
+            {group.children.length > 0
+              ? group.children.map((child) => renderCategoryRow(child, true))
+              : <p className="group-empty">Arrastra categorias aca</p>}
+          </div>
+        )}
+      </div>
+    );
   };
 
   return (
@@ -1479,9 +2137,35 @@ function LeftFilters({
       <div className="panel-head">
         <span>Categorias</span>
         <div className="panel-actions">
-          <button className="panel-icon-button" onClick={() => setAddingCategory((current) => !current)} title="Nueva categoria" aria-label="Nueva categoria">
-            <Plus size={15} />
-          </button>
+          <div className="create-menu-anchor">
+            <div className="split-button">
+              <button
+                className="panel-icon-button"
+                onClick={() => startAdding("category")}
+                title="Nueva categoria"
+                aria-label="Nueva categoria"
+              >
+                <Plus size={15} />
+              </button>
+              <button
+                className="panel-icon-button split-caret"
+                onClick={() => setCreateMenuOpen((current) => !current)}
+                title="Mas opciones"
+                aria-label="Mas opciones"
+                aria-expanded={createMenuOpen}
+              >
+                <ChevronDown size={12} />
+              </button>
+            </div>
+            {createMenuOpen && (
+              <div className="panel-menu" role="menu">
+                <button type="button" role="menuitem" onClick={() => startAdding("group")}>
+                  <FolderPlus size={14} />
+                  Crear grupo
+                </button>
+              </div>
+            )}
+          </div>
           <button className="panel-icon-button" onClick={onClear} title="Limpiar filtros" aria-label="Limpiar filtros">
             <X size={15} />
           </button>
@@ -1489,13 +2173,18 @@ function LeftFilters({
       </div>
 
       <div className="filter-stack">
-        {addingCategory && (
-          <form className="category-edit-form new-category" onSubmit={submitNewCategory}>
-            <input autoFocus value={newCategoryName} onChange={(event) => setNewCategoryName(event.target.value)} placeholder="Nueva categoria" />
-            <button type="submit" title="Crear categoria" aria-label="Crear categoria">
+        {adding && (
+          <form className={adding === "group" ? "category-edit-form new-category new-group" : "category-edit-form new-category"} onSubmit={submitNew}>
+            <input
+              autoFocus
+              value={newName}
+              onChange={(event) => setNewName(event.target.value)}
+              placeholder={adding === "group" ? "Nuevo grupo" : "Nueva categoria"}
+            />
+            <button type="submit" title="Crear" aria-label="Crear">
               <Check size={15} />
             </button>
-            <button type="button" title="Cancelar" aria-label="Cancelar" onClick={() => { setAddingCategory(false); setNewCategoryName(""); }}>
+            <button type="button" title="Cancelar" aria-label="Cancelar" onClick={() => { setAdding(null); setNewName(""); }}>
               <X size={15} />
             </button>
           </form>
@@ -1526,11 +2215,10 @@ function LeftFilters({
           className={[
             "category-row",
             "uncategorized-category-row",
-            dragState?.kind === "design" && dragState.targetCategory && sameCategory(dragState.targetCategory, UNCATEGORIZED_CATEGORY)
-              ? "design-drop-target"
-              : "",
+            dragState?.kind === "design" && dropsOn("category", UNCATEGORIZED_CATEGORY) ? "design-drop-target" : "",
           ].filter(Boolean).join(" ")}
-          data-category-drop={UNCATEGORIZED_CATEGORY}
+          data-drop-name={UNCATEGORIZED_CATEGORY}
+          data-drop-kind="category"
           title="Ver estampas sin categoria. Arrastra una estampa aca para quitarle la categoria."
         >
           <button
@@ -1552,95 +2240,7 @@ function LeftFilters({
             </span>
           </button>
         </div>
-        {categories.map((category) => {
-          const categoryCount = categoryCounts.get(category) ?? 0;
-          const rowClassName = [
-            "category-row",
-            dragState?.kind === "category" && sameCategory(dragState.id, category) ? "category-dragging" : "",
-            dragState?.kind === "design" && dragState.targetCategory && sameCategory(dragState.targetCategory, category)
-              ? "design-drop-target"
-              : "",
-            dragState?.kind === "category" && dragState.targetCategory && sameCategory(dragState.targetCategory, category)
-              ? `category-drop-${dragState.targetPosition}`
-              : "",
-          ].filter(Boolean).join(" ");
-
-          return (
-          <div
-            key={category}
-            className={rowClassName}
-            data-category-drop={category}
-            title="Arrastrar para ordenar. Doble clic para renombrar."
-          >
-            {editingCategory === category ? (
-              <form
-                className="category-edit-form inline-rename"
-                onSubmit={(event) => {
-                  event.preventDefault();
-                  (event.currentTarget.elements.namedItem("categoryName") as HTMLInputElement | null)?.blur();
-                }}
-              >
-                <input
-                  name="categoryName"
-                  autoFocus
-                  value={editingName}
-                  onChange={(event) => setEditingName(event.target.value)}
-                  onFocus={() => { renameCancelled.current = false; }}
-                  onBlur={() => {
-                    if (!renameCancelled.current) void commitRename(category);
-                  }}
-                  onKeyDown={(event) => {
-                    if (event.key === "Escape") {
-                      renameCancelled.current = true;
-                      setEditingCategory(null);
-                      setEditingName("");
-                    }
-                  }}
-                  aria-label={`Renombrar ${category}`}
-                />
-              </form>
-            ) : (
-              <>
-                <button
-                  className={filters.categories.some((item) => sameCategory(item, category)) ? "filter-row active" : "filter-row"}
-                  onPointerDown={(event) => onStartCategoryDrag(category, event)}
-                  onClick={(event) => {
-                    if (shouldSuppressDragClick()) {
-                      event.preventDefault();
-                      event.stopPropagation();
-                      return;
-                    }
-                    onCategoryFilter(category);
-                  }}
-                  onDoubleClick={(event) => {
-                    event.preventDefault();
-                    beginRename(category);
-                  }}
-                >
-                  <span className="filter-name">
-                    <span className="category-count" aria-label={`${categoryCount.toLocaleString("es-AR")} estampas`}>
-                      {categoryCount.toLocaleString("es-AR")}
-                    </span>
-                    <span className="category-label">{category}</span>
-                  </span>
-                </button>
-                <div className="category-actions">
-                  <button
-                    className="category-action delete"
-                    draggable={false}
-                    title={`Eliminar ${category}`}
-                    aria-label={`Eliminar ${category}`}
-                    onMouseDown={(event) => event.stopPropagation()}
-                    onClick={() => void deleteCurrentCategory(category)}
-                  >
-                    <Trash2 size={14} />
-                  </button>
-                </div>
-              </>
-            )}
-          </div>
-          );
-        })}
+        {sidebar.map((node) => (node.kind === "group" ? renderGroup(node) : renderCategoryRow(node.name, false)))}
       </div>
 
       <div className="left-status">
@@ -1648,6 +2248,36 @@ function LeftFilters({
         <span>{scanning ? "Escaneando biblioteca" : "Escaneo manual"}</span>
       </div>
       <div className="result-count">{filteredCount.toLocaleString("es-AR")} visibles</div>
+
+      {pendingDelete && (
+        <div
+          className="confirm-backdrop"
+          onPointerDown={(event) => {
+            if (event.target === event.currentTarget && !deleting) setPendingDelete(null);
+          }}
+        >
+          <div className="confirm-card" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title">
+            <div className="confirm-icon">
+              <Trash2 size={20} />
+            </div>
+            <h2 id="confirm-title">
+              {pendingDelete.kind === "group"
+                ? `Eliminar el grupo "${pendingDelete.name}"?`
+                : `Eliminar la categoria "${pendingDelete.name}"?`}
+            </h2>
+            <p>{deleteExplanation(pendingDelete)}</p>
+            <div className="confirm-actions">
+              <button type="button" className="confirm-cancel" autoFocus disabled={deleting} onClick={() => setPendingDelete(null)}>
+                Cancelar
+              </button>
+              <button type="button" className="confirm-delete" disabled={deleting} onClick={() => void confirmDelete()}>
+                {deleting ? <Loader2 size={15} className="spin" /> : <Trash2 size={15} />}
+                {pendingDelete.kind === "group" ? "Eliminar grupo" : "Eliminar categoria"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </aside>
   );
 }
@@ -1677,8 +2307,13 @@ function Viewer({
     [design?.previewCachePath, design?.previewPath],
   );
   const [previewSourceIndex, setPreviewSourceIndex] = useState(0);
+  const [loadingOriginal, setLoadingOriginal] = useState(false);
   const previewPath = previewPaths[previewSourceIndex] ?? null;
   const preview = previewPath ? convertFileSrc(previewPath) : null;
+  // El original solo se ofrece si es un archivo distinto de la copia cacheada.
+  const originalPath = design?.previewPath ?? null;
+  const canLoadOriginal = Boolean(originalPath) && originalPath !== previewPaths[0];
+  const showingOriginal = Boolean(originalPath) && previewPath === originalPath;
   const previewFile = design?.files.find((file) => file.path === design.previewPath) ?? design?.files[0] ?? null;
   const imageCount = design ? countForExtension(design, ".jpg") + countForExtension(design, ".jpeg") + countForExtension(design, ".png") + countForExtension(design, ".webp") : 0;
   const [pan, setPan] = useState({ x: 0, y: 0 });
@@ -1698,7 +2333,30 @@ function Viewer({
 
   useEffect(() => {
     setPreviewSourceIndex(0);
+    setLoadingOriginal(false);
   }, [design?.id, design?.previewCachePath, design?.previewPath]);
+
+  /**
+   * Carga el archivo original a pedido para poder hacer zoom con detalle real.
+   * Es temporal: al cambiar de estampa o cerrar la app se vuelve a la copia liviana.
+   */
+  const toggleOriginal = useCallback(() => {
+    if (showingOriginal) {
+      setPreviewSourceIndex(0);
+      return;
+    }
+    const target = originalPath;
+    if (!target || loadingOriginal) return;
+    setLoadingOriginal(true);
+    const loader = new Image();
+    const finish = (success: boolean) => {
+      setLoadingOriginal(false);
+      if (success) setPreviewSourceIndex(previewPaths.indexOf(target));
+    };
+    loader.onload = () => finish(true);
+    loader.onerror = () => finish(false);
+    loader.src = convertFileSrc(target);
+  }, [loadingOriginal, originalPath, previewPaths, showingOriginal]);
 
   const clampPan = useCallback(
     (next: { x: number; y: number }, nextZoom = zoom) => {
@@ -1791,6 +2449,38 @@ function Viewer({
       <button className="nav-arrow left" onClick={onPrev} disabled={!design} title="Anterior">
         <ChevronLeft size={28} />
       </button>
+
+      {design && canLoadOriginal && (
+        <div className="viewer-original-bar">
+          <button
+            className={showingOriginal ? "original-toggle active" : "original-toggle"}
+            onClick={toggleOriginal}
+            disabled={loadingOriginal}
+            title={
+              showingOriginal
+                ? "Estas viendo el archivo original. Tocá para volver a la vista liviana."
+                : "Cargar el archivo original para hacer zoom con todo el detalle."
+            }
+          >
+            {loadingOriginal ? (
+              <>
+                <Loader2 size={15} className="spin" />
+                <span>Cargando original...</span>
+              </>
+            ) : showingOriginal ? (
+              <>
+                <Maximize2 size={15} />
+                <span>Original</span>
+              </>
+            ) : (
+              <>
+                <Maximize2 size={15} />
+                <span>Cargar original</span>
+              </>
+            )}
+          </button>
+        </div>
+      )}
 
       <div ref={artboardRef} className="artboard" onWheel={handleWheel}>
         {loading && !design ? (

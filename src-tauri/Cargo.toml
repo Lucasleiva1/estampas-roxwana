@@ -1,6 +1,6 @@
 [package]
 name = "roxwana-biblioteca-visual"
-version = "0.1.7"
+version = "0.1.8"
 description = "ROXWANA Biblioteca Visual"
 authors = ["ROXWANA"]
 edition = "2021"
@@ -16,7 +16,7 @@ serde_json = "1"
 sha2 = "0.10"
 tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2"
-tauri-plugin-fs = "2"
+tauri-plugin-fs = { version = "2", features = ["watch"] }
 tauri-plugin-opener = "2"
 tauri-plugin-persisted-scope = "2"
 tauri-plugin-process = "2"
@@ -26,3 +26,8 @@ walkdir = "2"
 
 [dev-dependencies]
 tempfile = "3"
+
+# Las librerias externas se compilan optimizadas incluso en modo desarrollo.
+# Sin esto, redimensionar imagenes grandes tarda decenas de segundos cada una.
+[profile.dev.package."*"]
+opt-level = 3

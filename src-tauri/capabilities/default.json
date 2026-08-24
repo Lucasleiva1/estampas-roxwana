@@ -13,7 +13,8 @@
       "allow": [
         { "path": "$HOME/**/*" },
         { "path": "$APPCACHE/**/*" },
-        { "path": "$APPLOCALDATA/**/*" }
+        { "path": "$APPLOCALDATA/**/*" },
+        { "path": "D:\\estampas-roxwana\\**" }
       ]
     },
     "opener:default",
