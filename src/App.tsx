@@ -6,6 +6,7 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type DownloadEvent } from "@tauri-apps/plugin-updater";
 import {
   Check,
+  BriefcaseBusiness,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
@@ -23,6 +24,8 @@ import {
   Maximize2,
   Minus,
   MoreVertical,
+  PanelLeftClose,
+  PanelLeftOpen,
   Plus,
   RefreshCw,
   RotateCcw,
@@ -30,6 +33,7 @@ import {
   Search,
   Settings,
   Shuffle,
+  Sparkles,
   Tags,
   Trash2,
   Upload,
@@ -41,6 +45,7 @@ import {
   addTag,
   createCategory as createLibraryCategory,
   createCategoryGroup as createLibraryGroup,
+  createReferenceCategory,
   deleteCategory as deleteLibraryCategory,
   deleteCategoryGroup as deleteLibraryGroup,
   generatePreview,
@@ -50,6 +55,7 @@ import {
   getBrandLogo,
   getDesignDetail,
   getInitialState,
+  getReferences,
   openDesignFolder,
   openBackupFolder,
   removeBrandLogo,
@@ -63,8 +69,12 @@ import {
   scanLibrary,
   saveDatabaseBackup,
   saveBrandLogo,
+  scanReferences,
+  sendReferenceToWork,
   updateCategory,
   updateFavorite,
+  updateReferenceFavorite,
+  updateReferenceStatus,
   updateStatus,
   type BrandLogo,
 } from "./lib/api";
@@ -83,7 +93,7 @@ import {
   type SidebarNodeKind,
 } from "./lib/categories";
 import { formatBytes } from "./lib/fileTypes";
-import type { Design, DesignStatus, Filters, LibraryResponse } from "./lib/types";
+import type { Design, DesignStatus, Filters, LibraryResponse, ReferenceItem, ReferenceStatus, ReferencesResponse } from "./lib/types";
 import illustratorIcon from "./assets/illustrator.png";
 import photoshopIcon from "./assets/photoshop.png";
 
@@ -102,6 +112,7 @@ const LEFT_PANEL_WIDTH_MIN = 170;
 const LEFT_PANEL_WIDTH_MAX = 380;
 const LEFT_PANEL_RESERVED_WIDTH = 640;
 const RANDOM_HISTORY_STORAGE_KEY = "roxwana-random-history";
+const REFERENCES_SIDEBAR_STORAGE_KEY = "roxwana-references-sidebar-open";
 
 function clampNumber(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
@@ -278,6 +289,7 @@ function writeRandomHistory(rootPath: string, usedIds: string[]) {
 }
 
 export default function App() {
+  const [appMode, setAppMode] = useState<"library" | "references">("library");
   const [library, setLibrary] = useState<LibraryResponse | null>(null);
   const [filters, setFilters] = useState<Filters>(() => createDefaultFilters());
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -1389,6 +1401,15 @@ export default function App() {
     }
   }, []);
 
+  const openWorkInLibrary = useCallback(
+    async (workName: string) => {
+      await runScan();
+      setFilters({ ...createDefaultFilters(), categories: [workName] });
+      setAppMode("library");
+    },
+    [runScan],
+  );
+
   const saveBackupCopy = useCallback(async () => {
     setBackupState({ phase: "saving", message: "Guardando copia de seguridad...", path: null });
     try {
@@ -1474,6 +1495,18 @@ export default function App() {
     );
   }
 
+  if (appMode === "references") {
+    return (
+      <ReferencesScreen
+        rootPath={library?.rootPath ?? DEFAULT_LIBRARY_PATH}
+        brandLogo={brandLogo}
+        onBackToLibrary={() => setAppMode("library")}
+        onOpenSettings={() => setSettingsOpen(true)}
+        onOpenWork={openWorkInLibrary}
+      />
+    );
+  }
+
   return (
     <main className="visual-shell">
       <Header
@@ -1487,6 +1520,7 @@ export default function App() {
         showIconLabels={showIconLabels}
         setShowIconLabels={setShowIconLabels}
         setSettingsOpen={setSettingsOpen}
+        onOpenReferences={() => setAppMode("references")}
         uiScale={uiScale}
         setUiScale={setUiScale}
       />
@@ -1592,6 +1626,611 @@ export default function App() {
   );
 }
 
+type ReferenceScope = "all" | "favorites" | "recent";
+type ReferenceSort = "recent" | "name" | "random";
+type ReferenceSize = "small" | "medium" | "large";
+
+const referenceStatusLabels: Record<ReferenceStatus, string> = {
+  pending: "Pendiente",
+  working: "En trabajo",
+  done: "Realizada",
+};
+
+function initialReferencesSidebarOpen() {
+  try {
+    return window.localStorage.getItem(REFERENCES_SIDEBAR_STORAGE_KEY) !== "false";
+  } catch {
+    return true;
+  }
+}
+
+function referenceRandomRank(id: string, seed: number) {
+  let hash = seed | 0;
+  for (let index = 0; index < id.length; index += 1) {
+    hash = Math.imul(hash ^ id.charCodeAt(index), 16777619);
+  }
+  return hash >>> 0;
+}
+
+function ReferencesScreen({
+  rootPath,
+  brandLogo,
+  onBackToLibrary,
+  onOpenSettings,
+  onOpenWork,
+}: {
+  rootPath: string;
+  brandLogo: BrandLogo | null;
+  onBackToLibrary: () => void;
+  onOpenSettings: () => void;
+  onOpenWork: (workName: string) => Promise<void>;
+}) {
+  const [data, setData] = useState<ReferencesResponse | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [scanning, setScanning] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
+  const deferredQuery = useDeferredValue(query);
+  const [selectedCategory, setSelectedCategory] = useState("Todos");
+  const [scope, setScope] = useState<ReferenceScope>("all");
+  const [status, setStatusFilter] = useState<ReferenceStatus | "all">("all");
+  const [sort, setSort] = useState<ReferenceSort>("recent");
+  const [size, setSize] = useState<ReferenceSize>("medium");
+  const [randomSeed, setRandomSeed] = useState(() => Date.now());
+  const [sidebarOpen, setSidebarOpen] = useState(initialReferencesSidebarOpen);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [lightboxId, setLightboxId] = useState<string | null>(null);
+  const [workReference, setWorkReference] = useState<ReferenceItem | null>(null);
+  const [workName, setWorkName] = useState("");
+  const [creatingWork, setCreatingWork] = useState(false);
+  const thumbnailAttempts = useRef(new Set<string>());
+
+  const refresh = useCallback(
+    async (manual = false) => {
+      if (manual) setScanning(true);
+      setError(null);
+      try {
+        const response = manual ? await scanReferences(rootPath) : await getReferences(rootPath);
+        setData(response);
+      } catch (refreshError) {
+        setError(String(refreshError));
+      } finally {
+        setLoading(false);
+        setScanning(false);
+      }
+    },
+    [rootPath],
+  );
+
+  useEffect(() => {
+    setLoading(true);
+    void refresh(false);
+  }, [refresh]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(REFERENCES_SIDEBAR_STORAGE_KEY, String(sidebarOpen));
+    } catch {
+      // La preferencia sigue funcionando durante la sesion actual.
+    }
+  }, [sidebarOpen]);
+
+  useEffect(() => {
+    const referencesPath = data?.referencesPath;
+    if (!referencesPath) return;
+    let disposed = false;
+    let stopWatching: (() => void) | null = null;
+    let timer = 0;
+    void watch(
+      referencesPath,
+      (event) => {
+        if (typeof event.type === "object" && "access" in event.type) return;
+        const hasReferenceChange = event.paths.some((path) => {
+          const normalized = path.replace(/\\/g, "/").toLocaleLowerCase();
+          return !normalized.split("/").includes("_roxwana-cache");
+        });
+        if (!hasReferenceChange) return;
+        window.clearTimeout(timer);
+        timer = window.setTimeout(() => {
+          if (!disposed) void refresh(false);
+        }, 900);
+      },
+      { recursive: true, delayMs: 600 },
+    )
+      .then((stop) => {
+        if (disposed) stop();
+        else stopWatching = stop;
+      })
+      .catch((watchError) => {
+        if (!disposed) setError(`No pude vigilar Referencias: ${String(watchError)}`);
+      });
+    return () => {
+      disposed = true;
+      window.clearTimeout(timer);
+      stopWatching?.();
+    };
+  }, [data?.referencesPath, refresh]);
+
+  useEffect(() => {
+    const candidates = (data?.references ?? [])
+      .filter((reference) => !reference.thumbnailPath && !thumbnailAttempts.current.has(reference.path))
+      .slice(0, 180);
+    if (candidates.length === 0) return;
+    candidates.forEach((reference) => thumbnailAttempts.current.add(reference.path));
+    let cancelled = false;
+    void generateThumbnailsBulk(candidates.map((reference) => [reference.path, reference.modified]))
+      .then((generated) => {
+        if (cancelled) return;
+        const paths = new Map(generated.filter((item): item is [string, string] => Boolean(item[1])));
+        if (paths.size === 0) return;
+        setData((current) =>
+          current
+            ? {
+                ...current,
+                references: current.references.map((reference) => ({
+                  ...reference,
+                  thumbnailPath: paths.get(reference.path) ?? reference.thumbnailPath,
+                })),
+              }
+            : current,
+        );
+      })
+      .catch((thumbnailError) => {
+        if (!cancelled) setError(`No pude preparar algunas miniaturas: ${String(thumbnailError)}`);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [data?.references]);
+
+  const visibleReferences = useMemo(() => {
+    const normalizedQuery = deferredQuery.trim().toLocaleLowerCase();
+    const recentLimit = Math.floor(Date.now() / 1000) - 30 * 24 * 60 * 60;
+    const filtered = (data?.references ?? []).filter((reference) => {
+      if (selectedCategory !== "Todos" && reference.category !== selectedCategory) return false;
+      if (scope === "favorites" && !reference.favorite) return false;
+      if (scope === "recent" && reference.modified < recentLimit) return false;
+      if (status !== "all" && reference.status !== status) return false;
+      if (!normalizedQuery) return true;
+      return [reference.name, reference.fileName, reference.category]
+        .some((value) => value.toLocaleLowerCase().includes(normalizedQuery));
+    });
+    return [...filtered].sort((left, right) => {
+      if (sort === "name") return left.name.localeCompare(right.name, "es", { sensitivity: "base" });
+      if (sort === "random") return referenceRandomRank(left.id, randomSeed) - referenceRandomRank(right.id, randomSeed);
+      return right.modified - left.modified || left.name.localeCompare(right.name, "es", { sensitivity: "base" });
+    });
+  }, [data?.references, deferredQuery, randomSeed, scope, selectedCategory, sort, status]);
+
+  const selectedReference = data?.references.find((reference) => reference.id === selectedId) ?? null;
+  const lightboxIndex = Math.max(0, visibleReferences.findIndex((reference) => reference.id === lightboxId));
+  const lightboxReference = lightboxId ? visibleReferences[lightboxIndex] ?? null : null;
+
+  useEffect(() => {
+    if (!lightboxId) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setLightboxId(null);
+      if (event.key === "ArrowLeft" && visibleReferences.length > 0) {
+        const next = (lightboxIndex - 1 + visibleReferences.length) % visibleReferences.length;
+        setLightboxId(visibleReferences[next].id);
+      }
+      if (event.key === "ArrowRight" && visibleReferences.length > 0) {
+        const next = (lightboxIndex + 1) % visibleReferences.length;
+        setLightboxId(visibleReferences[next].id);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [lightboxId, lightboxIndex, visibleReferences]);
+
+  const replaceReference = useCallback((updated: ReferenceItem) => {
+    setData((current) =>
+      current
+        ? { ...current, references: current.references.map((reference) => (reference.id === updated.id ? updated : reference)) }
+        : current,
+    );
+  }, []);
+
+  const toggleFavorite = useCallback(async (reference: ReferenceItem) => {
+    const favorite = !reference.favorite;
+    setData((current) =>
+      current
+        ? {
+            ...current,
+            references: current.references.map((item) => (item.id === reference.id ? { ...item, favorite } : item)),
+          }
+        : current,
+    );
+    try {
+      await updateReferenceFavorite(reference.id, favorite);
+    } catch (favoriteError) {
+      setError(String(favoriteError));
+      setData((current) =>
+        current
+          ? {
+              ...current,
+              references: current.references.map((item) => (item.id === reference.id ? { ...item, favorite: reference.favorite } : item)),
+            }
+          : current,
+      );
+    }
+  }, []);
+
+  const changeStatus = useCallback(async (reference: ReferenceItem, nextStatus: ReferenceStatus) => {
+    setData((current) =>
+      current
+        ? {
+            ...current,
+            references: current.references.map((item) => (item.id === reference.id ? { ...item, status: nextStatus } : item)),
+          }
+        : current,
+    );
+    try {
+      await updateReferenceStatus(reference.id, nextStatus);
+    } catch (statusError) {
+      setError(String(statusError));
+      setData((current) =>
+        current
+          ? {
+              ...current,
+              references: current.references.map((item) => (item.id === reference.id ? { ...item, status: reference.status } : item)),
+            }
+          : current,
+      );
+    }
+  }, []);
+
+  const showWorkDialog = (reference: ReferenceItem) => {
+    setWorkReference(reference);
+    setWorkName(reference.name);
+  };
+
+  const createWork = async () => {
+    if (!workReference || !workName.trim()) return;
+    setCreatingWork(true);
+    setError(null);
+    try {
+      const updated = await sendReferenceToWork(rootPath, workReference.id, workName.trim());
+      replaceReference(updated);
+      setWorkReference(null);
+      setWorkName("");
+    } catch (workError) {
+      setError(String(workError));
+    } finally {
+      setCreatingWork(false);
+    }
+  };
+
+  const openWork = async (reference: ReferenceItem) => {
+    if (!reference.workPath) return;
+    const pathParts = reference.workPath.split(/[\\/]/).filter(Boolean);
+    const name = pathParts[pathParts.length - 1] ?? reference.name;
+    await onOpenWork(name);
+  };
+
+  const addCategory = async () => {
+    const name = window.prompt("Nombre de la nueva carpeta de referencias");
+    if (!name?.trim()) return;
+    try {
+      const category = await createReferenceCategory(rootPath, name);
+      await refresh(false);
+      setSelectedCategory(category);
+    } catch (categoryError) {
+      setError(String(categoryError));
+    }
+  };
+
+  const categoryCount = (category: string) =>
+    (data?.references ?? []).filter((reference) => reference.category === category).length;
+
+  return (
+    <main className="references-shell">
+      <header className="references-header">
+        <section className="references-brand">
+          <div className="references-logo">
+            {brandLogo ? <img src={brandLogo.dataUrl} alt="Logo de la marca" draggable={false} /> : <Sparkles size={27} />}
+          </div>
+          <div>
+            <strong>REFERENCIAS</strong>
+            <span>Explorar ideas y empezar trabajos</span>
+          </div>
+        </section>
+        <nav className="mode-switch single" aria-label="Volver a la biblioteca">
+          <button type="button" onClick={onBackToLibrary}>Biblioteca</button>
+        </nav>
+        <label className="references-search">
+          <Search size={17} />
+          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Buscar referencias..." />
+          {query && <button type="button" onClick={() => setQuery("")} title="Limpiar busqueda"><X size={15} /></button>}
+        </label>
+        <div className="references-header-actions">
+          <button type="button" onClick={() => void refresh(true)} title="Rescanear referencias">
+            <RefreshCw size={17} className={scanning ? "spin" : ""} />
+          </button>
+          <button type="button" onClick={onOpenSettings} title="Ajustes"><Settings size={17} /></button>
+        </div>
+      </header>
+
+      <nav className="references-category-bar" aria-label="Categorias de referencias">
+        <button
+          type="button"
+          className={selectedCategory === "Todos" ? "active" : ""}
+          onClick={() => setSelectedCategory("Todos")}
+        >
+          Todos <b>{data?.references.length ?? 0}</b>
+        </button>
+        {(data?.categories ?? []).map((category) => (
+          <button
+            type="button"
+            key={category}
+            className={selectedCategory === category ? "active" : ""}
+            onClick={() => setSelectedCategory(category)}
+          >
+            {category} <b>{categoryCount(category)}</b>
+          </button>
+        ))}
+        <button type="button" className="add" onClick={() => void addCategory()} title="Crear carpeta de referencias"><Plus size={15} /></button>
+      </nav>
+
+      {error && (
+        <div className="references-error" role="alert">
+          <span>{error}</span>
+          <button type="button" onClick={() => setError(null)}><X size={15} /></button>
+        </div>
+      )}
+
+      <section className={sidebarOpen ? "references-layout" : "references-layout sidebar-hidden"}>
+        {sidebarOpen && (
+          <aside className="references-sidebar">
+            <div className="references-sidebar-title">
+              <span>REFERENCIAS</span>
+              <button type="button" onClick={() => setSidebarOpen(false)} title="Ocultar barra lateral"><PanelLeftClose size={17} /></button>
+            </div>
+            <button type="button" className={scope === "all" && selectedCategory === "Todos" ? "active" : ""} onClick={() => { setScope("all"); setSelectedCategory("Todos"); }}>
+              <LayoutGrid size={16} /><span>Todas las referencias</span><b>{data?.references.length ?? 0}</b>
+            </button>
+            <button type="button" className={scope === "favorites" ? "active" : ""} onClick={() => { setScope("favorites"); setSelectedCategory("Todos"); }}>
+              <Heart size={16} /><span>Favoritas</span><b>{data?.references.filter((item) => item.favorite).length ?? 0}</b>
+            </button>
+            <button type="button" className={scope === "recent" ? "active" : ""} onClick={() => { setScope("recent"); setSelectedCategory("Todos"); }}>
+              <Clock3 size={16} /><span>Recientes</span>
+            </button>
+            <div className="references-sidebar-label">CARPETAS</div>
+            {(data?.categories ?? []).map((category) => (
+              <button type="button" key={category} className={selectedCategory === category ? "active" : ""} onClick={() => { setScope("all"); setSelectedCategory(category); }}>
+                <FolderOpen size={15} /><span>{category}</span><b>{categoryCount(category)}</b>
+              </button>
+            ))}
+            <div className="references-path" title={data?.referencesPath}>
+              <small>Carpeta activa</small>
+              <span>{data?.referencesPath ?? `${rootPath}\\Referencias`}</span>
+            </div>
+          </aside>
+        )}
+
+        <section className="references-content">
+          <div className="references-toolbar">
+            {!sidebarOpen && (
+              <button type="button" className="show-sidebar" onClick={() => setSidebarOpen(true)} title="Mostrar barra lateral">
+                <PanelLeftOpen size={17} /><span>Panel</span>
+              </button>
+            )}
+            <div className="reference-status-tabs">
+              {(["all", "pending", "working", "done"] as const).map((value) => (
+                <button type="button" key={value} className={status === value ? "active" : ""} onClick={() => setStatusFilter(value)}>
+                  {value === "all" ? "Todas" : referenceStatusLabels[value]}
+                </button>
+              ))}
+            </div>
+            <div className="references-result-count">
+              <strong>{visibleReferences.length.toLocaleString("es-AR")}</strong>
+              <span>{visibleReferences.length === 1 ? "referencia" : "referencias"}</span>
+            </div>
+            <select value={sort} onChange={(event) => {
+              const next = event.target.value as ReferenceSort;
+              setSort(next);
+              if (next === "random") setRandomSeed(Date.now());
+            }} aria-label="Ordenar referencias">
+              <option value="recent">Mas recientes</option>
+              <option value="name">Nombre</option>
+              <option value="random">Aleatorio</option>
+            </select>
+            {sort === "random" && <button type="button" className="shuffle-references" onClick={() => setRandomSeed(Date.now())} title="Mezclar de nuevo"><Shuffle size={16} /></button>}
+            <div className="references-size-control" aria-label="Tamano de miniaturas">
+              {(["small", "medium", "large"] as const).map((value) => (
+                <button type="button" key={value} className={size === value ? "active" : ""} onClick={() => setSize(value)} title={`Miniaturas ${value}`} />
+              ))}
+            </div>
+          </div>
+
+          {loading ? (
+            <div className="references-empty"><Loader2 size={28} className="spin" /><strong>Cargando referencias...</strong></div>
+          ) : visibleReferences.length === 0 ? (
+            <div className="references-empty">
+              <Sparkles size={30} />
+              <strong>No hay referencias para mostrar</strong>
+              <span>Agrega imagenes dentro de las carpetas de Referencias o cambia los filtros.</span>
+            </div>
+          ) : (
+            <div className={`references-wall ${size}`}>
+              {visibleReferences.map((reference) => (
+                <ReferenceCard
+                  key={reference.id}
+                  reference={reference}
+                  selected={selectedReference?.id === reference.id}
+                  onSelect={() => setSelectedId(reference.id)}
+                  onView={() => setLightboxId(reference.id)}
+                  onFavorite={() => void toggleFavorite(reference)}
+                  onOpenFolder={() => void openDesignFolder(reference.folderPath).catch((openError) => setError(String(openError)))}
+                  onStartWork={() => showWorkDialog(reference)}
+                  onOpenWork={() => void openWork(reference)}
+                />
+              ))}
+            </div>
+          )}
+        </section>
+      </section>
+
+      {lightboxReference && (
+        <ReferenceLightbox
+          reference={lightboxReference}
+          index={lightboxIndex}
+          total={visibleReferences.length}
+          onClose={() => setLightboxId(null)}
+          onPrevious={() => {
+            const next = (lightboxIndex - 1 + visibleReferences.length) % visibleReferences.length;
+            setLightboxId(visibleReferences[next].id);
+          }}
+          onNext={() => {
+            const next = (lightboxIndex + 1) % visibleReferences.length;
+            setLightboxId(visibleReferences[next].id);
+          }}
+          onFavorite={() => void toggleFavorite(lightboxReference)}
+          onOpenFolder={() => void openDesignFolder(lightboxReference.folderPath).catch((openError) => setError(String(openError)))}
+          onStartWork={() => showWorkDialog(lightboxReference)}
+          onOpenWork={() => void openWork(lightboxReference)}
+          onStatus={(nextStatus) => void changeStatus(lightboxReference, nextStatus)}
+        />
+      )}
+
+      {workReference && (
+        <div className="reference-modal-backdrop" role="presentation" onMouseDown={(event) => {
+          if (event.target === event.currentTarget && !creatingWork) setWorkReference(null);
+        }}>
+          <form className="create-work-modal" onSubmit={(event) => { event.preventDefault(); void createWork(); }}>
+            <div className="create-work-title">
+              <BriefcaseBusiness size={21} />
+              <div><strong>CREAR TRABAJO</strong><span>La referencia original no se mueve ni se modifica.</span></div>
+              <button type="button" onClick={() => setWorkReference(null)} disabled={creatingWork}><X size={17} /></button>
+            </div>
+            <label>
+              <span>Nombre</span>
+              <input autoFocus value={workName} onChange={(event) => setWorkName(event.target.value)} />
+            </label>
+            <div className="create-work-reference">
+              <img src={convertFileSrc(workReference.thumbnailPath ?? workReference.path)} alt="" />
+              <div><strong>{workReference.fileName}</strong><span>{workReference.category}</span></div>
+            </div>
+            <p>Se creara una carpeta dentro de <b>Trabajos</b> y se copiara esta imagen. Luego podras agregar alli PNG, PSD, AI y los demas archivos.</p>
+            <div className="create-work-actions">
+              <button type="button" onClick={() => setWorkReference(null)} disabled={creatingWork}>Cancelar</button>
+              <button type="submit" className="primary" disabled={creatingWork || !workName.trim()}>
+                {creatingWork ? <Loader2 size={16} className="spin" /> : <BriefcaseBusiness size={16} />}
+                Crear trabajo
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+    </main>
+  );
+}
+
+const ReferenceCard = memo(function ReferenceCard({
+  reference,
+  selected,
+  onSelect,
+  onView,
+  onFavorite,
+  onOpenFolder,
+  onStartWork,
+  onOpenWork,
+}: {
+  reference: ReferenceItem;
+  selected: boolean;
+  onSelect: () => void;
+  onView: () => void;
+  onFavorite: () => void;
+  onOpenFolder: () => void;
+  onStartWork: () => void;
+  onOpenWork: () => void;
+}) {
+  const [useOriginal, setUseOriginal] = useState(false);
+  const source = convertFileSrc(useOriginal || !reference.thumbnailPath ? reference.path : reference.thumbnailPath);
+  return (
+    <article className={`reference-card ${selected ? "selected" : ""}`} onClick={onSelect} onDoubleClick={onView}>
+      <div className="reference-image-wrap">
+        <img src={source} alt={reference.name} loading="lazy" decoding="async" draggable={false} onError={() => setUseOriginal(true)} />
+        <span className={`reference-status ${reference.status}`}>{referenceStatusLabels[reference.status]}</span>
+        <button type="button" className={`reference-heart ${reference.favorite ? "active" : ""}`} onClick={(event) => { event.stopPropagation(); onFavorite(); }} title="Favorita">
+          <Heart size={17} fill={reference.favorite ? "currentColor" : "none"} />
+        </button>
+        <div className="reference-hover-actions">
+          <button type="button" onClick={(event) => { event.stopPropagation(); onView(); }} title="Ver grande"><Maximize2 size={16} /></button>
+          <button type="button" onClick={(event) => { event.stopPropagation(); onOpenFolder(); }} title="Abrir carpeta"><FolderOpen size={16} /></button>
+          {reference.workPath ? (
+            <button type="button" className="work" onClick={(event) => { event.stopPropagation(); onOpenWork(); }} title="Abrir trabajo"><BriefcaseBusiness size={16} /></button>
+          ) : (
+            <button type="button" className="work" onClick={(event) => { event.stopPropagation(); onStartWork(); }} title="Enviar a trabajo"><BriefcaseBusiness size={16} /></button>
+          )}
+        </div>
+      </div>
+      <div className="reference-card-meta">
+        <strong>{reference.name}</strong>
+        <span>{reference.category}</span>
+      </div>
+    </article>
+  );
+});
+
+function ReferenceLightbox({
+  reference,
+  index,
+  total,
+  onClose,
+  onPrevious,
+  onNext,
+  onFavorite,
+  onOpenFolder,
+  onStartWork,
+  onOpenWork,
+  onStatus,
+}: {
+  reference: ReferenceItem;
+  index: number;
+  total: number;
+  onClose: () => void;
+  onPrevious: () => void;
+  onNext: () => void;
+  onFavorite: () => void;
+  onOpenFolder: () => void;
+  onStartWork: () => void;
+  onOpenWork: () => void;
+  onStatus: (status: ReferenceStatus) => void;
+}) {
+  return (
+    <div className="reference-lightbox" role="dialog" aria-modal="true" aria-label={reference.name}>
+      <button type="button" className="lightbox-close" onClick={onClose} title="Cerrar"><X size={22} /></button>
+      <button type="button" className="lightbox-arrow previous" onClick={onPrevious} title="Referencia anterior"><ChevronLeft size={30} /></button>
+      <div className="lightbox-image-stage"><img src={convertFileSrc(reference.path)} alt={reference.name} /></div>
+      <button type="button" className="lightbox-arrow next" onClick={onNext} title="Referencia siguiente"><ChevronRight size={30} /></button>
+      <aside className="lightbox-info">
+        <small>{index + 1} de {total}</small>
+        <h2>{reference.name}</h2>
+        <p>{reference.fileName}</p>
+        <span className="lightbox-category">{reference.category}</span>
+        <div className="lightbox-statuses">
+          {(["pending", "working", "done"] as const).map((value) => (
+            <button type="button" key={value} className={`${value} ${reference.status === value ? "active" : ""}`} onClick={() => onStatus(value)}>
+              {referenceStatusLabels[value]}
+            </button>
+          ))}
+        </div>
+        <div className="lightbox-actions">
+          <button type="button" onClick={onFavorite}><Heart size={17} fill={reference.favorite ? "currentColor" : "none"} />{reference.favorite ? "Quitar favorita" : "Favorita"}</button>
+          <button type="button" onClick={onOpenFolder}><FolderOpen size={17} />Abrir carpeta</button>
+          {reference.workPath ? (
+            <button type="button" className="primary" onClick={onOpenWork}><BriefcaseBusiness size={17} />Abrir trabajo</button>
+          ) : (
+            <button type="button" className="primary" onClick={onStartWork}><BriefcaseBusiness size={17} />Enviar a trabajo</button>
+          )}
+        </div>
+        <div className="lightbox-path" title={reference.path}>{reference.path}</div>
+      </aside>
+    </div>
+  );
+}
+
 function Header({
   brandLogo,
   setFilters,
@@ -1603,6 +2242,7 @@ function Header({
   showIconLabels,
   setShowIconLabels,
   setSettingsOpen,
+  onOpenReferences,
   uiScale,
   setUiScale,
 }: {
@@ -1616,6 +2256,7 @@ function Header({
   showIconLabels: boolean;
   setShowIconLabels: (show: boolean) => void;
   setSettingsOpen: (open: boolean) => void;
+  onOpenReferences: () => void;
   uiScale: number;
   setUiScale: (scale: number) => void;
 }) {
@@ -1683,6 +2324,10 @@ function Header({
       </section>
 
       <section className="window-actions">
+        <button className="action-button references-entry" onClick={onOpenReferences} title="Abrir el muro de referencias">
+          <Sparkles size={17} />
+          <span>Referencias</span>
+        </button>
         <button className="action-button" onClick={onChooseFolder} title="Cambiar biblioteca de estampas">
           <FolderOpen size={17} />
           <span>Elegir biblioteca</span>

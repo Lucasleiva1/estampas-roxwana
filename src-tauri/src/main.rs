@@ -23,6 +23,8 @@ const LEGACY_COMPLETE_DIR_NAME: &str = "1-COMPLETAS";
 const PREVIEW_EXTENSIONS: &[&str] = &[".jpg", ".jpeg", ".png", ".webp"];
 const SUPPORT_EXTENSIONS: &[&str] = &[".ai", ".psd", ".svg", ".pdf", ".eps", ".zip", ".txt"];
 const STATUSES: &[&str] = &["pending", "working", "ready", "discarded"];
+const REFERENCE_STATUSES: &[&str] = &["pending", "working", "done"];
+const CONTENT_LAYOUT_VERSION: &str = "github-layout-restored-v1";
 const BACKUP_FILE_NAME: &str = "biblioteca-visual-respaldo.sqlite";
 const RESTORE_SAFETY_FILE_NAME: &str = "biblioteca-visual-antes-de-cargar.sqlite";
 const BRAND_LOGO_FILE_NAME: &str = "brand-logo.png";
@@ -90,6 +92,33 @@ struct BrandLogo {
     data_url: String,
     width: u32,
     height: u32,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReferencesResponse {
+    root_path: String,
+    references_path: String,
+    works_path: String,
+    references: Vec<ReferenceItem>,
+    categories: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReferenceItem {
+    id: String,
+    name: String,
+    file_name: String,
+    path: String,
+    folder_path: String,
+    category: String,
+    thumbnail_path: Option<String>,
+    size: u64,
+    modified: i64,
+    favorite: bool,
+    status: String,
+    work_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -184,8 +213,12 @@ fn get_initial_state(app: AppHandle) -> Result<LibraryResponse, String> {
     let root =
         get_setting(&conn, "library_root")?.unwrap_or_else(|| DEFAULT_LIBRARY_PATH.to_string());
     let root_exists = PathBuf::from(&root).exists();
+    let layout_needs_rescan =
+        get_setting(&conn, "content_layout_version")?.as_deref() != Some(CONTENT_LAYOUT_VERSION);
     let should_scan = root_exists
-        && (active_design_count(&conn)? == 0 || active_library_has_missing_paths(&conn)?);
+        && (active_design_count(&conn)? == 0
+            || active_library_has_missing_paths(&conn)?
+            || layout_needs_rescan);
 
     if !root_exists {
         conn.execute("UPDATE designs SET missing = 1", [])
@@ -219,6 +252,76 @@ async fn save_brand_logo(app: AppHandle, source_path: String) -> Result<BrandLog
 #[tauri::command]
 fn remove_brand_logo(app: AppHandle) -> Result<(), String> {
     remove_file_if_exists(&brand_logo_path(&app)?)
+}
+
+#[tauri::command]
+fn get_references(app: AppHandle, root_path: String) -> Result<ReferencesResponse, String> {
+    scan_references_impl(&app, &root_path)
+}
+
+#[tauri::command]
+fn scan_references(app: AppHandle, root_path: String) -> Result<ReferencesResponse, String> {
+    scan_references_impl(&app, &root_path)
+}
+
+#[tauri::command]
+fn create_reference_category(root_path: String, name: String) -> Result<String, String> {
+    let folder_name = safe_folder_name(&name)?;
+    let references_path = PathBuf::from(&root_path).join(REFERENCES_DIR_NAME);
+    fs::create_dir_all(&references_path)
+        .map_err(|error| format!("No se pudo preparar Referencias: {error}"))?;
+    let category_path = references_path.join(&folder_name);
+    if category_path.exists() {
+        return Err("Ya existe una carpeta de referencias con ese nombre".to_string());
+    }
+    fs::create_dir(&category_path)
+        .map_err(|error| format!("No se pudo crear la carpeta de referencias: {error}"))?;
+    Ok(folder_name)
+}
+
+#[tauri::command]
+fn update_reference_favorite(
+    app: AppHandle,
+    reference_id: String,
+    favorite: bool,
+) -> Result<(), String> {
+    let conn = open_database(&app)?;
+    ensure_database(&conn)?;
+    conn.execute(
+        "UPDATE reference_images SET favorite = ?1 WHERE id = ?2",
+        params![favorite as i32, reference_id],
+    )
+    .map_err(to_string)?;
+    Ok(())
+}
+
+#[tauri::command]
+fn update_reference_status(
+    app: AppHandle,
+    reference_id: String,
+    status: String,
+) -> Result<(), String> {
+    if !REFERENCE_STATUSES.contains(&status.as_str()) {
+        return Err(format!("Estado de referencia invalido: {status}"));
+    }
+    let conn = open_database(&app)?;
+    ensure_database(&conn)?;
+    conn.execute(
+        "UPDATE reference_images SET status = ?1 WHERE id = ?2",
+        params![status, reference_id],
+    )
+    .map_err(to_string)?;
+    Ok(())
+}
+
+#[tauri::command]
+fn send_reference_to_work(
+    app: AppHandle,
+    root_path: String,
+    reference_id: String,
+    work_name: String,
+) -> Result<ReferenceItem, String> {
+    send_reference_to_work_impl(&app, &root_path, &reference_id, &work_name)
 }
 
 #[tauri::command]
@@ -822,6 +925,280 @@ fn restore_database_backup(app: AppHandle, backup_path: String) -> Result<Librar
     load_library_from_db(&conn, &root)
 }
 
+fn scan_references_impl(app: &AppHandle, root_path: &str) -> Result<ReferencesResponse, String> {
+    let root = PathBuf::from(root_path);
+    if !root.is_dir() {
+        return Err(format!(
+            "La carpeta de la biblioteca no existe: {root_path}"
+        ));
+    }
+
+    let references_path = root.join(REFERENCES_DIR_NAME);
+    let works_path = root.join(WORKS_DIR_NAME);
+    fs::create_dir_all(&references_path)
+        .map_err(|error| format!("No se pudo preparar la carpeta Referencias: {error}"))?;
+
+    let conn = open_database(app)?;
+    ensure_database(&conn)?;
+    conn.execute(
+        "UPDATE reference_images SET missing = 1 WHERE root_path = ?1",
+        params![root_path],
+    )
+    .map_err(to_string)?;
+
+    let mut categories = BTreeSet::new();
+    for entry in fs::read_dir(&references_path)
+        .map_err(|error| format!("No se pudo leer la carpeta Referencias: {error}"))?
+    {
+        let entry = entry.map_err(to_string)?;
+        if entry.file_type().map_err(to_string)?.is_dir() {
+            if let Some(name) = entry.file_name().to_str() {
+                if !name.trim().is_empty() {
+                    categories.insert(name.to_string());
+                }
+            }
+        }
+    }
+
+    for path in collect_reference_image_paths(&references_path)? {
+        let relative = path.strip_prefix(&references_path).map_err(to_string)?;
+        let mut components = relative.components();
+        let first = components.next();
+        let category = if relative.components().count() > 1 {
+            first
+                .and_then(|component| component.as_os_str().to_str())
+                .unwrap_or("Sin carpeta")
+                .to_string()
+        } else {
+            "Sin carpeta".to_string()
+        };
+        categories.insert(category.clone());
+
+        let metadata = fs::metadata(&path).map_err(to_string)?;
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(system_time_to_i64)
+            .unwrap_or(0);
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("referencia")
+            .to_string();
+        let name = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .map(title_from_slug)
+            .unwrap_or_else(|| "Referencia".to_string());
+        let id = stable_id(&format!("reference:{}", normalize_path_for_id(&path)));
+        let thumbnail_path = cached_thumbnail(app, Some(&path), modified)?;
+        let now = now_i64();
+
+        conn.execute(
+            "INSERT INTO reference_images (
+                id, root_path, name, file_name, path, folder_path, category,
+                thumbnail_path, size, modified, first_seen, last_seen, missing
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, 0)
+             ON CONFLICT(id) DO UPDATE SET
+                root_path = excluded.root_path,
+                name = excluded.name,
+                file_name = excluded.file_name,
+                path = excluded.path,
+                folder_path = excluded.folder_path,
+                category = excluded.category,
+                thumbnail_path = excluded.thumbnail_path,
+                size = excluded.size,
+                modified = excluded.modified,
+                last_seen = excluded.last_seen,
+                missing = 0",
+            params![
+                id,
+                root_path,
+                name,
+                file_name,
+                path_to_string(&path),
+                path_to_string(path.parent().unwrap_or(&references_path)),
+                category,
+                thumbnail_path.as_ref().map(|value| path_to_string(value)),
+                metadata.len() as i64,
+                modified,
+                now,
+            ],
+        )
+        .map_err(to_string)?;
+    }
+
+    purge_reference_cache_rows(&conn, root_path)?;
+    let references = load_references_from_db(&conn, root_path)?;
+    Ok(ReferencesResponse {
+        root_path: root_path.to_string(),
+        references_path: path_to_string(&references_path),
+        works_path: path_to_string(&works_path),
+        references,
+        categories: categories.into_iter().collect(),
+    })
+}
+
+fn collect_reference_image_paths(references_path: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut paths = Vec::new();
+    for entry in WalkDir::new(references_path)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| !is_portable_cache_path(entry.path()))
+    {
+        let entry = entry.map_err(to_string)?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path().to_path_buf();
+        if PREVIEW_EXTENSIONS.contains(&extension_for(&path).as_str()) {
+            paths.push(path);
+        }
+    }
+    Ok(paths)
+}
+
+fn purge_reference_cache_rows(conn: &Connection, root_path: &str) -> Result<usize, String> {
+    conn.execute(
+        "DELETE FROM reference_images
+         WHERE root_path = ?1
+           AND instr(lower(replace(path, char(92), '/')), '/_roxwana-cache/') > 0",
+        params![root_path],
+    )
+    .map_err(to_string)
+}
+
+fn load_references_from_db(
+    conn: &Connection,
+    root_path: &str,
+) -> Result<Vec<ReferenceItem>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, name, file_name, path, folder_path, category,
+                    thumbnail_path, size, modified, favorite, status, work_path
+             FROM reference_images
+             WHERE root_path = ?1 AND missing = 0
+             ORDER BY modified DESC, lower(name)",
+        )
+        .map_err(to_string)?;
+    let references = stmt
+        .query_map(params![root_path], reference_item_from_row)
+        .map_err(to_string)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(to_string)?;
+    Ok(references)
+}
+
+fn load_reference_by_id(conn: &Connection, reference_id: &str) -> Result<ReferenceItem, String> {
+    conn.query_row(
+        "SELECT id, name, file_name, path, folder_path, category,
+                thumbnail_path, size, modified, favorite, status, work_path
+         FROM reference_images WHERE id = ?1 AND missing = 0",
+        params![reference_id],
+        reference_item_from_row,
+    )
+    .optional()
+    .map_err(to_string)?
+    .ok_or_else(|| "No encontre esa referencia".to_string())
+}
+
+fn reference_item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReferenceItem> {
+    Ok(ReferenceItem {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        file_name: row.get(2)?,
+        path: row.get(3)?,
+        folder_path: row.get(4)?,
+        category: row.get(5)?,
+        thumbnail_path: row.get(6)?,
+        size: row.get::<_, i64>(7)? as u64,
+        modified: row.get(8)?,
+        favorite: row.get::<_, i64>(9)? != 0,
+        status: row.get(10)?,
+        work_path: row.get(11)?,
+    })
+}
+
+fn send_reference_to_work_impl(
+    app: &AppHandle,
+    root_path: &str,
+    reference_id: &str,
+    work_name: &str,
+) -> Result<ReferenceItem, String> {
+    let conn = open_database(app)?;
+    ensure_database(&conn)?;
+    let reference = load_reference_by_id(&conn, reference_id)?;
+    let source = PathBuf::from(&reference.path);
+    if !source.is_file() {
+        return Err("El archivo original de la referencia ya no existe".to_string());
+    }
+
+    let root = PathBuf::from(root_path);
+    let references_root = root.join(REFERENCES_DIR_NAME);
+    let canonical_source = source.canonicalize().map_err(to_string)?;
+    let canonical_references = references_root.canonicalize().map_err(to_string)?;
+    if !canonical_source.starts_with(&canonical_references) {
+        return Err("La referencia no pertenece a la carpeta Referencias activa".to_string());
+    }
+
+    let work_path = copy_reference_into_work(&root, &source, &reference.file_name, work_name)?;
+
+    conn.execute(
+        "UPDATE reference_images SET status = 'working', work_path = ?1 WHERE id = ?2",
+        params![path_to_string(&work_path), reference_id],
+    )
+    .map_err(to_string)?;
+    load_reference_by_id(&conn, reference_id)
+}
+
+fn copy_reference_into_work(
+    root: &Path,
+    source: &Path,
+    file_name: &str,
+    work_name: &str,
+) -> Result<PathBuf, String> {
+    let folder_name = safe_folder_name(work_name)?;
+    let work_path = root.join(WORKS_DIR_NAME).join(folder_name);
+    fs::create_dir_all(&work_path)
+        .map_err(|error| format!("No se pudo crear la carpeta del trabajo: {error}"))?;
+    let destination = work_path.join(file_name);
+    if !destination.exists() {
+        fs::copy(source, &destination)
+            .map_err(|error| format!("No se pudo copiar la referencia al trabajo: {error}"))?;
+    }
+    Ok(work_path)
+}
+
+fn safe_folder_name(value: &str) -> Result<String, String> {
+    let cleaned = value
+        .trim()
+        .chars()
+        .map(|character| {
+            if character.is_control() || "<>:\"/\\|?*".contains(character) {
+                '-'
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .trim_matches([' ', '.'])
+        .to_string();
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+        return Err("El nombre del trabajo esta vacio".to_string());
+    }
+    let reserved = cleaned.to_ascii_uppercase();
+    if ["CON", "PRN", "AUX", "NUL"]
+        .iter()
+        .any(|name| reserved == *name)
+        || (reserved.len() == 4
+            && (reserved.starts_with("COM") || reserved.starts_with("LPT"))
+            && reserved[3..].parse::<u8>().is_ok())
+    {
+        return Err("Ese nombre esta reservado por Windows".to_string());
+    }
+    Ok(cleaned)
+}
+
 fn scan_library_impl(app: &AppHandle, root_path: &str) -> Result<LibraryResponse, String> {
     let root = PathBuf::from(root_path);
     if !root.exists() {
@@ -865,6 +1242,7 @@ fn scan_library_impl(app: &AppHandle, root_path: &str) -> Result<LibraryResponse
     }
 
     normalize_design_categories(&conn)?;
+    save_setting(&conn, "content_layout_version", CONTENT_LAYOUT_VERSION)?;
     load_library_from_db(&conn, root_path)
 }
 
@@ -1848,6 +2226,28 @@ fn ensure_database(conn: &Connection) -> Result<(), String> {
             PRIMARY KEY (design_id, lower_name),
             FOREIGN KEY(design_id) REFERENCES designs(id) ON DELETE CASCADE
         );
+
+        CREATE TABLE IF NOT EXISTS reference_images (
+            id TEXT PRIMARY KEY,
+            root_path TEXT NOT NULL,
+            name TEXT NOT NULL,
+            file_name TEXT NOT NULL,
+            path TEXT NOT NULL UNIQUE,
+            folder_path TEXT NOT NULL,
+            category TEXT NOT NULL,
+            thumbnail_path TEXT,
+            size INTEGER NOT NULL DEFAULT 0,
+            modified INTEGER NOT NULL DEFAULT 0,
+            first_seen INTEGER NOT NULL,
+            last_seen INTEGER NOT NULL,
+            missing INTEGER NOT NULL DEFAULT 0,
+            favorite INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'pending',
+            work_path TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS reference_images_root_active
+        ON reference_images(root_path, missing, category);
         ",
     )
     .map_err(to_string)?;
@@ -3410,6 +3810,12 @@ fn main() {
             get_brand_logo,
             save_brand_logo,
             remove_brand_logo,
+            get_references,
+            scan_references,
+            create_reference_category,
+            update_reference_favorite,
+            update_reference_status,
+            send_reference_to_work,
             get_library_from_db,
             get_design_detail,
             scan_library,
@@ -3580,6 +3986,123 @@ mod tests {
                 && design.files.len() == 1
                 && design.auto_category.as_deref() == Some("Campana Verano")
         }));
+    }
+
+    #[test]
+    fn prepares_safe_windows_folder_names() {
+        assert_eq!(
+            safe_folder_name(" Capitan: America ").unwrap(),
+            "Capitan- America"
+        );
+        assert!(safe_folder_name("CON").is_err());
+        assert!(safe_folder_name("  ...  ").is_err());
+    }
+
+    #[test]
+    fn copies_a_reference_into_a_flat_work_folder_without_moving_the_original() {
+        let dir = tempdir().unwrap();
+        let source = dir
+            .path()
+            .join(REFERENCES_DIR_NAME)
+            .join("Superheroes")
+            .join("capitan.png");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, b"reference-image").unwrap();
+
+        let work_path =
+            copy_reference_into_work(dir.path(), &source, "capitan.png", "Capitan America")
+                .unwrap();
+
+        assert!(source.is_file());
+        assert_eq!(
+            work_path,
+            dir.path().join(WORKS_DIR_NAME).join("Capitan America")
+        );
+        assert_eq!(
+            fs::read(work_path.join("capitan.png")).unwrap(),
+            b"reference-image"
+        );
+        assert!(!work_path.join(REFERENCES_DIR_NAME).exists());
+    }
+
+    #[test]
+    fn reference_scan_ignores_portable_cache_at_any_depth() {
+        let dir = tempdir().unwrap();
+        let category = dir.path().join(REFERENCES_DIR_NAME).join("Che");
+        let cache = category
+            .join(PORTABLE_CACHE_DIR_NAME)
+            .join("thumbnails");
+        let nested_cache = cache
+            .join(PORTABLE_CACHE_DIR_NAME)
+            .join("thumbnails");
+        fs::create_dir_all(&nested_cache).unwrap();
+
+        let original = category.join("original.jpg");
+        fs::write(&original, b"original").unwrap();
+        fs::write(cache.join("miniatura.jpg"), b"cache").unwrap();
+        fs::write(nested_cache.join("miniatura-de-miniatura.jpg"), b"cache").unwrap();
+
+        let paths = collect_reference_image_paths(&dir.path().join(REFERENCES_DIR_NAME)).unwrap();
+
+        assert_eq!(paths, vec![original]);
+    }
+
+    #[test]
+    fn purges_only_reference_rows_that_belong_to_portable_cache() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_database(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO reference_images (
+                id, root_path, name, file_name, path, folder_path, category,
+                size, modified, first_seen, last_seen, missing
+             ) VALUES
+                ('original', 'D:\\Biblioteca', 'Original', 'original.jpg',
+                 'D:\\Biblioteca\\Referencias\\Che\\original.jpg',
+                 'D:\\Biblioteca\\Referencias\\Che', 'Che', 1, 1, 1, 1, 0),
+                ('cache', 'D:\\Biblioteca', 'Cache', 'cache.jpg',
+                 'D:\\Biblioteca\\Referencias\\Che\\_roxwana-cache\\thumbnails\\cache.jpg',
+                 'D:\\Biblioteca\\Referencias\\Che\\_roxwana-cache\\thumbnails',
+                 'Che', 1, 1, 1, 1, 1);",
+        )
+        .unwrap();
+
+        assert_eq!(purge_reference_cache_rows(&conn, "D:\\Biblioteca").unwrap(), 1);
+        let remaining: Vec<String> = conn
+            .prepare("SELECT id FROM reference_images ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(remaining, vec!["original".to_string()]);
+    }
+
+    #[test]
+    fn persists_reference_state_separately_from_library_designs() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_database(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO reference_images (
+                id, root_path, name, file_name, path, folder_path, category,
+                size, modified, first_seen, last_seen, favorite, status, work_path
+             ) VALUES ('ref-1', 'C:\\Biblioteca', 'Capitan', 'capitan.png',
+                       'C:\\Biblioteca\\Referencias\\Marvel\\capitan.png',
+                       'C:\\Biblioteca\\Referencias\\Marvel', 'Marvel',
+                       42, 123, 1, 1, 1, 'working',
+                       'C:\\Biblioteca\\Trabajos\\Capitan America')",
+            [],
+        )
+        .unwrap();
+
+        let references = load_references_from_db(&conn, "C:\\Biblioteca").unwrap();
+        assert_eq!(references.len(), 1);
+        assert!(references[0].favorite);
+        assert_eq!(references[0].status, "working");
+        assert_eq!(references[0].category, "Marvel");
+        assert_eq!(
+            references[0].work_path.as_deref(),
+            Some("C:\\Biblioteca\\Trabajos\\Capitan America")
+        );
     }
 
     #[test]

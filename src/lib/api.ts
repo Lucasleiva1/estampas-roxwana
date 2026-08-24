@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { SidebarNode } from "./categories";
-import type { Design, DesignStatus, LibraryResponse } from "./types";
+import type { Design, DesignStatus, ReferenceItem, ReferenceStatus, ReferencesResponse, LibraryResponse } from "./types";
 
 const DEFAULT_LIBRARY_PATH = "C:\\Users\\jaell\\Documents\\estampas-roxwana";
 
@@ -40,6 +40,30 @@ export async function saveBrandLogo(sourcePath: string) {
 
 export async function removeBrandLogo() {
   await invoke("remove_brand_logo");
+}
+
+export async function getReferences(rootPath: string) {
+  return invoke<ReferencesResponse>("get_references", { rootPath });
+}
+
+export async function scanReferences(rootPath: string) {
+  return invoke<ReferencesResponse>("scan_references", { rootPath });
+}
+
+export async function createReferenceCategory(rootPath: string, name: string) {
+  return invoke<string>("create_reference_category", { rootPath, name });
+}
+
+export async function updateReferenceFavorite(referenceId: string, favorite: boolean) {
+  await invoke("update_reference_favorite", { referenceId, favorite });
+}
+
+export async function updateReferenceStatus(referenceId: string, status: ReferenceStatus) {
+  await invoke("update_reference_status", { referenceId, status });
+}
+
+export async function sendReferenceToWork(rootPath: string, referenceId: string, workName: string) {
+  return invoke<ReferenceItem>("send_reference_to_work", { rootPath, referenceId, workName });
 }
 
 export async function getLibraryFromDb() {

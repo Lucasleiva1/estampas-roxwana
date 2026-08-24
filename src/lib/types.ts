@@ -1,6 +1,7 @@
 import type { SidebarNode } from "./categories";
 
 export type DesignStatus = "pending" | "working" | "ready" | "discarded";
+export type ReferenceStatus = "pending" | "working" | "done";
 export type ViewMode = "grid" | "masonry" | "list" | "detail";
 
 export type FileKind = "preview" | "support" | "other";
@@ -69,6 +70,29 @@ export interface LibraryResponse {
   categories: string[];
   sidebar: SidebarNode[];
   tags: string[];
+}
+
+export interface ReferenceItem {
+  id: string;
+  name: string;
+  fileName: string;
+  path: string;
+  folderPath: string;
+  category: string;
+  thumbnailPath: string | null;
+  size: number;
+  modified: number;
+  favorite: boolean;
+  status: ReferenceStatus;
+  workPath: string | null;
+}
+
+export interface ReferencesResponse {
+  rootPath: string;
+  referencesPath: string;
+  worksPath: string;
+  references: ReferenceItem[];
+  categories: string[];
 }
 
 export interface Filters {
