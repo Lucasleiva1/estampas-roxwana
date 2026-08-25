@@ -11,6 +11,7 @@ import {
   ChevronLeft,
   ChevronRight,
   Clock3,
+  Crop,
   FileImage,
   FileText,
   FolderOpen,
@@ -61,6 +62,7 @@ import {
   removeBrandLogo,
   removeTag,
   rescanPaths,
+  revealDesignFile,
   renameCategory as renameLibraryCategory,
   renameCategoryGroup as renameLibraryGroup,
   saveSidebarLayout,
@@ -93,6 +95,7 @@ import {
   type SidebarNodeKind,
 } from "./lib/categories";
 import { formatBytes } from "./lib/fileTypes";
+import { buildMasonryLayout, type MasonryTile } from "./lib/masonry";
 import type { Design, DesignStatus, Filters, LibraryResponse, ReferenceItem, ReferenceStatus, ReferencesResponse } from "./lib/types";
 import illustratorIcon from "./assets/illustrator.png";
 import photoshopIcon from "./assets/photoshop.png";
@@ -113,6 +116,7 @@ const LEFT_PANEL_WIDTH_MAX = 380;
 const LEFT_PANEL_RESERVED_WIDTH = 640;
 const RANDOM_HISTORY_STORAGE_KEY = "roxwana-random-history";
 const REFERENCES_SIDEBAR_STORAGE_KEY = "roxwana-references-sidebar-open";
+const REFERENCE_VIEWER_STORAGE_KEY = "roxwana-reference-viewer";
 
 function clampNumber(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
@@ -131,6 +135,15 @@ function getInitialUiScale() {
     // Local storage can be unavailable in restricted webview contexts.
   }
   return 100;
+}
+
+function getInitialReferenceViewer(): ReferenceViewerMode {
+  try {
+    return window.localStorage.getItem(REFERENCE_VIEWER_STORAGE_KEY) === "window" ? "window" : "full";
+  } catch {
+    // Keep the full screen viewer when local storage is unavailable.
+  }
+  return "full";
 }
 
 function getInitialLeftPanelWidth() {
@@ -302,6 +315,7 @@ export default function App() {
   const [isResizingLeftPanel, setIsResizingLeftPanel] = useState(false);
   const [thumbMode, setThumbMode] = useState<"compact" | "grid" | "list">("compact");
   const [showIconLabels, setShowIconLabels] = useState(false);
+  const [referenceViewer, setReferenceViewer] = useState<ReferenceViewerMode>(getInitialReferenceViewer);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [detailsById, setDetailsById] = useState<Record<string, Design>>({});
   const [pageIndex, setPageIndex] = useState(0);
@@ -337,6 +351,14 @@ export default function App() {
       document.documentElement.style.setProperty("zoom", String(uiScale / 100));
     }
   }, [uiScale]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(REFERENCE_VIEWER_STORAGE_KEY, referenceViewer);
+    } catch {
+      // The chosen viewer still applies for the current session.
+    }
+  }, [referenceViewer]);
 
   useEffect(() => {
     try {
@@ -1487,6 +1509,8 @@ export default function App() {
           onSaveBackup={saveBackupCopy}
           onOpenBackupFolder={openBackupLocation}
           onRestoreBackup={restoreBackupCopy}
+          referenceViewer={referenceViewer}
+          onChangeReferenceViewer={setReferenceViewer}
           error={error}
           onDismissError={() => setError(null)}
           onBack={() => setSettingsOpen(false)}
@@ -1503,6 +1527,7 @@ export default function App() {
         onBackToLibrary={() => setAppMode("library")}
         onOpenSettings={() => setSettingsOpen(true)}
         onOpenWork={openWorkInLibrary}
+        viewerMode={referenceViewer}
       />
     );
   }
@@ -1629,6 +1654,8 @@ export default function App() {
 type ReferenceScope = "all" | "favorites" | "recent";
 type ReferenceSort = "recent" | "name" | "random";
 type ReferenceSize = "small" | "medium" | "large";
+/** Como se abre una referencia: a pantalla completa o en una ventana centrada. */
+type ReferenceViewerMode = "full" | "window";
 
 const referenceStatusLabels: Record<ReferenceStatus, string> = {
   pending: "Pendiente",
@@ -1658,12 +1685,14 @@ function ReferencesScreen({
   onBackToLibrary,
   onOpenSettings,
   onOpenWork,
+  viewerMode,
 }: {
   rootPath: string;
   brandLogo: BrandLogo | null;
   onBackToLibrary: () => void;
   onOpenSettings: () => void;
   onOpenWork: (workName: string) => Promise<void>;
+  viewerMode: ReferenceViewerMode;
 }) {
   const [data, setData] = useState<ReferencesResponse | null>(null);
   const [loading, setLoading] = useState(true);
@@ -1923,6 +1952,10 @@ function ReferencesScreen({
   const categoryCount = (category: string) =>
     (data?.references ?? []).filter((reference) => reference.category === category).length;
 
+  // Los dos visores reciben lo mismo, asi que la preferencia solo elige cual se
+  // monta. Las teclas Escape y las flechas ya viven mas arriba y sirven a ambos.
+  const Viewer = viewerMode === "window" ? ReferenceWindow : ReferenceLightbox;
+
   return (
     <main className="references-shell">
       <header className="references-header">
@@ -2018,6 +2051,7 @@ function ReferencesScreen({
             <div className="reference-status-tabs">
               {(["all", "pending", "working", "done"] as const).map((value) => (
                 <button type="button" key={value} className={status === value ? "active" : ""} onClick={() => setStatusFilter(value)}>
+                  {value !== "all" && <span className={`status-dot ${value}`} aria-hidden="true" />}
                   {value === "all" ? "Todas" : referenceStatusLabels[value]}
                 </button>
               ))}
@@ -2052,27 +2086,27 @@ function ReferencesScreen({
               <span>Agrega imagenes dentro de las carpetas de Referencias o cambia los filtros.</span>
             </div>
           ) : (
-            <div className={`references-wall ${size}`}>
-              {visibleReferences.map((reference) => (
-                <ReferenceCard
-                  key={reference.id}
-                  reference={reference}
-                  selected={selectedReference?.id === reference.id}
-                  onSelect={() => setSelectedId(reference.id)}
-                  onView={() => setLightboxId(reference.id)}
-                  onFavorite={() => void toggleFavorite(reference)}
-                  onOpenFolder={() => void openDesignFolder(reference.folderPath).catch((openError) => setError(String(openError)))}
-                  onStartWork={() => showWorkDialog(reference)}
-                  onOpenWork={() => void openWork(reference)}
-                />
-              ))}
-            </div>
+            <ReferencesWall
+              references={visibleReferences}
+              size={size}
+              selectedId={selectedReference?.id ?? null}
+              onSelect={setSelectedId}
+              onView={setLightboxId}
+              onFavorite={(reference) => void toggleFavorite(reference)}
+              onOpenFolder={(reference) =>
+                // Abre la carpeta con el archivo ya seleccionado y resaltado:
+                // apretar la carpeta es para ver esa imagen, no para buscarla.
+                void revealDesignFile(reference.path).catch((openError) => setError(String(openError)))
+              }
+              onStartWork={showWorkDialog}
+              onOpenWork={(reference) => void openWork(reference)}
+            />
           )}
         </section>
       </section>
 
       {lightboxReference && (
-        <ReferenceLightbox
+        <Viewer
           reference={lightboxReference}
           index={lightboxIndex}
           total={visibleReferences.length}
@@ -2086,7 +2120,7 @@ function ReferencesScreen({
             setLightboxId(visibleReferences[next].id);
           }}
           onFavorite={() => void toggleFavorite(lightboxReference)}
-          onOpenFolder={() => void openDesignFolder(lightboxReference.folderPath).catch((openError) => setError(String(openError)))}
+          onOpenFolder={() => void revealDesignFile(lightboxReference.path).catch((openError) => setError(String(openError)))}
           onStartWork={() => showWorkDialog(lightboxReference)}
           onOpenWork={() => void openWork(lightboxReference)}
           onStatus={(nextStatus) => void changeStatus(lightboxReference, nextStatus)}
@@ -2126,8 +2160,74 @@ function ReferencesScreen({
   );
 }
 
+const referenceColumnWidths = { small: 150, medium: 220, large: 310 } as const;
+const REFERENCE_WALL_GAP = 14;
+
+function ReferencesWall({
+  references,
+  size,
+  selectedId,
+  onSelect,
+  onView,
+  onFavorite,
+  onOpenFolder,
+  onStartWork,
+  onOpenWork,
+}: {
+  references: ReferenceItem[];
+  size: keyof typeof referenceColumnWidths;
+  selectedId: string | null;
+  onSelect: (id: string) => void;
+  onView: (id: string) => void;
+  onFavorite: (reference: ReferenceItem) => void;
+  onOpenFolder: (reference: ReferenceItem) => void;
+  onStartWork: (reference: ReferenceItem) => void;
+  onOpenWork: (reference: ReferenceItem) => void;
+}) {
+  const wallRef = useRef<HTMLDivElement>(null);
+  const [wallWidth, setWallWidth] = useState(0);
+
+  useEffect(() => {
+    const node = wallRef.current;
+    if (!node) return;
+    // El ancho util cambia solo cuando aparece la barra de scroll o se pliega
+    // el panel lateral, asi que hay que medirlo y no calcularlo.
+    const observer = new ResizeObserver(([entry]) => {
+      if (entry) setWallWidth(entry.contentRect.width);
+    });
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, []);
+
+  const layout = useMemo(
+    () => buildMasonryLayout(references, wallWidth, referenceColumnWidths[size], REFERENCE_WALL_GAP),
+    [references, wallWidth, size],
+  );
+
+  return (
+    <div className="references-wall" ref={wallRef}>
+      <div className="references-wall-canvas" style={{ height: layout.height }}>
+        {wallWidth > 0 &&
+          layout.tiles.map((tile) => (
+            <ReferenceCard
+              key={tile.item.id}
+              tile={tile}
+              selected={selectedId === tile.item.id}
+              onSelect={() => onSelect(tile.item.id)}
+              onView={() => onView(tile.item.id)}
+              onFavorite={() => onFavorite(tile.item)}
+              onOpenFolder={() => onOpenFolder(tile.item)}
+              onStartWork={() => onStartWork(tile.item)}
+              onOpenWork={() => onOpenWork(tile.item)}
+            />
+          ))}
+      </div>
+    </div>
+  );
+}
+
 const ReferenceCard = memo(function ReferenceCard({
-  reference,
+  tile,
   selected,
   onSelect,
   onView,
@@ -2136,7 +2236,7 @@ const ReferenceCard = memo(function ReferenceCard({
   onStartWork,
   onOpenWork,
 }: {
-  reference: ReferenceItem;
+  tile: MasonryTile<ReferenceItem>;
   selected: boolean;
   onSelect: () => void;
   onView: () => void;
@@ -2145,19 +2245,36 @@ const ReferenceCard = memo(function ReferenceCard({
   onStartWork: () => void;
   onOpenWork: () => void;
 }) {
+  const reference = tile.item;
   const [useOriginal, setUseOriginal] = useState(false);
   const source = convertFileSrc(useOriginal || !reference.thumbnailPath ? reference.path : reference.thumbnailPath);
   return (
-    <article className={`reference-card ${selected ? "selected" : ""}`} onClick={onSelect} onDoubleClick={onView}>
-      <div className="reference-image-wrap">
-        <img src={source} alt={reference.name} loading="lazy" decoding="async" draggable={false} onError={() => setUseOriginal(true)} />
-        <span className={`reference-status ${reference.status}`}>{referenceStatusLabels[reference.status]}</span>
-        <button type="button" className={`reference-heart ${reference.favorite ? "active" : ""}`} onClick={(event) => { event.stopPropagation(); onFavorite(); }} title="Favorita">
-          <Heart size={17} fill={reference.favorite ? "currentColor" : "none"} />
-        </button>
+    <article
+      className={`reference-card ${selected ? "selected" : ""}`}
+      style={{ left: tile.left, top: tile.top, width: tile.width, height: tile.height }}
+      onClick={() => {
+        // Marcarla ademas de abrirla: al cerrar el visor se ve donde estabas.
+        onSelect();
+        onView();
+      }}
+    >
+      <img src={source} alt={reference.name} loading="lazy" decoding="async" draggable={false} onError={() => setUseOriginal(true)} />
+      <span className={`reference-status ${reference.status}`} title={referenceStatusLabels[reference.status]} />
+      <button type="button" className={`reference-heart ${reference.favorite ? "active" : ""}`} onClick={(event) => { event.stopPropagation(); onFavorite(); }} title="Favorita">
+        <Heart size={17} fill={reference.favorite ? "currentColor" : "none"} />
+      </button>
+      {tile.cropped && (
+        <span className="reference-cropped" title="Es mas alargada que el limite de la pared: abrila para verla entera">
+          <Crop size={14} />
+        </span>
+      )}
+      <div className="reference-card-footer">
+        <div className="reference-card-meta">
+          <strong>{reference.name}</strong>
+          <span>{reference.category}</span>
+        </div>
         <div className="reference-hover-actions">
-          <button type="button" onClick={(event) => { event.stopPropagation(); onView(); }} title="Ver grande"><Maximize2 size={16} /></button>
-          <button type="button" onClick={(event) => { event.stopPropagation(); onOpenFolder(); }} title="Abrir carpeta"><FolderOpen size={16} /></button>
+          <button type="button" onClick={(event) => { event.stopPropagation(); onOpenFolder(); }} title="Mostrar el archivo en su carpeta"><FolderOpen size={16} /></button>
           {reference.workPath ? (
             <button type="button" className="work" onClick={(event) => { event.stopPropagation(); onOpenWork(); }} title="Abrir trabajo"><BriefcaseBusiness size={16} /></button>
           ) : (
@@ -2165,13 +2282,36 @@ const ReferenceCard = memo(function ReferenceCard({
           )}
         </div>
       </div>
-      <div className="reference-card-meta">
-        <strong>{reference.name}</strong>
-        <span>{reference.category}</span>
-      </div>
     </article>
   );
 });
+
+function ReferenceStatusPicker({
+  className,
+  status,
+  onStatus,
+}: {
+  className: string;
+  status: ReferenceStatus;
+  onStatus: (status: ReferenceStatus) => void;
+}) {
+  return (
+    <div className={className}>
+      {(["pending", "working", "done"] as const).map((value) => (
+        <button
+          type="button"
+          key={value}
+          className={`${value} ${status === value ? "active" : ""}`}
+          onClick={() => onStatus(value)}
+          title={referenceStatusLabels[value]}
+        >
+          <span className={`status-dot ${value}`} aria-hidden="true" />
+          <span>{referenceStatusLabels[value]}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
 
 function ReferenceLightbox({
   reference,
@@ -2209,16 +2349,10 @@ function ReferenceLightbox({
         <h2>{reference.name}</h2>
         <p>{reference.fileName}</p>
         <span className="lightbox-category">{reference.category}</span>
-        <div className="lightbox-statuses">
-          {(["pending", "working", "done"] as const).map((value) => (
-            <button type="button" key={value} className={`${value} ${reference.status === value ? "active" : ""}`} onClick={() => onStatus(value)}>
-              {referenceStatusLabels[value]}
-            </button>
-          ))}
-        </div>
+        <ReferenceStatusPicker className="lightbox-statuses" status={reference.status} onStatus={onStatus} />
         <div className="lightbox-actions">
           <button type="button" onClick={onFavorite}><Heart size={17} fill={reference.favorite ? "currentColor" : "none"} />{reference.favorite ? "Quitar favorita" : "Favorita"}</button>
-          <button type="button" onClick={onOpenFolder}><FolderOpen size={17} />Abrir carpeta</button>
+          <button type="button" onClick={onOpenFolder}><FolderOpen size={17} />Mostrar en su carpeta</button>
           {reference.workPath ? (
             <button type="button" className="primary" onClick={onOpenWork}><BriefcaseBusiness size={17} />Abrir trabajo</button>
           ) : (
@@ -2227,6 +2361,155 @@ function ReferenceLightbox({
         </div>
         <div className="lightbox-path" title={reference.path}>{reference.path}</div>
       </aside>
+    </div>
+  );
+}
+
+const VIEWER_CONTROLS_HIDE_MS = 2200;
+
+const referenceStatusCycle: ReferenceStatus[] = ["pending", "working", "done"];
+
+function nextReferenceStatus(status: ReferenceStatus) {
+  const position = referenceStatusCycle.indexOf(status);
+  return referenceStatusCycle[(position + 1) % referenceStatusCycle.length];
+}
+
+function ReferenceWindow({
+  reference,
+  index,
+  total,
+  onClose,
+  onPrevious,
+  onNext,
+  onFavorite,
+  onOpenFolder,
+  onStartWork,
+  onOpenWork,
+  onStatus,
+}: {
+  reference: ReferenceItem;
+  index: number;
+  total: number;
+  onClose: () => void;
+  onPrevious: () => void;
+  onNext: () => void;
+  onFavorite: () => void;
+  onOpenFolder: () => void;
+  onStartWork: () => void;
+  onOpenWork: () => void;
+  onStatus: (status: ReferenceStatus) => void;
+}) {
+  const [controlsVisible, setControlsVisible] = useState(true);
+  const [naturalAspect, setNaturalAspect] = useState<number | null>(null);
+  const overControls = useRef(false);
+  const hideTimer = useRef(0);
+
+  // El marco copia la forma del archivo. Normalmente las medidas ya vienen del
+  // escaneo; si a esa referencia todavia le faltan, se toman de la imagen al
+  // cargar para que el marco nunca invente una forma que no es.
+  const storedAspect =
+    reference.width && reference.height ? reference.width / reference.height : null;
+  const aspect = storedAspect ?? naturalAspect ?? 0.75;
+
+  const scheduleHide = useCallback(() => {
+    window.clearTimeout(hideTimer.current);
+    hideTimer.current = window.setTimeout(() => {
+      // Con el mouse encima de la barra no se esconde: si no, desaparece
+      // justo cuando estas por elegir un estado.
+      if (!overControls.current) setControlsVisible(false);
+    }, VIEWER_CONTROLS_HIDE_MS);
+  }, []);
+
+  useEffect(() => {
+    const wake = () => {
+      setControlsVisible(true);
+      scheduleHide();
+    };
+    wake();
+    window.addEventListener("mousemove", wake);
+    // Tambien con el teclado: pasando con las flechas y el mouse quieto, si no
+    // no se ve el nombre ni el contador de la referencia a la que llegaste.
+    window.addEventListener("keydown", wake);
+    return () => {
+      window.removeEventListener("mousemove", wake);
+      window.removeEventListener("keydown", wake);
+      window.clearTimeout(hideTimer.current);
+    };
+  }, [scheduleHide]);
+
+  const holdControls = {
+    onMouseEnter: () => {
+      overControls.current = true;
+      setControlsVisible(true);
+    },
+    onMouseLeave: () => {
+      overControls.current = false;
+      scheduleHide();
+    },
+  };
+
+  return (
+    <div
+      className="reference-window-backdrop"
+      role="presentation"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <div
+        className={`reference-window ${controlsVisible ? "" : "controls-hidden"}`}
+        style={{ "--reference-aspect": aspect } as CSSProperties}
+        role="dialog"
+        aria-modal="true"
+        aria-label={reference.name}
+      >
+        <img
+          src={convertFileSrc(reference.path)}
+          alt={reference.name}
+          draggable={false}
+          onLoad={(event) =>
+            setNaturalAspect(event.currentTarget.naturalWidth / event.currentTarget.naturalHeight)
+          }
+        />
+
+        {/* Un solo punto, el del estado actual, en el mismo lugar y del mismo
+            tamano que en la pared. No se esconde con el resto de los controles. */}
+        <button
+          type="button"
+          className={`reference-status ${reference.status}`}
+          onClick={() => onStatus(nextReferenceStatus(reference.status))}
+          title={`${referenceStatusLabels[reference.status]} (clic para cambiar)`}
+        />
+
+        <div className="reference-window-top" {...holdControls}>
+          <div className="reference-window-title">
+            <strong>{reference.name}</strong>
+            <small>{index + 1} de {total} &middot; {reference.category}</small>
+          </div>
+          <button type="button" onClick={onClose} title="Cerrar"><X size={19} /></button>
+        </div>
+
+        <button type="button" className="reference-window-arrow previous" onClick={onPrevious} title="Referencia anterior" {...holdControls}>
+          <ChevronLeft size={26} />
+        </button>
+        <button type="button" className="reference-window-arrow next" onClick={onNext} title="Referencia siguiente" {...holdControls}>
+          <ChevronRight size={26} />
+        </button>
+
+        <div className="reference-window-bar" {...holdControls}>
+          <div className="reference-window-actions">
+            <button type="button" className={reference.favorite ? "favorite active" : "favorite"} onClick={onFavorite} title={reference.favorite ? "Quitar favorita" : "Favorita"}>
+              <Heart size={17} fill={reference.favorite ? "currentColor" : "none"} />
+            </button>
+            <button type="button" onClick={onOpenFolder} title="Mostrar el archivo en su carpeta"><FolderOpen size={17} /></button>
+            {reference.workPath ? (
+              <button type="button" className="work" onClick={onOpenWork} title="Abrir trabajo"><BriefcaseBusiness size={17} /></button>
+            ) : (
+              <button type="button" className="work" onClick={onStartWork} title="Enviar a trabajo"><BriefcaseBusiness size={17} /></button>
+            )}
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
@@ -2324,10 +2607,6 @@ function Header({
       </section>
 
       <section className="window-actions">
-        <button className="action-button references-entry" onClick={onOpenReferences} title="Abrir el muro de referencias">
-          <Sparkles size={17} />
-          <span>Referencias</span>
-        </button>
         <button className="action-button" onClick={onChooseFolder} title="Cambiar biblioteca de estampas">
           <FolderOpen size={17} />
           <span>Elegir biblioteca</span>
@@ -2347,11 +2626,11 @@ function Header({
         >
           <Shuffle size={15} />
         </button>
-        <div className="settings-menu">
-          <button className="icon-only" title="Ajustes" onClick={() => setSettingsOpen(true)}>
-            <Settings size={18} />
-          </button>
-        </div>
+      </section>
+
+      {/* Controles de la aplicacion, contra el borde derecho: el engranaje en
+          la punta como en cualquier programa, y Referencias a su izquierda. */}
+      <section className="app-actions">
         <div ref={interfaceMenuRef} className="interface-menu">
           <button
             type="button"
@@ -2435,6 +2714,15 @@ function Header({
             </div>
           )}
         </div>
+        <button className="action-button references-entry" onClick={onOpenReferences} title="Abrir el muro de referencias">
+          <Sparkles size={17} />
+          <span>Referencias</span>
+        </button>
+        <div className="settings-menu">
+          <button className="icon-only" title="Ajustes" onClick={() => setSettingsOpen(true)}>
+            <Settings size={18} />
+          </button>
+        </div>
       </section>
     </header>
   );
@@ -2460,6 +2748,8 @@ function SettingsScreen({
   onSaveBackup,
   onOpenBackupFolder,
   onRestoreBackup,
+  referenceViewer,
+  onChangeReferenceViewer,
   error,
   onDismissError,
   onBack,
@@ -2483,6 +2773,8 @@ function SettingsScreen({
   onSaveBackup: () => void;
   onOpenBackupFolder: () => void;
   onRestoreBackup: () => void;
+  referenceViewer: ReferenceViewerMode;
+  onChangeReferenceViewer: (mode: ReferenceViewerMode) => void;
   error: string | null;
   onDismissError: () => void;
   onBack: () => void;
@@ -2629,6 +2921,43 @@ function SettingsScreen({
                 </div>
               )}
             </div>
+          </section>
+
+          <section className="settings-card">
+            <div className="settings-card-header">
+              <Maximize2 size={19} />
+              <div>
+                <h2>Visor de referencias</h2>
+                <p>Como se abre una referencia al hacerle clic.</p>
+              </div>
+            </div>
+            <div className="viewer-mode-options">
+              {([
+                {
+                  value: "full" as const,
+                  title: "Pantalla completa",
+                  detail: "Ocupa toda la ventana, con los datos y las acciones en un panel a la derecha.",
+                },
+                {
+                  value: "window" as const,
+                  title: "Ventana centrada",
+                  detail: "Un recuadro en el medio con el fondo desenfocado. Los controles van sobre la imagen y se esconden solos.",
+                },
+              ]).map((option) => (
+                <button
+                  type="button"
+                  key={option.value}
+                  className={`viewer-mode-option ${referenceViewer === option.value ? "active" : ""}`}
+                  onClick={() => onChangeReferenceViewer(option.value)}
+                  aria-pressed={referenceViewer === option.value}
+                >
+                  <span className={`viewer-mode-preview ${option.value}`} aria-hidden="true"><span /></span>
+                  <strong>{option.title}</strong>
+                  <small>{option.detail}</small>
+                </button>
+              ))}
+            </div>
+            <small className="viewer-mode-note">En los dos casos cerras con Escape y pasas de una a otra con las flechas del teclado.</small>
           </section>
 
           <section className="settings-card">

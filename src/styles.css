@@ -71,6 +71,7 @@ button:disabled {
 .logo-area,
 .quick-pills,
 .window-actions,
+.app-actions,
 .action-button,
 .pill,
 .filter-name,
@@ -192,6 +193,14 @@ button:disabled {
 .window-actions {
   gap: 7px;
   min-width: 0;
+  position: relative;
+}
+
+/* Tercera columna de la barra: queda pegada al borde derecho. */
+.app-actions {
+  gap: 7px;
+  min-width: 0;
+  justify-self: end;
   position: relative;
 }
 
@@ -633,6 +642,81 @@ button:disabled {
 
 .settings-brand .update-status {
   margin: 0;
+}
+
+.viewer-mode-options {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.viewer-mode-option {
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+  padding: 12px;
+  border: 1px solid #3a3c40;
+  border-radius: 9px;
+  color: #ded7ce;
+  background: rgb(20 21 23 / 92%);
+  text-align: left;
+}
+
+.viewer-mode-option:hover {
+  border-color: #5b5f66;
+}
+
+.viewer-mode-option.active {
+  border-color: #8b5cf6;
+  background: rgb(38 28 62 / 92%);
+}
+
+.viewer-mode-option strong {
+  font-size: 12px;
+}
+
+.viewer-mode-option small {
+  color: #8f8a84;
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+/* Dibujito del modo: el marco exterior es la ventana de la app y el bloque de
+   adentro es lo que ocupa el visor. */
+.viewer-mode-preview {
+  height: 46px;
+  display: grid;
+  place-items: center;
+  margin-bottom: 2px;
+  border: 1px solid #43464b;
+  border-radius: 6px;
+  background: #0d0e10;
+}
+
+.viewer-mode-preview > span {
+  display: block;
+  border-radius: 3px;
+  background: #6d5fa8;
+}
+
+.viewer-mode-preview.full > span {
+  width: 100%;
+  height: 100%;
+  border-radius: 5px;
+}
+
+.viewer-mode-preview.window > span {
+  width: 34%;
+  height: 66%;
+}
+
+.viewer-mode-option.active .viewer-mode-preview > span {
+  background: #9c7bf1;
+}
+
+.viewer-mode-note {
+  color: #8f8a84;
+  font-size: 10px;
 }
 
 .settings-action {
@@ -2505,6 +2589,7 @@ button:disabled {
 .lightbox-arrow,
 .lightbox-actions button,
 .lightbox-statuses button,
+.reference-window-actions button,
 .create-work-title button,
 .create-work-actions button {
   border: 1px solid #373044;
@@ -2760,6 +2845,9 @@ button:disabled {
 
 .reference-status-tabs button {
   height: 27px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   padding: 0 9px;
   border: 0;
   border-radius: 5px;
@@ -2838,51 +2926,31 @@ button:disabled {
 
 .references-wall {
   min-height: 0;
-  display: flex;
-  flex-flow: row wrap;
-  align-content: start;
-  align-items: start;
   padding: 14px;
   overflow-x: hidden;
   overflow-y: auto;
-  gap: 13px;
   scrollbar-color: #4b3a70 transparent;
 }
 
-.references-wall.small {
-  --reference-card-width: 150px;
-  --reference-image-height: 188px;
-}
-
-.references-wall.medium {
-  --reference-card-width: 220px;
-  --reference-image-height: 275px;
-}
-
-.references-wall.large {
-  --reference-card-width: 310px;
-  --reference-image-height: 388px;
+.references-wall-canvas {
+  position: relative;
+  width: 100%;
 }
 
 .reference-card {
-  position: relative;
-  width: var(--reference-card-width, 220px);
-  flex: 0 0 var(--reference-card-width, 220px);
-  display: block;
+  position: absolute;
   margin: 0;
   overflow: hidden;
   border: 1px solid #292532;
-  border-radius: 9px;
+  border-radius: 11px;
   color: #eae4f2;
-  background: #0e0d13;
-  box-shadow: 0 9px 22px rgb(0 0 0 / 24%);
+  background: #08070a;
   cursor: default;
-  transition: border-color 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
 
 .reference-card:hover {
   border-color: #574473;
-  transform: translateY(-1px);
   box-shadow: 0 12px 28px rgb(0 0 0 / 34%);
 }
 
@@ -2891,50 +2959,73 @@ button:disabled {
   box-shadow: 0 0 0 2px rgb(139 92 246 / 22%), 0 14px 30px rgb(0 0 0 / 38%);
 }
 
-.reference-image-wrap {
-  position: relative;
-  width: 100%;
-  height: var(--reference-image-height, 300px);
-  min-height: 0;
-  display: grid;
-  place-items: center;
-  overflow: hidden;
-  background: #08070a;
-}
-
-.reference-image-wrap > img {
+/* La caja ya tiene la forma de la imagen, asi que `cover` no recorta nada
+   salvo en las extremas, que se apretaron contra el limite de la banda. En
+   esas conviene perder el pie y no la cabeza: `top`. */
+.reference-card > img {
   width: 100%;
   height: 100%;
   display: block;
-  object-fit: contain;
+  object-fit: cover;
+  object-position: top;
 }
 
+.reference-cropped {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  display: grid;
+  place-items: center;
+  padding: 4px;
+  border-radius: 6px;
+  color: #d8cbf5;
+  background: rgb(9 8 13 / 82%);
+  backdrop-filter: blur(8px);
+  pointer-events: none;
+  transition: opacity 0.15s ease;
+}
+
+.reference-card:hover .reference-cropped {
+  opacity: 0;
+}
+
+/* Los tres colores del estado viven aca y en ningun otro lado: el punto de la
+   tarjeta y el de la pestana de arriba leen de la misma variable. */
+.status-dot.pending,
+.reference-status.pending {
+  --status-color: #ffc93e;
+}
+
+.status-dot.working,
+.reference-status.working {
+  --status-color: #4e91ff;
+}
+
+.status-dot.done,
+.reference-status.done {
+  --status-color: #3ddc84;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 8px;
+  border-radius: 50%;
+  background: var(--status-color, #6f6779);
+}
+
+/* En la imagen va solo el punto. El aro oscuro lo despega tanto de una estampa
+   blanca como de una negra. */
 .reference-status {
   position: absolute;
-  top: 8px;
-  left: 8px;
-  padding: 4px 7px;
-  border: 1px solid rgb(255 201 66 / 52%);
-  border-radius: 99px;
-  color: #ffe3a1;
-  background: rgb(62 43 4 / 84%);
-  backdrop-filter: blur(8px);
-  font-size: 9px;
-  font-weight: 800;
-  letter-spacing: 0.4px;
-  text-transform: uppercase;
-}
-
-.reference-status.working {
-  border-color: rgb(78 145 255 / 60%);
-  color: #cfe1ff;
-  background: rgb(11 42 91 / 86%);
-}
-
-.reference-status.done {
-  border-color: rgb(65 188 120 / 58%);
-  color: #cef6dc;
-  background: rgb(12 70 39 / 86%);
+  top: 10px;
+  left: 10px;
+  width: 11px;
+  height: 11px;
+  border: 2px solid rgb(8 7 11 / 62%);
+  border-radius: 50%;
+  background: var(--status-color, #6f6779);
+  box-shadow: 0 1px 5px rgb(0 0 0 / 55%);
 }
 
 .reference-heart {
@@ -2958,24 +3049,8 @@ button:disabled {
 }
 
 .reference-hover-actions {
-  position: absolute;
-  right: 8px;
-  bottom: 8px;
+  justify-content: flex-end;
   gap: 5px;
-  padding: 4px;
-  border: 1px solid rgb(91 74 117 / 70%);
-  border-radius: 7px;
-  opacity: 0;
-  background: rgb(9 8 13 / 88%);
-  backdrop-filter: blur(10px);
-  transform: translateY(5px);
-  transition: opacity 0.15s ease, transform 0.15s ease;
-}
-
-.reference-card:hover .reference-hover-actions,
-.reference-card.selected .reference-hover-actions {
-  opacity: 1;
-  transform: translateY(0);
 }
 
 .reference-hover-actions button {
@@ -2994,11 +3069,30 @@ button:disabled {
   background: #3d286f;
 }
 
+.reference-card-footer {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 26px 8px 8px;
+  opacity: 0;
+  background: linear-gradient(rgb(8 7 11 / 0%), rgb(8 7 11 / 94%));
+  transition: opacity 0.15s ease;
+}
+
+.reference-card:hover .reference-card-footer,
+.reference-card.selected .reference-card-footer {
+  opacity: 1;
+}
+
 .reference-card-meta {
   min-width: 0;
   justify-content: space-between;
   gap: 10px;
-  padding: 9px 10px 10px;
+  padding: 0 2px;
 }
 
 .reference-card-meta strong {
@@ -3148,7 +3242,11 @@ button:disabled {
 
 .lightbox-statuses button {
   min-height: 34px;
-  padding: 0 5px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 8px;
   border-radius: 6px;
   color: #8e8795;
   font-size: 10px;
@@ -3202,6 +3300,176 @@ button:disabled {
   color: #625b6b;
   font-size: 9px;
   line-height: 1.45;
+}
+
+/* Visor en ventana centrada. El marco toma la forma exacta de cada imagen: sin
+   eso no se distingue una vertical de una horizontal, ni se ve si la imagen
+   trae espacio vacio propio, que es justo lo que hay que poder mirar aca. */
+.reference-window-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: grid;
+  place-items: center;
+  background: rgb(3 2 6 / 62%);
+  backdrop-filter: blur(14px);
+}
+
+.reference-window {
+  position: relative;
+  width: min(92vw, calc(88vh * var(--reference-aspect, 0.75)));
+  height: auto;
+  aspect-ratio: var(--reference-aspect, 0.75);
+  overflow: hidden;
+  border: 1px solid #342c47;
+  border-radius: 14px;
+  color: #f1ebfb;
+  background: #0a090e;
+  box-shadow: 0 26px 70px rgb(0 0 0 / 62%);
+}
+
+/* La imagen se estira al marco entero y `contain` la acomoda adentro. Con
+   `max-height: 100%` no alcanza: el porcentaje se resuelve contra una fila de
+   grilla que ya se desbordo, no limita nada, y la imagen sale recortada. */
+.reference-window > img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.reference-window-top,
+.reference-window-bar,
+.reference-window-arrow {
+  position: absolute;
+  z-index: 2;
+  opacity: 1;
+  transition: opacity 0.25s ease;
+}
+
+.reference-window.controls-hidden .reference-window-top,
+.reference-window.controls-hidden .reference-window-bar,
+.reference-window.controls-hidden .reference-window-arrow {
+  opacity: 0;
+}
+
+/* El punto del estado es el mismo que en la pared: misma esquina, mismo
+   tamano, mismo aro. Aca ademas es un boton y va por encima del degrade. */
+.reference-window > .reference-status {
+  z-index: 3;
+  padding: 0;
+  cursor: pointer;
+}
+
+.reference-window-top {
+  top: 0;
+  right: 0;
+  left: 0;
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 12px 12px 30px 34px;
+  background: linear-gradient(rgb(6 5 9 / 88%), rgb(6 5 9 / 0%));
+}
+
+.reference-window-title {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-right: auto;
+}
+
+.reference-window-title strong {
+  overflow: hidden;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.reference-window-title small {
+  color: #9b93a8;
+  font-size: 10px;
+}
+
+.reference-window-top button {
+  width: 32px;
+  height: 32px;
+  flex: 0 0 32px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 1px solid #3d3550;
+  border-radius: 8px;
+  color: #d9d1ed;
+  background: rgb(16 13 24 / 88%);
+}
+
+.reference-window-arrow {
+  top: 50%;
+  width: 38px;
+  height: 54px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 1px solid #3d3550;
+  border-radius: 9px;
+  color: #b3a6cc;
+  background: rgb(14 11 21 / 78%);
+  transform: translateY(-50%);
+}
+
+.reference-window-arrow.previous {
+  left: 10px;
+}
+
+.reference-window-arrow.next {
+  right: 10px;
+}
+
+.reference-window-top button:hover,
+.reference-window-arrow:hover {
+  border-color: #8b5cf6;
+  color: #fff;
+}
+
+.reference-window-bar {
+  right: 0;
+  bottom: 0;
+  left: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 34px 12px 12px;
+  background: linear-gradient(rgb(6 5 9 / 0%), rgb(6 5 9 / 92%));
+}
+
+.reference-window-actions {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: auto;
+}
+
+.reference-window-actions button {
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border-radius: 7px;
+}
+
+.reference-window-actions button.favorite.active {
+  border-color: #d54f8a;
+  color: #ff77ae;
+}
+
+.reference-window-actions button.work {
+  border-color: #7855cc;
+  color: #e2d7ff;
+  background: #3d286f;
 }
 
 .reference-modal-backdrop {

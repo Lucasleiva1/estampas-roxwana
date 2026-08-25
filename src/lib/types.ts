@@ -85,6 +85,8 @@ export interface ReferenceItem {
   favorite: boolean;
   status: ReferenceStatus;
   workPath: string | null;
+  width: number | null;
+  height: number | null;
 }
 
 export interface ReferencesResponse {

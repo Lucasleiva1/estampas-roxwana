@@ -119,6 +119,8 @@ struct ReferenceItem {
     favorite: bool,
     status: String,
     work_path: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -992,13 +994,20 @@ fn scan_references_impl(app: &AppHandle, root_path: &str) -> Result<ReferencesRe
             .unwrap_or_else(|| "Referencia".to_string());
         let id = stable_id(&format!("reference:{}", normalize_path_for_id(&path)));
         let thumbnail_path = cached_thumbnail(app, Some(&path), modified)?;
+        // Solo lee el encabezado del archivo, no decodifica la imagen: la pared
+        // necesita la forma de cada referencia antes de que cargue el pixel uno.
+        let (width, height) = match image::image_dimensions(&path) {
+            Ok((width, height)) => (Some(width as i64), Some(height as i64)),
+            Err(_) => (None, None),
+        };
         let now = now_i64();
 
         conn.execute(
             "INSERT INTO reference_images (
                 id, root_path, name, file_name, path, folder_path, category,
-                thumbnail_path, size, modified, first_seen, last_seen, missing
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, 0)
+                thumbnail_path, size, modified, first_seen, last_seen, missing,
+                width, height
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, 0, ?12, ?13)
              ON CONFLICT(id) DO UPDATE SET
                 root_path = excluded.root_path,
                 name = excluded.name,
@@ -1010,7 +1019,9 @@ fn scan_references_impl(app: &AppHandle, root_path: &str) -> Result<ReferencesRe
                 size = excluded.size,
                 modified = excluded.modified,
                 last_seen = excluded.last_seen,
-                missing = 0",
+                missing = 0,
+                width = excluded.width,
+                height = excluded.height",
             params![
                 id,
                 root_path,
@@ -1023,6 +1034,8 @@ fn scan_references_impl(app: &AppHandle, root_path: &str) -> Result<ReferencesRe
                 metadata.len() as i64,
                 modified,
                 now,
+                width,
+                height,
             ],
         )
         .map_err(to_string)?;
@@ -1075,7 +1088,8 @@ fn load_references_from_db(
     let mut stmt = conn
         .prepare(
             "SELECT id, name, file_name, path, folder_path, category,
-                    thumbnail_path, size, modified, favorite, status, work_path
+                    thumbnail_path, size, modified, favorite, status, work_path,
+                    width, height
              FROM reference_images
              WHERE root_path = ?1 AND missing = 0
              ORDER BY modified DESC, lower(name)",
@@ -1092,7 +1106,8 @@ fn load_references_from_db(
 fn load_reference_by_id(conn: &Connection, reference_id: &str) -> Result<ReferenceItem, String> {
     conn.query_row(
         "SELECT id, name, file_name, path, folder_path, category,
-                thumbnail_path, size, modified, favorite, status, work_path
+                thumbnail_path, size, modified, favorite, status, work_path,
+                width, height
          FROM reference_images WHERE id = ?1 AND missing = 0",
         params![reference_id],
         reference_item_from_row,
@@ -1116,6 +1131,14 @@ fn reference_item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Referenc
         favorite: row.get::<_, i64>(9)? != 0,
         status: row.get(10)?,
         work_path: row.get(11)?,
+        width: row
+            .get::<_, Option<i64>>(12)?
+            .filter(|value| *value > 0)
+            .map(|value| value as u32),
+        height: row
+            .get::<_, Option<i64>>(13)?
+            .filter(|value| *value > 0)
+            .map(|value| value as u32),
     })
 }
 
@@ -2243,7 +2266,9 @@ fn ensure_database(conn: &Connection) -> Result<(), String> {
             missing INTEGER NOT NULL DEFAULT 0,
             favorite INTEGER NOT NULL DEFAULT 0,
             status TEXT NOT NULL DEFAULT 'pending',
-            work_path TEXT
+            work_path TEXT,
+            width INTEGER,
+            height INTEGER
         );
 
         CREATE INDEX IF NOT EXISTS reference_images_root_active
@@ -2271,6 +2296,21 @@ fn ensure_database(conn: &Connection) -> Result<(), String> {
             }
         })
         .map_err(to_string)?;
+
+    for column in ["width", "height"] {
+        conn.execute(
+            &format!("ALTER TABLE reference_images ADD COLUMN {column} INTEGER"),
+            [],
+        )
+        .or_else(|error| {
+            if error.to_string().contains("duplicate column name") {
+                Ok(0)
+            } else {
+                Err(error)
+            }
+        })
+        .map_err(to_string)?;
+    }
 
     seed_categories(conn)?;
     normalize_design_categories(conn)?;
