@@ -96,6 +96,7 @@ import {
 } from "./lib/categories";
 import { formatBytes } from "./lib/fileTypes";
 import { buildMasonryLayout, type MasonryTile } from "./lib/masonry";
+import { dailySeed, defaultSortFor, referenceRandomRank } from "./lib/ordering";
 import type { Design, DesignStatus, Filters, LibraryResponse, ReferenceItem, ReferenceStatus, ReferencesResponse } from "./lib/types";
 import illustratorIcon from "./assets/illustrator.png";
 import photoshopIcon from "./assets/photoshop.png";
@@ -1671,13 +1672,6 @@ function initialReferencesSidebarOpen() {
   }
 }
 
-function referenceRandomRank(id: string, seed: number) {
-  let hash = seed | 0;
-  for (let index = 0; index < id.length; index += 1) {
-    hash = Math.imul(hash ^ id.charCodeAt(index), 16777619);
-  }
-  return hash >>> 0;
-}
 
 function ReferencesScreen({
   rootPath,
@@ -1703,9 +1697,11 @@ function ReferencesScreen({
   const [selectedCategory, setSelectedCategory] = useState("Todos");
   const [scope, setScope] = useState<ReferenceScope>("all");
   const [status, setStatusFilter] = useState<ReferenceStatus | "all">("all");
-  const [sort, setSort] = useState<ReferenceSort>("recent");
+  const [sort, setSort] = useState<ReferenceSort>(() => defaultSortFor("Todos"));
   const [size, setSize] = useState<ReferenceSize>("medium");
-  const [randomSeed, setRandomSeed] = useState(() => Date.now());
+  // Semilla del dia: la mezcla se queda quieta hasta la medianoche. El boton de
+  // remezclar la reemplaza por la hora exacta para forzar un orden nuevo ya.
+  const [randomSeed, setRandomSeed] = useState(dailySeed);
   const [sidebarOpen, setSidebarOpen] = useState(initialReferencesSidebarOpen);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [lightboxId, setLightboxId] = useState<string | null>(null);
@@ -1713,6 +1709,14 @@ function ReferencesScreen({
   const [workName, setWorkName] = useState("");
   const [creatingWork, setCreatingWork] = useState(false);
   const thumbnailAttempts = useRef(new Set<string>());
+
+  // Al cambiar de vista, el orden vuelve al natural de esa vista: mezclado en
+  // "Todos", por fecha dentro de una carpeta. Despues se puede cambiar a mano
+  // desde el desplegable y ese cambio manda hasta la proxima vez que cambies.
+  const chooseCategory = useCallback((category: string) => {
+    setSelectedCategory(category);
+    setSort(defaultSortFor(category));
+  }, []);
 
   const refresh = useCallback(
     async (manual = false) => {
@@ -1943,7 +1947,7 @@ function ReferencesScreen({
     try {
       const category = await createReferenceCategory(rootPath, name);
       await refresh(false);
-      setSelectedCategory(category);
+      chooseCategory(category);
     } catch (categoryError) {
       setError(String(categoryError));
     }
@@ -1988,7 +1992,7 @@ function ReferencesScreen({
         <button
           type="button"
           className={selectedCategory === "Todos" ? "active" : ""}
-          onClick={() => setSelectedCategory("Todos")}
+          onClick={() => chooseCategory("Todos")}
         >
           Todos <b>{data?.references.length ?? 0}</b>
         </button>
@@ -1997,7 +2001,7 @@ function ReferencesScreen({
             type="button"
             key={category}
             className={selectedCategory === category ? "active" : ""}
-            onClick={() => setSelectedCategory(category)}
+            onClick={() => chooseCategory(category)}
           >
             {category} <b>{categoryCount(category)}</b>
           </button>
@@ -2019,18 +2023,18 @@ function ReferencesScreen({
               <span>REFERENCIAS</span>
               <button type="button" onClick={() => setSidebarOpen(false)} title="Ocultar barra lateral"><PanelLeftClose size={17} /></button>
             </div>
-            <button type="button" className={scope === "all" && selectedCategory === "Todos" ? "active" : ""} onClick={() => { setScope("all"); setSelectedCategory("Todos"); }}>
+            <button type="button" className={scope === "all" && selectedCategory === "Todos" ? "active" : ""} onClick={() => { setScope("all"); chooseCategory("Todos"); }}>
               <LayoutGrid size={16} /><span>Todas las referencias</span><b>{data?.references.length ?? 0}</b>
             </button>
-            <button type="button" className={scope === "favorites" ? "active" : ""} onClick={() => { setScope("favorites"); setSelectedCategory("Todos"); }}>
+            <button type="button" className={scope === "favorites" ? "active" : ""} onClick={() => { setScope("favorites"); chooseCategory("Todos"); }}>
               <Heart size={16} /><span>Favoritas</span><b>{data?.references.filter((item) => item.favorite).length ?? 0}</b>
             </button>
-            <button type="button" className={scope === "recent" ? "active" : ""} onClick={() => { setScope("recent"); setSelectedCategory("Todos"); }}>
+            <button type="button" className={scope === "recent" ? "active" : ""} onClick={() => { setScope("recent"); setSelectedCategory("Todos"); setSort("recent"); }}>
               <Clock3 size={16} /><span>Recientes</span>
             </button>
             <div className="references-sidebar-label">CARPETAS</div>
             {(data?.categories ?? []).map((category) => (
-              <button type="button" key={category} className={selectedCategory === category ? "active" : ""} onClick={() => { setScope("all"); setSelectedCategory(category); }}>
+              <button type="button" key={category} className={selectedCategory === category ? "active" : ""} onClick={() => { setScope("all"); chooseCategory(category); }}>
                 <FolderOpen size={15} /><span>{category}</span><b>{categoryCount(category)}</b>
               </button>
             ))}
@@ -2061,9 +2065,9 @@ function ReferencesScreen({
               <span>{visibleReferences.length === 1 ? "referencia" : "referencias"}</span>
             </div>
             <select value={sort} onChange={(event) => {
-              const next = event.target.value as ReferenceSort;
-              setSort(next);
-              if (next === "random") setRandomSeed(Date.now());
+              // Volver a "Aleatorio" recupera el orden del dia, no inventa uno
+              // nuevo: para eso esta el boton de mezclar.
+              setSort(event.target.value as ReferenceSort);
             }} aria-label="Ordenar referencias">
               <option value="recent">Mas recientes</option>
               <option value="name">Nombre</option>

@@ -3553,7 +3553,7 @@ dependencies = [
 
 [[package]]
 name = "roxwana-biblioteca-visual"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "image",
  "rusqlite",
