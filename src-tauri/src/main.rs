@@ -268,13 +268,55 @@ fn remove_brand_logo(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn list_system_fonts() -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(list_system_fonts_impl)
+        .await
+        .map_err(to_string)?
+}
+
+#[tauri::command]
 fn get_references(app: AppHandle, root_path: String) -> Result<ReferencesResponse, String> {
-    scan_references_impl(&app, &root_path)
+    let root = PathBuf::from(&root_path);
+    if !root.is_dir() {
+        return Err(format!(
+            "La carpeta de la biblioteca no existe: {root_path}"
+        ));
+    }
+    let references_path = root.join(REFERENCES_DIR_NAME);
+    fs::create_dir_all(&references_path)
+        .map_err(|error| format!("No se pudo preparar la carpeta Referencias: {error}"))?;
+    let conn = open_database(&app)?;
+    ensure_database(&conn)?;
+    purge_reference_cache_rows(&conn, &root_path)?;
+    load_references_response_from_db(&conn, &root_path)
 }
 
 #[tauri::command]
 fn scan_references(app: AppHandle, root_path: String) -> Result<ReferencesResponse, String> {
     scan_references_impl(&app, &root_path)
+}
+
+#[tauri::command]
+async fn rescan_reference_paths(
+    app: AppHandle,
+    root_path: String,
+    paths: Vec<String>,
+) -> Result<ReferencesResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        rescan_reference_paths_impl(&app, &root_path, &paths)
+    })
+    .await
+    .map_err(to_string)?
+}
+
+#[tauri::command]
+async fn detect_reference_changes(
+    app: AppHandle,
+    root_path: String,
+) -> Result<Option<ReferencesResponse>, String> {
+    tauri::async_runtime::spawn_blocking(move || detect_reference_changes_impl(&app, &root_path))
+        .await
+        .map_err(to_string)?
 }
 
 #[tauri::command]
@@ -1015,7 +1057,6 @@ fn scan_references_impl(app: &AppHandle, root_path: &str) -> Result<ReferencesRe
     }
 
     let references_path = root.join(REFERENCES_DIR_NAME);
-    let works_path = root.join(WORKS_DIR_NAME);
     fs::create_dir_all(&references_path)
         .map_err(|error| format!("No se pudo preparar la carpeta Referencias: {error}"))?;
 
@@ -1027,12 +1068,43 @@ fn scan_references_impl(app: &AppHandle, root_path: &str) -> Result<ReferencesRe
     )
     .map_err(to_string)?;
 
+    for path in collect_reference_image_paths(&references_path)? {
+        upsert_reference_image(app, &conn, root_path, &references_path, &path)?;
+    }
+
+    purge_reference_cache_rows(&conn, root_path)?;
+    let response = load_references_response_from_db(&conn, root_path)?;
+    drop(conn);
+    refresh_portable_preferences_for_root(app, &root)?;
+    Ok(response)
+}
+
+fn load_references_response_from_db(
+    conn: &Connection,
+    root_path: &str,
+) -> Result<ReferencesResponse, String> {
+    let root = PathBuf::from(root_path);
+    let references_path = root.join(REFERENCES_DIR_NAME);
+    Ok(ReferencesResponse {
+        root_path: root_path.to_string(),
+        references_path: path_to_string(&references_path),
+        works_path: path_to_string(&root.join(WORKS_DIR_NAME)),
+        references: load_references_from_db(conn, root_path)?,
+        categories: reference_categories(&references_path)?,
+    })
+}
+
+fn reference_categories(references_path: &Path) -> Result<Vec<String>, String> {
+    if !references_path.is_dir() {
+        return Ok(Vec::new());
+    }
     let mut categories = BTreeSet::new();
-    for entry in fs::read_dir(&references_path)
+    for entry in fs::read_dir(references_path)
         .map_err(|error| format!("No se pudo leer la carpeta Referencias: {error}"))?
     {
         let entry = entry.map_err(to_string)?;
-        if entry.file_type().map_err(to_string)?.is_dir() {
+        if entry.file_type().map_err(to_string)?.is_dir() && !is_portable_cache_path(&entry.path())
+        {
             if let Some(name) = entry.file_name().to_str() {
                 if !name.trim().is_empty() {
                     categories.insert(name.to_string());
@@ -1040,98 +1112,98 @@ fn scan_references_impl(app: &AppHandle, root_path: &str) -> Result<ReferencesRe
             }
         }
     }
+    Ok(categories.into_iter().collect())
+}
 
-    for path in collect_reference_image_paths(&references_path)? {
-        let relative = path.strip_prefix(&references_path).map_err(to_string)?;
-        let mut components = relative.components();
-        let first = components.next();
-        let category = if relative.components().count() > 1 {
-            first
-                .and_then(|component| component.as_os_str().to_str())
-                .unwrap_or("Sin carpeta")
-                .to_string()
-        } else {
-            "Sin carpeta".to_string()
-        };
-        categories.insert(category.clone());
-
-        let metadata = fs::metadata(&path).map_err(to_string)?;
-        let modified = metadata
-            .modified()
-            .ok()
-            .and_then(system_time_to_i64)
-            .unwrap_or(0);
-        let file_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("referencia")
-            .to_string();
-        let name = path
-            .file_stem()
-            .and_then(|name| name.to_str())
-            .map(title_from_slug)
-            .unwrap_or_else(|| "Referencia".to_string());
-        let id = stable_id(&format!("reference:{}", normalize_path_for_id(&path)));
-        let thumbnail_path = cached_thumbnail(app, Some(&path), modified)?;
-        // Solo lee el encabezado del archivo, no decodifica la imagen: la pared
-        // necesita la forma de cada referencia antes de que cargue el pixel uno.
-        let (width, height) = match image::image_dimensions(&path) {
-            Ok((width, height)) => (Some(width as i64), Some(height as i64)),
-            Err(_) => (None, None),
-        };
-        let now = now_i64();
-
-        conn.execute(
-            "INSERT INTO reference_images (
-                id, root_path, name, file_name, path, folder_path, category,
-                thumbnail_path, size, modified, first_seen, last_seen, missing,
-                width, height
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, 0, ?12, ?13)
-             ON CONFLICT(id) DO UPDATE SET
-                root_path = excluded.root_path,
-                name = excluded.name,
-                file_name = excluded.file_name,
-                path = excluded.path,
-                folder_path = excluded.folder_path,
-                category = excluded.category,
-                thumbnail_path = excluded.thumbnail_path,
-                size = excluded.size,
-                modified = excluded.modified,
-                last_seen = excluded.last_seen,
-                missing = 0,
-                width = excluded.width,
-                height = excluded.height",
-            params![
-                id,
-                root_path,
-                name,
-                file_name,
-                path_to_string(&path),
-                path_to_string(path.parent().unwrap_or(&references_path)),
-                category,
-                thumbnail_path.as_ref().map(|value| path_to_string(value)),
-                metadata.len() as i64,
-                modified,
-                now,
-                width,
-                height,
-            ],
-        )
-        .map_err(to_string)?;
+fn reference_category_for_path(references_path: &Path, path: &Path) -> Result<String, String> {
+    let relative = path.strip_prefix(references_path).map_err(to_string)?;
+    if relative.components().count() > 1 {
+        Ok(relative
+            .components()
+            .next()
+            .and_then(|component| component.as_os_str().to_str())
+            .unwrap_or("Sin carpeta")
+            .to_string())
+    } else {
+        Ok("Sin carpeta".to_string())
     }
+}
 
-    purge_reference_cache_rows(&conn, root_path)?;
-    let references = load_references_from_db(&conn, root_path)?;
-    let response = ReferencesResponse {
-        root_path: root_path.to_string(),
-        references_path: path_to_string(&references_path),
-        works_path: path_to_string(&works_path),
-        references,
-        categories: categories.into_iter().collect(),
+fn upsert_reference_image(
+    app: &AppHandle,
+    conn: &Connection,
+    root_path: &str,
+    references_path: &Path,
+    path: &Path,
+) -> Result<(), String> {
+    if is_portable_cache_path(path)
+        || !path.is_file()
+        || !PREVIEW_EXTENSIONS.contains(&extension_for(path).as_str())
+    {
+        return Ok(());
+    }
+    let metadata = fs::metadata(path).map_err(to_string)?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(system_time_to_i64)
+        .unwrap_or(0);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("referencia")
+        .to_string();
+    let name = path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .map(title_from_slug)
+        .unwrap_or_else(|| "Referencia".to_string());
+    let id = stable_id(&format!("reference:{}", normalize_path_for_id(path)));
+    let thumbnail_path = cached_thumbnail(app, Some(path), modified)?;
+    let (width, height) = match image::image_dimensions(path) {
+        Ok((width, height)) => (Some(width as i64), Some(height as i64)),
+        Err(_) => (None, None),
     };
-    drop(conn);
-    refresh_portable_preferences_for_root(app, &root)?;
-    Ok(response)
+    let now = now_i64();
+
+    conn.execute(
+        "INSERT INTO reference_images (
+            id, root_path, name, file_name, path, folder_path, category,
+            thumbnail_path, size, modified, first_seen, last_seen, missing,
+            width, height
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, 0, ?12, ?13)
+         ON CONFLICT(id) DO UPDATE SET
+            root_path = excluded.root_path,
+            name = excluded.name,
+            file_name = excluded.file_name,
+            path = excluded.path,
+            folder_path = excluded.folder_path,
+            category = excluded.category,
+            thumbnail_path = excluded.thumbnail_path,
+            size = excluded.size,
+            modified = excluded.modified,
+            last_seen = excluded.last_seen,
+            missing = 0,
+            width = excluded.width,
+            height = excluded.height",
+        params![
+            id,
+            root_path,
+            name,
+            file_name,
+            path_to_string(path),
+            path_to_string(path.parent().unwrap_or(references_path)),
+            reference_category_for_path(references_path, path)?,
+            thumbnail_path.as_ref().map(|value| path_to_string(value)),
+            metadata.len() as i64,
+            modified,
+            now,
+            width,
+            height,
+        ],
+    )
+    .map_err(to_string)?;
+    Ok(())
 }
 
 fn collect_reference_image_paths(references_path: &Path) -> Result<Vec<PathBuf>, String> {
@@ -1183,6 +1255,193 @@ fn load_references_from_db(
         .collect::<Result<Vec<_>, _>>()
         .map_err(to_string)?;
     Ok(references)
+}
+
+fn rescan_reference_paths_impl(
+    app: &AppHandle,
+    root_path: &str,
+    paths: &[String],
+) -> Result<ReferencesResponse, String> {
+    let root = PathBuf::from(root_path);
+    if !root.is_dir() {
+        return Err(format!(
+            "La carpeta de la biblioteca no existe: {root_path}"
+        ));
+    }
+    let references_path = root.join(REFERENCES_DIR_NAME);
+    fs::create_dir_all(&references_path)
+        .map_err(|error| format!("No se pudo preparar la carpeta Referencias: {error}"))?;
+
+    let mut scopes = BTreeMap::<String, PathBuf>::new();
+    for value in paths {
+        let path = PathBuf::from(value);
+        if is_portable_cache_path(&path) || !is_same_or_descendant_path(&path, &references_path) {
+            continue;
+        }
+        if same_path(&path, &references_path) {
+            return scan_references_impl(app, root_path);
+        }
+        scopes.insert(normalize_path_for_id(&path), path);
+    }
+
+    let conn = open_database(app)?;
+    ensure_database(&conn)?;
+    if scopes.is_empty() {
+        return load_references_response_from_db(&conn, root_path);
+    }
+
+    mark_reference_scopes_missing(&conn, root_path, scopes.values())?;
+    let mut image_paths = BTreeMap::<String, PathBuf>::new();
+    for scope in scopes.values() {
+        if scope.is_dir() {
+            for path in collect_reference_image_paths(scope)? {
+                image_paths.insert(normalize_path_for_id(&path), path);
+            }
+        } else if scope.is_file() && PREVIEW_EXTENSIONS.contains(&extension_for(scope).as_str()) {
+            image_paths.insert(normalize_path_for_id(scope), scope.clone());
+        }
+    }
+    for path in image_paths.values() {
+        upsert_reference_image(app, &conn, root_path, &references_path, path)?;
+    }
+
+    purge_reference_cache_rows(&conn, root_path)?;
+    let response = load_references_response_from_db(&conn, root_path)?;
+    drop(conn);
+    refresh_portable_preferences_for_root(app, &root)?;
+    Ok(response)
+}
+
+fn mark_reference_scopes_missing<'a>(
+    conn: &Connection,
+    root_path: &str,
+    scopes: impl Iterator<Item = &'a PathBuf>,
+) -> Result<usize, String> {
+    let scopes = scopes.collect::<Vec<_>>();
+    let exact_scopes = scopes
+        .iter()
+        .map(|scope| normalize_path_for_id(scope))
+        .collect::<BTreeSet<_>>();
+    let descendant_scopes = scopes
+        .iter()
+        .filter(|scope| {
+            scope.is_dir() || !PREVIEW_EXTENSIONS.contains(&extension_for(scope).as_str())
+        })
+        .map(|scope| format!("{}/", normalize_path_for_id(scope)))
+        .collect::<Vec<_>>();
+    let mut stmt = conn
+        .prepare("SELECT id, path FROM reference_images WHERE root_path = ?1 AND missing = 0")
+        .map_err(to_string)?;
+    let rows = stmt
+        .query_map(params![root_path], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(to_string)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(to_string)?;
+    drop(stmt);
+
+    let ids = rows
+        .into_iter()
+        .filter_map(|(id, path)| {
+            let normalized = normalize_path_for_id(Path::new(&path));
+            (exact_scopes.contains(&normalized)
+                || descendant_scopes
+                    .iter()
+                    .any(|scope| normalized.starts_with(scope)))
+            .then_some(id)
+        })
+        .collect::<Vec<_>>();
+    for id in &ids {
+        conn.execute(
+            "UPDATE reference_images SET missing = 1 WHERE id = ?1",
+            params![id],
+        )
+        .map_err(to_string)?;
+    }
+    Ok(ids.len())
+}
+
+fn detect_reference_changes_impl(
+    app: &AppHandle,
+    root_path: &str,
+) -> Result<Option<ReferencesResponse>, String> {
+    let root = PathBuf::from(root_path);
+    if !root.is_dir() {
+        return Ok(None);
+    }
+    let references_path = root.join(REFERENCES_DIR_NAME);
+    if !references_path.is_dir() {
+        return Ok(None);
+    }
+    let conn = open_database(app)?;
+    ensure_database(&conn)?;
+    let changed_paths = changed_reference_paths(&conn, root_path, &references_path)?;
+    drop(conn);
+    if changed_paths.is_empty() {
+        return Ok(None);
+    }
+    rescan_reference_paths_impl(app, root_path, &changed_paths).map(Some)
+}
+
+fn changed_reference_paths(
+    conn: &Connection,
+    root_path: &str,
+    references_path: &Path,
+) -> Result<Vec<String>, String> {
+    let mut indexed = BTreeMap::<String, (String, u64, i64)>::new();
+    let mut stmt = conn
+        .prepare(
+            "SELECT path, size, modified
+             FROM reference_images
+             WHERE root_path = ?1 AND missing = 0",
+        )
+        .map_err(to_string)?;
+    let rows = stmt
+        .query_map(params![root_path], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)? as u64,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(to_string)?;
+    for row in rows {
+        let (path, size, modified) = row.map_err(to_string)?;
+        indexed.insert(
+            normalize_path_for_id(Path::new(&path)),
+            (path, size, modified),
+        );
+    }
+    drop(stmt);
+
+    let mut changed = BTreeSet::new();
+    for path in collect_reference_image_paths(references_path)? {
+        let previous = indexed.remove(&normalize_path_for_id(&path));
+        let Ok(metadata) = fs::metadata(&path) else {
+            continue;
+        };
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(system_time_to_i64)
+            .unwrap_or(0);
+        if previous.as_ref().is_none_or(|(_, size, stored_modified)| {
+            *size != metadata.len() || *stored_modified != modified
+        }) {
+            changed.insert(path_to_string(&path));
+        }
+    }
+    for (_, (path, _, _)) in indexed {
+        changed.insert(path);
+    }
+    Ok(changed.into_iter().collect())
+}
+
+fn is_same_or_descendant_path(path: &Path, ancestor: &Path) -> bool {
+    let path = normalize_path_for_id(path);
+    let ancestor = normalize_path_for_id(ancestor);
+    path == ancestor || path.starts_with(&format!("{ancestor}/"))
 }
 
 fn load_reference_by_id(conn: &Connection, reference_id: &str) -> Result<ReferenceItem, String> {
@@ -2242,6 +2501,226 @@ fn save_brand_logo_impl(app: &AppHandle, source_path: &str) -> Result<BrandLogo,
             saved.height = height;
             saved
         })
+}
+
+
+/// Devuelve las familias tipograficas instaladas en Windows leyendo la tabla
+/// `name` de cada archivo de fuente. WebView2 resuelve `font-family` contra
+/// estos mismos nombres, asi que lo que aparece en la lista es exactamente lo
+/// que la interfaz puede dibujar.
+fn list_system_fonts_impl() -> Result<Vec<String>, String> {
+    let mut families: BTreeMap<String, String> = BTreeMap::new();
+
+    for directory in system_font_directories() {
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !is_font_file(&path) {
+                continue;
+            }
+            for family in read_font_families(&path) {
+                families
+                    .entry(family.to_lowercase())
+                    .or_insert(family);
+            }
+        }
+    }
+
+    if families.is_empty() {
+        return Err("No se pudo leer ninguna fuente instalada en el equipo".to_string());
+    }
+
+    Ok(families.into_values().collect())
+}
+
+fn system_font_directories() -> Vec<PathBuf> {
+    let mut directories = Vec::new();
+    match std::env::var("WINDIR") {
+        Ok(windows) if !windows.trim().is_empty() => {
+            directories.push(PathBuf::from(windows).join("Fonts"))
+        }
+        _ => directories.push(PathBuf::from(r"C:\Windows\Fonts")),
+    }
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        if !local.trim().is_empty() {
+            directories.push(PathBuf::from(local).join(r"Microsoft\Windows\Fonts"));
+        }
+    }
+    directories
+}
+
+fn is_font_file(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "ttf" | "otf" | "ttc" | "otc"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Un `.ttc` guarda varias fuentes en el mismo archivo, por eso devolvemos una
+/// lista y no un unico nombre.
+fn read_font_families(path: &Path) -> Vec<String> {
+    use std::io::Read;
+
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut header = [0u8; 12];
+    if file.read_exact(&mut header).is_err() {
+        return Vec::new();
+    }
+
+    if &header[0..4] == b"ttcf" {
+        let count = read_u32(&header[8..12]) as usize;
+        if count == 0 || count > 128 {
+            return Vec::new();
+        }
+        let mut offsets = vec![0u8; count * 4];
+        if file.read_exact(&mut offsets).is_err() {
+            return Vec::new();
+        }
+        return offsets
+            .chunks_exact(4)
+            .filter_map(|chunk| read_font_family_at(&mut file, u64::from(read_u32(chunk))))
+            .collect();
+    }
+
+    read_font_family_at(&mut file, 0)
+        .map(|family| vec![family])
+        .unwrap_or_default()
+}
+
+fn read_font_family_at(file: &mut fs::File, sfnt_offset: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    file.seek(SeekFrom::Start(sfnt_offset)).ok()?;
+    let mut header = [0u8; 12];
+    file.read_exact(&mut header).ok()?;
+
+    let table_count = usize::from(read_u16(&header[4..6]));
+    if table_count == 0 || table_count > 512 {
+        return None;
+    }
+
+    let mut directory = vec![0u8; table_count * 16];
+    file.read_exact(&mut directory).ok()?;
+
+    let record = directory
+        .chunks_exact(16)
+        .find(|record| &record[0..4] == b"name")?;
+    let table_offset = u64::from(read_u32(&record[8..12]));
+    let table_length = read_u32(&record[12..16]) as usize;
+    if table_length < 6 || table_length > 8 * 1024 * 1024 {
+        return None;
+    }
+
+    file.seek(SeekFrom::Start(table_offset)).ok()?;
+    let mut table = vec![0u8; table_length];
+    file.read_exact(&mut table).ok()?;
+
+    parse_font_family_name(&table)
+}
+
+/// De la tabla `name` nos quedamos con el nombre de familia, prefiriendo la
+/// familia tipografica (id 16) en ingles, que es la que usa CSS cuando la
+/// fuente tiene mas de cuatro estilos.
+fn parse_font_family_name(table: &[u8]) -> Option<String> {
+    if table.len() < 6 {
+        return None;
+    }
+    let record_count = usize::from(read_u16(&table[2..4]));
+    let strings_offset = usize::from(read_u16(&table[4..6]));
+
+    let mut best: Option<(u8, String)> = None;
+    for index in 0..record_count {
+        let start = 6 + index * 12;
+        let end = start + 12;
+        if end > table.len() {
+            break;
+        }
+        let record = &table[start..end];
+        let platform = read_u16(&record[0..2]);
+        let language = read_u16(&record[4..6]);
+        let name_id = read_u16(&record[6..8]);
+        if name_id != 1 && name_id != 16 {
+            continue;
+        }
+
+        let length = usize::from(read_u16(&record[8..10]));
+        let offset = usize::from(read_u16(&record[10..12]));
+        let text_start = strings_offset.checked_add(offset)?;
+        let text_end = text_start.checked_add(length)?;
+        if length == 0 || text_end > table.len() {
+            continue;
+        }
+
+        let raw = &table[text_start..text_end];
+        let text = if platform == 3 || platform == 0 {
+            decode_utf16_be(raw)
+        } else {
+            raw.iter().map(|byte| char::from(*byte)).collect()
+        };
+        let Some(text) = sanitize_font_family(&text) else {
+            continue;
+        };
+
+        let rank = match (name_id, language) {
+            (16, 0x0409) => 0,
+            (16, _) => 1,
+            (1, 0x0409) => 2,
+            _ => 3,
+        };
+        let replace = match &best {
+            Some((current, _)) => rank < *current,
+            None => true,
+        };
+        if replace {
+            best = Some((rank, text));
+        }
+    }
+
+    best.map(|(_, family)| family)
+}
+
+/// Descarta nombres inutilizables: vacios, demasiado largos, con caracteres de
+/// control, o los alias verticales de Windows que empiezan con `@`.
+fn sanitize_font_family(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_matches('\u{0}').trim();
+    if trimmed.is_empty() || trimmed.starts_with('@') || trimmed.chars().count() > 80 {
+        return None;
+    }
+    if trimmed.chars().any(|character| character.is_control()) {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn decode_utf16_be(bytes: &[u8]) -> String {
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+        .collect();
+    String::from_utf16_lossy(&units)
+}
+
+fn read_u16(bytes: &[u8]) -> u16 {
+    u16::from_be_bytes([bytes[0], bytes[1]])
+}
+
+fn read_u32(bytes: &[u8]) -> u32 {
+    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
 fn encode_base64(bytes: &[u8]) -> String {
@@ -4278,8 +4757,11 @@ fn main() {
             get_brand_logo,
             save_brand_logo,
             remove_brand_logo,
+            list_system_fonts,
             get_references,
             scan_references,
+            rescan_reference_paths,
+            detect_reference_changes,
             create_reference_category,
             update_reference_favorite,
             update_reference_status,
@@ -4321,6 +4803,88 @@ fn main() {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// Arma una tabla `name` minima con los registros indicados
+    /// (`platform`, `language`, `name_id`, texto) para probar el parseo.
+    fn build_name_table(records: &[(u16, u16, u16, &str)]) -> Vec<u8> {
+        let mut strings: Vec<u8> = Vec::new();
+        let mut entries: Vec<u8> = Vec::new();
+        for (platform, language, name_id, text) in records {
+            let encoded: Vec<u8> = if *platform == 3 || *platform == 0 {
+                text.encode_utf16().flat_map(|unit| unit.to_be_bytes()).collect()
+            } else {
+                text.bytes().collect()
+            };
+            entries.extend_from_slice(&platform.to_be_bytes());
+            entries.extend_from_slice(&1u16.to_be_bytes());
+            entries.extend_from_slice(&language.to_be_bytes());
+            entries.extend_from_slice(&name_id.to_be_bytes());
+            entries.extend_from_slice(&(encoded.len() as u16).to_be_bytes());
+            entries.extend_from_slice(&(strings.len() as u16).to_be_bytes());
+            strings.extend_from_slice(&encoded);
+        }
+
+        let strings_offset = (6 + entries.len()) as u16;
+        let mut table = Vec::new();
+        table.extend_from_slice(&0u16.to_be_bytes());
+        table.extend_from_slice(&(records.len() as u16).to_be_bytes());
+        table.extend_from_slice(&strings_offset.to_be_bytes());
+        table.extend_from_slice(&entries);
+        table.extend_from_slice(&strings);
+        table
+    }
+
+    #[test]
+    fn reads_the_english_family_name_from_a_font_name_table() {
+        let table = build_name_table(&[
+            (1, 0, 1, "Legacy Mac Name"),
+            (3, 0x0409, 1, "Roxwana Display"),
+        ]);
+        assert_eq!(
+            parse_font_family_name(&table).as_deref(),
+            Some("Roxwana Display")
+        );
+    }
+
+    #[test]
+    fn prefers_the_typographic_family_over_the_basic_family() {
+        let table = build_name_table(&[
+            (3, 0x0409, 1, "Roxwana Display Semibold"),
+            (3, 0x0409, 16, "Roxwana Display"),
+        ]);
+        assert_eq!(
+            parse_font_family_name(&table).as_deref(),
+            Some("Roxwana Display")
+        );
+    }
+
+    /// Comprobacion contra las fuentes reales del equipo: si el lector se
+    /// rompe, la lista queda vacia o pierde las fuentes que Windows siempre
+    /// trae instaladas.
+    #[cfg(windows)]
+    #[test]
+    fn reads_the_fonts_actually_installed_on_this_machine() {
+        let families = list_system_fonts_impl().expect("Windows deberia tener fuentes instaladas");
+        assert!(families.len() > 20, "se leyeron muy pocas fuentes: {families:?}");
+        for expected in ["Arial", "Segoe UI", "Times New Roman"] {
+            assert!(
+                families.iter().any(|family| family == expected),
+                "falta la fuente {expected} en la lista leida"
+            );
+        }
+        assert!(families.iter().all(|family| !family.starts_with('@')));
+    }
+
+    #[test]
+    fn discards_vertical_aliases_and_empty_family_names() {
+        assert_eq!(sanitize_font_family("@MS Gothic"), None);
+        assert_eq!(sanitize_font_family("   "), None);
+        assert_eq!(sanitize_font_family("Bad\u{7}Name"), None);
+        assert_eq!(
+            sanitize_font_family("  Segoe UI \u{0}").as_deref(),
+            Some("Segoe UI")
+        );
+    }
 
     #[test]
     fn encodes_brand_logo_bytes_as_base64() {
@@ -4863,6 +5427,159 @@ mod tests {
         assert_eq!(
             references[0].work_path.as_deref(),
             Some("C:\\Biblioteca\\Trabajos\\Capitan America")
+        );
+    }
+
+    #[test]
+    fn loads_the_saved_reference_index_without_scanning_new_files() {
+        let dir = tempdir().unwrap();
+        let references = dir.path().join(REFERENCES_DIR_NAME);
+        let category = references.join("Marvel");
+        fs::create_dir_all(&category).unwrap();
+        let indexed = category.join("indexada.jpg");
+        let not_indexed = category.join("nueva.jpg");
+        fs::write(&indexed, b"indexed").unwrap();
+        fs::write(&not_indexed, b"new").unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_database(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO reference_images (
+                id, root_path, name, file_name, path, folder_path, category,
+                size, modified, first_seen, last_seen, missing
+             ) VALUES (?1, ?2, 'Indexada', 'indexada.jpg', ?3, ?4, 'Marvel', 7, 1, 1, 1, 0)",
+            params![
+                "ref-indexed",
+                path_to_string(dir.path()),
+                path_to_string(&indexed),
+                path_to_string(&category),
+            ],
+        )
+        .unwrap();
+
+        let response =
+            load_references_response_from_db(&conn, &path_to_string(dir.path())).unwrap();
+
+        assert_eq!(response.references.len(), 1);
+        assert_eq!(response.references[0].file_name, "indexada.jpg");
+        assert_eq!(response.categories, vec!["Marvel".to_string()]);
+    }
+
+    #[test]
+    fn detects_only_new_modified_or_deleted_reference_files() {
+        let dir = tempdir().unwrap();
+        let references = dir.path().join(REFERENCES_DIR_NAME);
+        let category = references.join("Personajes");
+        let cache = category.join(PORTABLE_CACHE_DIR_NAME).join("thumbnails");
+        fs::create_dir_all(&cache).unwrap();
+        let unchanged = category.join("quieta.jpg");
+        let modified = category.join("cambiada.png");
+        let added = category.join("nueva.webp");
+        let deleted = category.join("borrada.jpg");
+        fs::write(&unchanged, b"quiet").unwrap();
+        fs::write(&modified, b"changed-now").unwrap();
+        fs::write(&added, b"new").unwrap();
+        fs::write(cache.join("ignorar.jpg"), b"cache").unwrap();
+
+        let unchanged_metadata = fs::metadata(&unchanged).unwrap();
+        let unchanged_modified = unchanged_metadata
+            .modified()
+            .ok()
+            .and_then(system_time_to_i64)
+            .unwrap_or(0);
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_database(&conn).unwrap();
+        for (id, path, size, modified_at) in [
+            (
+                "quieta",
+                &unchanged,
+                unchanged_metadata.len() as i64,
+                unchanged_modified,
+            ),
+            ("cambiada", &modified, 1, 1),
+            ("borrada", &deleted, 1, 1),
+        ] {
+            conn.execute(
+                "INSERT INTO reference_images (
+                    id, root_path, name, file_name, path, folder_path, category,
+                    size, modified, first_seen, last_seen, missing
+                 ) VALUES (?1, ?2, ?1, ?1, ?3, ?4, 'Personajes', ?5, ?6, 1, 1, 0)",
+                params![
+                    id,
+                    path_to_string(dir.path()),
+                    path_to_string(path),
+                    path_to_string(&category),
+                    size,
+                    modified_at,
+                ],
+            )
+            .unwrap();
+        }
+
+        let changed =
+            changed_reference_paths(&conn, &path_to_string(dir.path()), &references).unwrap();
+
+        assert_eq!(
+            changed.into_iter().collect::<BTreeSet<_>>(),
+            [
+                path_to_string(&added),
+                path_to_string(&deleted),
+                path_to_string(&modified),
+            ]
+            .into_iter()
+            .collect()
+        );
+    }
+
+    #[test]
+    fn marks_only_the_affected_reference_scope_as_missing() {
+        let dir = tempdir().unwrap();
+        let references = dir.path().join(REFERENCES_DIR_NAME);
+        let marvel = references.join("Marvel");
+        let retratos = references.join("Retratos");
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_database(&conn).unwrap();
+        for (id, path, category) in [
+            ("marvel", marvel.join("uno.jpg"), "Marvel"),
+            ("retrato", retratos.join("dos.jpg"), "Retratos"),
+        ] {
+            conn.execute(
+                "INSERT INTO reference_images (
+                    id, root_path, name, file_name, path, folder_path, category,
+                    size, modified, first_seen, last_seen, missing
+                 ) VALUES (?1, ?2, ?1, ?1, ?3, ?4, ?5, 1, 1, 1, 1, 0)",
+                params![
+                    id,
+                    path_to_string(dir.path()),
+                    path_to_string(&path),
+                    path_to_string(path.parent().unwrap()),
+                    category,
+                ],
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            mark_reference_scopes_missing(
+                &conn,
+                &path_to_string(dir.path()),
+                std::iter::once(&marvel),
+            )
+            .unwrap(),
+            1
+        );
+        let states = conn
+            .prepare("SELECT id, missing FROM reference_images ORDER BY id")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            states,
+            vec![("marvel".to_string(), 1), ("retrato".to_string(), 0)]
         );
     }
 

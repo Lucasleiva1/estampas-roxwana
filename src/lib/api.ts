@@ -50,12 +50,24 @@ export async function removeBrandLogo() {
   await invoke("remove_brand_logo");
 }
 
+export async function listSystemFonts() {
+  return invoke<string[]>("list_system_fonts");
+}
+
 export async function getReferences(rootPath: string) {
   return invoke<ReferencesResponse>("get_references", { rootPath });
 }
 
 export async function scanReferences(rootPath: string) {
   return invoke<ReferencesResponse>("scan_references", { rootPath });
+}
+
+export async function rescanReferencePaths(rootPath: string, paths: string[]) {
+  return invoke<ReferencesResponse>("rescan_reference_paths", { rootPath, paths });
+}
+
+export async function detectReferenceChanges(rootPath: string) {
+  return invoke<ReferencesResponse | null>("detect_reference_changes", { rootPath });
 }
 
 export async function createReferenceCategory(rootPath: string, name: string) {

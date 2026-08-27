@@ -42,13 +42,14 @@ import {
   Upload,
   X,
 } from "lucide-react";
-import { memo, useCallback, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { memo, useCallback, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type Dispatch, type SetStateAction } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   addTag,
   createCategory as createLibraryCategory,
   createCategoryGroup as createLibraryGroup,
   createReferenceCategory,
+  detectReferenceChanges,
   detectLibraryChanges,
   deleteCategory as deleteLibraryCategory,
   deleteCategoryGroup as deleteLibraryGroup,
@@ -60,11 +61,13 @@ import {
   getDesignDetail,
   getInitialState,
   getReferences,
+  listSystemFonts,
   openDesignFolder,
   openBackupFolder,
   removeBrandLogo,
   removeTag,
   reloadPreferencesIfUnusable,
+  rescanReferencePaths,
   rescanPaths,
   revealDesignFile,
   renameCategory as renameLibraryCategory,
@@ -132,8 +135,69 @@ const RANDOM_HISTORY_STORAGE_KEY = "roxwana-random-history";
 const REFERENCES_SIDEBAR_STORAGE_KEY = "roxwana-references-sidebar-open";
 const REFERENCE_VIEWER_STORAGE_KEY = "roxwana-reference-viewer";
 const THEME_STORAGE_KEY = "roxwana-theme";
+const BRAND_PRESENTATION_STORAGE_KEY = "roxwana-brand-presentation";
+const SYSTEM_FONT_FALLBACKS = [
+  "Arial",
+  "Arial Black",
+  "Bahnschrift",
+  "Calibri",
+  "Cambria",
+  "Candara",
+  "Century Gothic",
+  "Comic Sans MS",
+  "Consolas",
+  "Courier New",
+  "Georgia",
+  "Impact",
+  "Segoe UI",
+  "Tahoma",
+  "Times New Roman",
+  "Trebuchet MS",
+  "Verdana",
+];
+/// Colores listos para tocar de una, sin abrir el selector de Windows.
+const BRAND_COLOR_SWATCHES = [
+  "#f5eee2",
+  "#ffffff",
+  "#d29332",
+  "#e5b769",
+  "#c0392b",
+  "#821c1f",
+  "#e2725b",
+  "#7d9a6d",
+  "#3f7f8c",
+  "#5b4b8a",
+  "#c46a9b",
+  "#1a1a1a",
+];
+/// El encabezado y el hueco del logo miden siempre lo mismo: el porcentaje
+/// agranda o achica unicamente la imagen. El tope es el mayor tamano que entra
+/// dentro de la barra sin tocarle los bordes (ver los `max-height` / `max-width`
+/// de `.brand-logo` en styles.css).
+const BRAND_LOGO_SCALE_MIN = 75;
+const BRAND_LOGO_SCALE_MAX = 150;
 
 type AppTheme = "dark" | "light";
+
+type BrandPresentation = {
+  logoScale: number;
+  logoOffsetX: number;
+  logoOffsetY: number;
+  name: string;
+  nameFont: string;
+  nameColor: string;
+  nameSize: number;
+};
+
+const DEFAULT_BRAND_PRESENTATION: BrandPresentation = {
+  logoScale: 100,
+  logoOffsetX: 0,
+  logoOffsetY: 0,
+  name: "",
+  nameFont: "Impact",
+  nameColor: "#f5eee2",
+  nameSize: 30,
+};
 
 function clampNumber(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
@@ -170,6 +234,48 @@ function getInitialTheme(): AppTheme {
     // Keep the original dark appearance when local storage is unavailable.
   }
   return "dark";
+}
+
+function getInitialBrandPresentation(): BrandPresentation {
+  try {
+    const stored = JSON.parse(window.localStorage.getItem(BRAND_PRESENTATION_STORAGE_KEY) ?? "null") as Partial<BrandPresentation> | null;
+    if (!stored) return DEFAULT_BRAND_PRESENTATION;
+    return {
+      logoScale: Math.round(clampNumber(Number(stored.logoScale) || 100, BRAND_LOGO_SCALE_MIN, BRAND_LOGO_SCALE_MAX)),
+      logoOffsetX: Math.round(clampNumber(Number(stored.logoOffsetX) || 0, -24, 24)),
+      logoOffsetY: Math.round(clampNumber(Number(stored.logoOffsetY) || 0, -18, 18)),
+      name: typeof stored.name === "string" ? stored.name.slice(0, 40) : "",
+      nameFont: typeof stored.nameFont === "string" && stored.nameFont.trim() ? stored.nameFont.trim().slice(0, 80) : "Impact",
+      nameColor: typeof stored.nameColor === "string" && /^#[0-9a-f]{6}$/i.test(stored.nameColor) ? stored.nameColor : "#f5eee2",
+      nameSize: Math.round(clampNumber(Number(stored.nameSize) || 30, 14, 44)),
+    };
+  } catch {
+    return DEFAULT_BRAND_PRESENTATION;
+  }
+}
+
+/// El tamano viaja como variable CSS al encabezado, pero alla adentro solo
+/// afecta al tamano maximo de la imagen: el hueco, la columna y el alto del
+/// encabezado quedan fijos. Se escala el limite de la imagen y no un
+/// `transform`, asi el logo se vuelve a dibujar nitido en vez de agrandarse
+/// borroso.
+function brandHeaderStyle(presentation: BrandPresentation): CSSProperties {
+  return { "--brand-logo-scale": presentation.logoScale / 100 } as CSSProperties;
+}
+
+function brandLogoStyle(presentation: BrandPresentation): CSSProperties {
+  return {
+    transform: `translate(${presentation.logoOffsetX}px, ${presentation.logoOffsetY}px)`,
+  };
+}
+
+function brandNameStyle(presentation: BrandPresentation): CSSProperties {
+  const safeFont = presentation.nameFont.replace(/["\\]/g, "");
+  return {
+    color: presentation.nameColor,
+    fontFamily: `"${safeFont}", sans-serif`,
+    fontSize: `${presentation.nameSize}px`,
+  };
 }
 
 function getInitialLeftPanelWidth() {
@@ -330,6 +436,10 @@ function writeRandomHistory(rootPath: string, usedIds: string[]) {
 export default function App() {
   const [appMode, setAppMode] = useState<"library" | "references">("library");
   const [library, setLibrary] = useState<LibraryResponse | null>(null);
+  const [referencesData, setReferencesData] = useState<ReferencesResponse | null>(null);
+  const [referencesLoading, setReferencesLoading] = useState(true);
+  const [referencesScanning, setReferencesScanning] = useState(false);
+  const [referencesError, setReferencesError] = useState<string | null>(null);
   const [filters, setFilters] = useState<Filters>(() => createDefaultFilters());
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -343,6 +453,7 @@ export default function App() {
   const [showIconLabels, setShowIconLabels] = useState(false);
   const [referenceViewer, setReferenceViewer] = useState<ReferenceViewerMode>(getInitialReferenceViewer);
   const [theme, setTheme] = useState<AppTheme>(getInitialTheme);
+  const [brandPresentation, setBrandPresentation] = useState<BrandPresentation>(getInitialBrandPresentation);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [detailsById, setDetailsById] = useState<Record<string, Design>>({});
   const [pageIndex, setPageIndex] = useState(0);
@@ -400,6 +511,14 @@ export default function App() {
       document.documentElement.style.setProperty("zoom", String(uiScale / 100));
     }
   }, [uiScale]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(BRAND_PRESENTATION_STORAGE_KEY, JSON.stringify(brandPresentation));
+    } catch {
+      // El ajuste sigue aplicado durante la sesion aunque no se pueda persistir.
+    }
+  }, [brandPresentation]);
 
   useEffect(() => {
     try {
@@ -511,6 +630,121 @@ export default function App() {
       alive = false;
     };
   }, [applyLibrary]);
+
+  const refreshReferences = useCallback(
+    async (manual = false) => {
+      const rootPath = library?.rootPath ?? DEFAULT_LIBRARY_PATH;
+      if (manual) setReferencesScanning(true);
+      setReferencesError(null);
+      try {
+        const response = manual ? await scanReferences(rootPath) : await getReferences(rootPath);
+        setReferencesData(response);
+      } finally {
+        if (manual) setReferencesScanning(false);
+      }
+    },
+    [library?.rootPath],
+  );
+
+  // Referencias abre siempre desde el indice guardado. Una comprobacion del
+  // disco corre despues, sin bloquear ni vaciar la pantalla que ve el usuario.
+  useEffect(() => {
+    const rootPath = library?.rootPath;
+    if (!rootPath) return;
+    let disposed = false;
+    let backgroundTimer = 0;
+    setReferencesData((current) => (current?.rootPath === rootPath ? current : null));
+    setReferencesLoading(true);
+    setReferencesError(null);
+    void getReferences(rootPath)
+      .then((response) => {
+        if (disposed) return;
+        setReferencesData(response);
+        backgroundTimer = window.setTimeout(() => {
+          void detectReferenceChanges(rootPath)
+            .then((updated) => {
+              if (!disposed && updated) setReferencesData(updated);
+            })
+            .catch((checkError) => {
+              if (!disposed) setReferencesError(`No pude comprobar los cambios recientes de Referencias: ${String(checkError)}`);
+            });
+        }, 700);
+      })
+      .catch((referencesLoadError) => {
+        if (!disposed) setReferencesError(String(referencesLoadError));
+      })
+      .finally(() => {
+        if (!disposed) setReferencesLoading(false);
+      });
+
+    return () => {
+      disposed = true;
+      window.clearTimeout(backgroundTimer);
+    };
+  }, [library?.rootPath]);
+
+  // Este vigilante pertenece a la aplicacion, no a la pantalla de Referencias:
+  // sigue activo mientras el usuario navega por la Biblioteca y sincroniza solo
+  // las rutas notificadas, agrupando las rafagas de copiado en una sola tarea.
+  useEffect(() => {
+    const rootPath = referencesData?.rootPath;
+    const referencesPath = referencesData?.referencesPath;
+    if (!rootPath || !referencesPath) return;
+    let disposed = false;
+    let stopWatching: (() => void) | null = null;
+    let flushTimer = 0;
+    let syncRunning = false;
+    const pendingPaths = new Set<string>();
+
+    const scheduleFlush = () => {
+      window.clearTimeout(flushTimer);
+      flushTimer = window.setTimeout(() => void flushChanges(), 900);
+    };
+
+    const flushChanges = async () => {
+      if (disposed || syncRunning || pendingPaths.size === 0) return;
+      const paths = Array.from(pendingPaths);
+      pendingPaths.clear();
+      syncRunning = true;
+      setReferencesError(null);
+      try {
+        const response = await rescanReferencePaths(rootPath, paths);
+        if (!disposed) setReferencesData(response);
+      } catch (watchError) {
+        if (!disposed) setReferencesError(`No pude actualizar Referencias: ${String(watchError)}`);
+      } finally {
+        syncRunning = false;
+        if (!disposed && pendingPaths.size > 0) scheduleFlush();
+      }
+    };
+
+    void watch(
+      referencesPath,
+      (event) => {
+        if (typeof event.type === "object" && "access" in event.type) return;
+        for (const path of event.paths) {
+          const normalized = path.replace(/\\/g, "/").toLocaleLowerCase();
+          if (normalized.split("/").includes("_roxwana-cache")) continue;
+          pendingPaths.add(path);
+        }
+        if (pendingPaths.size > 0) scheduleFlush();
+      },
+      { recursive: true, delayMs: 600 },
+    )
+      .then((stop) => {
+        if (disposed) stop();
+        else stopWatching = stop;
+      })
+      .catch((watchError) => {
+        if (!disposed) setReferencesError(`No pude vigilar Referencias: ${String(watchError)}`);
+      });
+
+    return () => {
+      disposed = true;
+      window.clearTimeout(flushTimer);
+      stopWatching?.();
+    };
+  }, [referencesData?.referencesPath, referencesData?.rootPath]);
 
   // La biblioteca guardada queda disponible de inmediato. Después se compara
   // el disco en segundo plano y solo se reescanean las carpetas que cambiaron
@@ -1629,6 +1863,8 @@ export default function App() {
         <SettingsScreen
           library={library}
           brandLogo={brandLogo}
+          brandPresentation={brandPresentation}
+          onChangeBrandPresentation={setBrandPresentation}
           brandLogoState={brandLogoState}
           onChooseBrandLogo={chooseBrandLogo}
           onDropBrandLogo={saveBrandLogoPath}
@@ -1665,6 +1901,14 @@ export default function App() {
       <ReferencesScreen
         rootPath={library?.rootPath ?? DEFAULT_LIBRARY_PATH}
         brandLogo={brandLogo}
+        brandPresentation={brandPresentation}
+        data={referencesData}
+        setData={setReferencesData}
+        loading={referencesLoading}
+        scanning={referencesScanning}
+        syncError={referencesError}
+        onDismissSyncError={() => setReferencesError(null)}
+        onRefresh={refreshReferences}
         onBackToLibrary={() => setAppMode("library")}
         onOpenSettings={() => setSettingsOpen(true)}
         onOpenWork={openWorkInLibrary}
@@ -1677,6 +1921,7 @@ export default function App() {
     <main className="visual-shell">
       <Header
         brandLogo={brandLogo}
+        brandPresentation={brandPresentation}
         libraryPath={library?.rootPath ?? DEFAULT_LIBRARY_PATH}
         setFilters={setFilters}
         loading={loading || scanning}
@@ -1817,6 +2062,14 @@ function initialReferencesSidebarOpen() {
 function ReferencesScreen({
   rootPath,
   brandLogo,
+  brandPresentation,
+  data,
+  setData,
+  loading,
+  scanning,
+  syncError,
+  onDismissSyncError,
+  onRefresh,
   onBackToLibrary,
   onOpenSettings,
   onOpenWork,
@@ -1824,14 +2077,19 @@ function ReferencesScreen({
 }: {
   rootPath: string;
   brandLogo: BrandLogo | null;
+  brandPresentation: BrandPresentation;
+  data: ReferencesResponse | null;
+  setData: Dispatch<SetStateAction<ReferencesResponse | null>>;
+  loading: boolean;
+  scanning: boolean;
+  syncError: string | null;
+  onDismissSyncError: () => void;
+  onRefresh: (manual?: boolean) => Promise<void>;
   onBackToLibrary: () => void;
   onOpenSettings: () => void;
   onOpenWork: (workName: string) => Promise<void>;
   viewerMode: ReferenceViewerMode;
 }) {
-  const [data, setData] = useState<ReferencesResponse | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [scanning, setScanning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const deferredQuery = useDeferredValue(query);
@@ -1861,25 +2119,15 @@ function ReferencesScreen({
 
   const refresh = useCallback(
     async (manual = false) => {
-      if (manual) setScanning(true);
       setError(null);
       try {
-        const response = manual ? await scanReferences(rootPath) : await getReferences(rootPath);
-        setData(response);
+        await onRefresh(manual);
       } catch (refreshError) {
         setError(String(refreshError));
-      } finally {
-        setLoading(false);
-        setScanning(false);
       }
     },
-    [rootPath],
+    [onRefresh],
   );
-
-  useEffect(() => {
-    setLoading(true);
-    void refresh(false);
-  }, [refresh]);
 
   useEffect(() => {
     try {
@@ -1889,41 +2137,6 @@ function ReferencesScreen({
     }
   }, [sidebarOpen]);
 
-  useEffect(() => {
-    const referencesPath = data?.referencesPath;
-    if (!referencesPath) return;
-    let disposed = false;
-    let stopWatching: (() => void) | null = null;
-    let timer = 0;
-    void watch(
-      referencesPath,
-      (event) => {
-        if (typeof event.type === "object" && "access" in event.type) return;
-        const hasReferenceChange = event.paths.some((path) => {
-          const normalized = path.replace(/\\/g, "/").toLocaleLowerCase();
-          return !normalized.split("/").includes("_roxwana-cache");
-        });
-        if (!hasReferenceChange) return;
-        window.clearTimeout(timer);
-        timer = window.setTimeout(() => {
-          if (!disposed) void refresh(false);
-        }, 900);
-      },
-      { recursive: true, delayMs: 600 },
-    )
-      .then((stop) => {
-        if (disposed) stop();
-        else stopWatching = stop;
-      })
-      .catch((watchError) => {
-        if (!disposed) setError(`No pude vigilar Referencias: ${String(watchError)}`);
-      });
-    return () => {
-      disposed = true;
-      window.clearTimeout(timer);
-      stopWatching?.();
-    };
-  }, [data?.referencesPath, refresh]);
 
   useEffect(() => {
     const candidates = (data?.references ?? [])
@@ -2104,9 +2317,9 @@ function ReferencesScreen({
   return (
     <main className="references-shell">
       <header className="references-header">
-        <section className="references-brand">
+        <section className="references-brand" style={brandHeaderStyle(brandPresentation)}>
           <div className="references-logo">
-            {brandLogo ? <img src={brandLogo.dataUrl} alt="Logo de la marca" draggable={false} /> : <Sparkles size={27} />}
+            {brandLogo ? <img src={brandLogo.dataUrl} alt="Logo de la marca" draggable={false} style={brandLogoStyle(brandPresentation)} /> : <Sparkles size={27} />}
           </div>
           <div>
             <strong>REFERENCIAS</strong>
@@ -2150,10 +2363,13 @@ function ReferencesScreen({
         <button type="button" className="add" onClick={() => void addCategory()} title="Crear carpeta de referencias"><Plus size={15} /></button>
       </nav>
 
-      {error && (
+      {(error || syncError) && (
         <div className="references-error" role="alert">
-          <span>{error}</span>
-          <button type="button" onClick={() => setError(null)}><X size={15} /></button>
+          <span>{error ?? syncError}</span>
+          <button type="button" onClick={() => {
+            setError(null);
+            onDismissSyncError();
+          }}><X size={15} /></button>
         </div>
       )}
 
@@ -2661,6 +2877,7 @@ function ReferenceWindow({
 
 function Header({
   brandLogo,
+  brandPresentation,
   libraryPath,
   setFilters,
   loading,
@@ -2675,6 +2892,7 @@ function Header({
   setUiScale,
 }: {
   brandLogo: BrandLogo | null;
+  brandPresentation: BrandPresentation;
   libraryPath: string;
   setFilters: React.Dispatch<React.SetStateAction<Filters>>;
   loading: boolean;
@@ -2754,7 +2972,7 @@ function Header({
   const randomRemaining = Math.max(0, randomProgress.total - randomProgress.seen);
 
   return (
-    <header className="visual-header">
+    <header className="visual-header" style={brandHeaderStyle(brandPresentation)}>
       <section className={brandLogo ? "logo-area has-logo" : "logo-area empty"} aria-label="Logo de marca">
         {brandLogo && (
           <img
@@ -2762,6 +2980,7 @@ function Header({
             src={brandLogo.dataUrl}
             alt="Logo de la marca"
             draggable={false}
+            style={brandLogoStyle(brandPresentation)}
             onError={(event) => {
               event.currentTarget.hidden = true;
             }}
@@ -2786,6 +3005,14 @@ function Header({
           <Shuffle size={15} />
         </button>
       </section>
+
+      {/* El nombre va entre los dos grupos de botones para que el hueco libre
+          lo centre solo, aunque mas adelante se agreguen o saquen botones. */}
+      {brandPresentation.name.trim() && (
+        <div className="header-brand-name" style={brandNameStyle(brandPresentation)}>
+          {brandPresentation.name.trim()}
+        </div>
+      )}
 
       {/* Controles de la aplicacion, contra el borde derecho: el engranaje en
           la punta como en cualquier programa, y Referencias a su izquierda. */}
@@ -2915,6 +3142,8 @@ function Header({
 function SettingsScreen({
   library,
   brandLogo,
+  brandPresentation,
+  onChangeBrandPresentation,
   brandLogoState,
   onChooseBrandLogo,
   onDropBrandLogo,
@@ -2944,6 +3173,8 @@ function SettingsScreen({
 }: {
   library: LibraryResponse | null;
   brandLogo: BrandLogo | null;
+  brandPresentation: BrandPresentation;
+  onChangeBrandPresentation: Dispatch<SetStateAction<BrandPresentation>>;
   brandLogoState: BrandLogoState;
   onChooseBrandLogo: () => void;
   onDropBrandLogo: (path: string) => void | Promise<void>;
@@ -2972,6 +3203,12 @@ function SettingsScreen({
   onBack: () => void;
 }) {
   const [brandDragActive, setBrandDragActive] = useState(false);
+  const [systemFonts, setSystemFonts] = useState<string[]>(SYSTEM_FONT_FALLBACKS);
+  const [fontLoadState, setFontLoadState] = useState<"idle" | "loading" | "loaded" | "error">("idle");
+  const [fontSearch, setFontSearch] = useState("");
+  const [fontListOpen, setFontListOpen] = useState(false);
+  const fontPickerRef = useRef<HTMLDivElement>(null);
+  const fontPopoverRef = useRef<HTMLDivElement>(null);
   const brandDropRef = useRef<HTMLDivElement>(null);
   const draggedBrandPathsRef = useRef<string[]>([]);
   const updateBusy = updateState.phase === "checking" || updateState.phase === "downloading" || updateState.phase === "installing";
@@ -2982,13 +3219,90 @@ function SettingsScreen({
   const backupBusy = backupState.phase === "saving" || backupState.phase === "opening" || backupState.phase === "loading";
   const brandLogoBusy = brandLogoState.phase === "saving" || brandLogoState.phase === "removing";
 
+  const updateBrandPresentation = <Key extends keyof BrandPresentation,>(key: Key, value: BrandPresentation[Key]) => {
+    onChangeBrandPresentation((current) => ({ ...current, [key]: value }));
+  };
+
+  /// Primero le preguntamos a Windows por el backend (lee la carpeta de fuentes
+  /// del equipo). Si eso falla probamos la API del navegador, y como ultimo
+  /// recurso quedan las fuentes que Windows trae siempre.
+  const loadSystemFonts = useCallback(async () => {
+    setFontLoadState("loading");
+    const mergeFamilies = (families: string[]) =>
+      Array.from(new Set([...SYSTEM_FONT_FALLBACKS, ...families.map((family) => family.trim()).filter(Boolean)]))
+        .sort((left, right) => left.localeCompare(right, "es", { sensitivity: "base" }));
+
+    try {
+      setSystemFonts(mergeFamilies(await listSystemFonts()));
+      setFontLoadState("loaded");
+      return;
+    } catch {
+      // El backend no pudo leer la carpeta de fuentes: seguimos con el navegador.
+    }
+
+    try {
+      const queryLocalFonts = (window as Window & {
+        queryLocalFonts?: () => Promise<Array<{ family: string }>>;
+      }).queryLocalFonts;
+      if (!queryLocalFonts) throw new Error("WebView2 no ofrece acceso a la lista local");
+      const fonts = await queryLocalFonts.call(window);
+      setSystemFonts(mergeFamilies(fonts.map((font) => font.family)));
+      setFontLoadState("loaded");
+    } catch {
+      setSystemFonts(SYSTEM_FONT_FALLBACKS);
+      setFontLoadState("error");
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadSystemFonts();
+  }, [loadSystemFonts]);
+
+  const visibleFonts = useMemo(() => {
+    const needle = fontSearch.trim().toLowerCase();
+    if (!needle) return systemFonts;
+    return systemFonts.filter((font) => font.toLowerCase().includes(needle));
+  }, [fontSearch, systemFonts]);
+
+  useEffect(() => {
+    if (!fontListOpen) return;
+    const closeFontList = (event: MouseEvent) => {
+      if (!fontPickerRef.current?.contains(event.target as Node)) setFontListOpen(false);
+    };
+    window.addEventListener("pointerdown", closeFontList);
+    return () => window.removeEventListener("pointerdown", closeFontList);
+  }, [fontListOpen]);
+
+  /// En pantallas bajas la lista se abriria por debajo del borde: la subimos
+  /// arriba del boton o, si tampoco entra, acercamos el panel con un scroll.
+  useLayoutEffect(() => {
+    const popover = fontPopoverRef.current;
+    const trigger = fontPickerRef.current;
+    if (!fontListOpen || !popover || !trigger) return;
+    popover.classList.remove("upwards");
+    const triggerBounds = trigger.getBoundingClientRect();
+    const needed = popover.offsetHeight + 12;
+    if (triggerBounds.bottom + needed > window.innerHeight && triggerBounds.top > needed) {
+      popover.classList.add("upwards");
+    } else if (triggerBounds.bottom + needed > window.innerHeight) {
+      popover.scrollIntoView({ block: "nearest" });
+    }
+  }, [fontListOpen, visibleFonts.length]);
+
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onBack();
+      if (event.key !== "Escape") return;
+      // Con la lista de fuentes abierta, Escape cierra solo la lista: salir de
+      // Configuracion de golpe seria perder de vista lo que se estaba ajustando.
+      if (fontListOpen) {
+        setFontListOpen(false);
+        return;
+      }
+      onBack();
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [onBack]);
+  }, [fontListOpen, onBack]);
 
   useEffect(() => {
     let disposed = false;
@@ -3080,162 +3394,53 @@ function SettingsScreen({
               <small>Biblioteca actual</small>
               <strong title={library?.rootPath ?? DEFAULT_LIBRARY_PATH}>{library?.rootPath ?? DEFAULT_LIBRARY_PATH}</strong>
             </div>
+            {/* Los cuatro botones van juntos en una sola fila de cuadrados. Los
+                avisos de progreso quedan debajo, fuera de la fila, para no
+                partirla en dos cuando aparecen. */}
             <div className="settings-action-list">
               <button className="settings-action" onClick={onChooseFolder} disabled={loading}>
-                <FolderOpen size={16} />
+                <FolderOpen size={24} />
                 <span>Cambiar biblioteca</span>
               </button>
               <button className="settings-action secondary" onClick={onRunScan} disabled={loading}>
-                <RefreshCw size={16} className={loading ? "spin" : ""} />
+                <RefreshCw size={24} className={loading ? "spin" : ""} />
                 <span>Escanear biblioteca</span>
               </button>
               <button className="settings-action secondary" onClick={onPrepareThumbnails} disabled={thumbnailBusy || !library}>
-                {thumbnailBusy ? <Loader2 size={16} className="spin" /> : <FileImage size={16} />}
+                {thumbnailBusy ? <Loader2 size={24} className="spin" /> : <FileImage size={24} />}
                 <span>{thumbnailBusy ? "Preparando..." : "Preparar miniaturas"}</span>
               </button>
-              {thumbnailPrep.message && (
-                <div className={`update-status ${thumbnailPrep.phase}`} aria-live="polite">
-                  <span>{thumbnailPrep.message}</span>
-                  {thumbnailPrep.total > 0 && (
-                    <>
-                      <small>{thumbnailPrep.done.toLocaleString("es-AR")} de {thumbnailPrep.total.toLocaleString("es-AR")}</small>
-                      <div className="update-progress" aria-label={`Progreso ${thumbnailProgress ?? 0}%`}>
-                        <span style={{ width: `${thumbnailProgress ?? 0}%` }} />
-                      </div>
-                    </>
-                  )}
-                </div>
-              )}
               <button className="settings-action secondary" onClick={onPreparePreviews} disabled={previewBusy || !library}>
-                {previewBusy ? <Loader2 size={16} className="spin" /> : <Maximize2 size={16} />}
+                {previewBusy ? <Loader2 size={24} className="spin" /> : <Maximize2 size={24} />}
                 <span>{previewBusy ? "Optimizando visor..." : "Optimizar visor"}</span>
               </button>
-              {previewPrep.message && (
-                <div className={`update-status ${previewPrep.phase}`} aria-live="polite">
-                  <span>{previewPrep.message}</span>
-                  {previewPrep.total > 0 && (
-                    <>
-                      <small>{previewPrep.done.toLocaleString("es-AR")} de {previewPrep.total.toLocaleString("es-AR")}</small>
-                      <div className="update-progress" aria-label={`Progreso ${previewProgress ?? 0}%`}>
-                        <span style={{ width: `${previewProgress ?? 0}%` }} />
-                      </div>
-                    </>
-                  )}
-                </div>
-              )}
             </div>
-          </section>
-
-          <section className="settings-card">
-            <div className="settings-card-header">
-              <FileImage size={19} />
-              <div>
-                <h2>Identidad de marca</h2>
-                <p>Logo que aparece en la esquina superior de la aplicacion.</p>
-              </div>
-            </div>
-            <div className="settings-brand">
-              <div
-                ref={brandDropRef}
-                className={`settings-brand-preview brand-drop-zone ${brandLogo ? "has-logo" : "empty"} ${brandDragActive ? "drag-active" : ""}`}
-              >
-                {brandDragActive ? (
-                  <div className="brand-drop-prompt">
-                    <Upload size={24} />
-                    <strong>Solta la imagen para usarla como logo</strong>
-                  </div>
-                ) : brandLogo ? (
-                  <img src={brandLogo.dataUrl} alt="Vista previa del logo" />
-                ) : (
+            {thumbnailPrep.message && (
+              <div className={`update-status ${thumbnailPrep.phase}`} aria-live="polite">
+                <span>{thumbnailPrep.message}</span>
+                {thumbnailPrep.total > 0 && (
                   <>
-                    <ImageOff size={20} />
-                    <span>Arrastra una imagen aca o usa el boton</span>
+                    <small>{thumbnailPrep.done.toLocaleString("es-AR")} de {thumbnailPrep.total.toLocaleString("es-AR")}</small>
+                    <div className="update-progress" aria-label={`Progreso ${thumbnailProgress ?? 0}%`}>
+                      <span style={{ width: `${thumbnailProgress ?? 0}%` }} />
+                    </div>
                   </>
                 )}
               </div>
-              <div className="settings-brand-actions">
-                <button type="button" onClick={onChooseBrandLogo} disabled={brandLogoBusy}>
-                  {brandLogoState.phase === "saving" ? <Loader2 size={15} className="spin" /> : <Upload size={15} />}
-                  <span>{brandLogo ? "Cambiar imagen" : "Cargar imagen"}</span>
-                </button>
-                {brandLogo && (
-                  <button type="button" className="danger" onClick={onRemoveBrandLogo} disabled={brandLogoBusy} title="Quitar logo">
-                    {brandLogoState.phase === "removing" ? <Loader2 size={15} className="spin" /> : <Trash2 size={15} />}
-                  </button>
+            )}
+            {previewPrep.message && (
+              <div className={`update-status ${previewPrep.phase}`} aria-live="polite">
+                <span>{previewPrep.message}</span>
+                {previewPrep.total > 0 && (
+                  <>
+                    <small>{previewPrep.done.toLocaleString("es-AR")} de {previewPrep.total.toLocaleString("es-AR")}</small>
+                    <div className="update-progress" aria-label={`Progreso ${previewProgress ?? 0}%`}>
+                      <span style={{ width: `${previewProgress ?? 0}%` }} />
+                    </div>
+                  </>
                 )}
               </div>
-              <small>Arrastra una imagen sobre la vista previa o elegila con el boton. PNG, JPG o WebP.</small>
-              {brandLogoState.message && (
-                <div className={`update-status ${brandLogoState.phase}`} aria-live="polite">
-                  <span>{brandLogoState.message}</span>
-                </div>
-              )}
-            </div>
-          </section>
-
-          <section className="settings-card appearance-settings-card">
-            <div className="settings-card-header">
-              <Sun size={19} />
-              <div>
-                <h2>Apariencia</h2>
-                <p>Colores de la aplicacion y apertura de referencias.</p>
-              </div>
-            </div>
-            <div className="settings-section-label">Tema de la aplicacion</div>
-            <div className="theme-mode-options" role="group" aria-label="Tema de la aplicacion">
-              <button
-                type="button"
-                className={theme === "dark" ? "theme-mode-option active" : "theme-mode-option"}
-                onClick={() => onChangeTheme("dark")}
-                aria-pressed={theme === "dark"}
-              >
-                <Moon size={18} />
-                <span>
-                  <strong>Oscuro</strong>
-                  <small>Fondo negro y paneles oscuros.</small>
-                </span>
-              </button>
-              <button
-                type="button"
-                className={theme === "light" ? "theme-mode-option active" : "theme-mode-option"}
-                onClick={() => onChangeTheme("light")}
-                aria-pressed={theme === "light"}
-              >
-                <Sun size={18} />
-                <span>
-                  <strong>Claro</strong>
-                  <small>Fondo blanco y texto oscuro.</small>
-                </span>
-              </button>
-            </div>
-            <div className="settings-section-label">Visor de referencias</div>
-            <div className="viewer-mode-options">
-              {([
-                {
-                  value: "full" as const,
-                  title: "Pantalla completa",
-                  detail: "Ocupa toda la ventana, con los datos y las acciones en un panel a la derecha.",
-                },
-                {
-                  value: "window" as const,
-                  title: "Ventana centrada",
-                  detail: "Un recuadro en el medio con el fondo desenfocado. Los controles van sobre la imagen y se esconden solos.",
-                },
-              ]).map((option) => (
-                <button
-                  type="button"
-                  key={option.value}
-                  className={`viewer-mode-option ${referenceViewer === option.value ? "active" : ""}`}
-                  onClick={() => onChangeReferenceViewer(option.value)}
-                  aria-pressed={referenceViewer === option.value}
-                >
-                  <span className={`viewer-mode-preview ${option.value}`} aria-hidden="true"><span /></span>
-                  <strong>{option.title}</strong>
-                  <small>{option.detail}</small>
-                </button>
-              ))}
-            </div>
-            <small className="viewer-mode-note">En los dos casos cerras con Escape y pasas de una a otra con las flechas del teclado.</small>
+            )}
           </section>
 
           <section className="settings-card">
@@ -3313,6 +3518,316 @@ function SettingsScreen({
                 </div>
               )}
             </div>
+          </section>
+
+          <section className="settings-card brand-settings-card">
+            <div className="settings-card-header">
+              <FileImage size={19} />
+              <div>
+                <h2>Identidad de marca</h2>
+                <p>Logo y nombre que aparecen en el encabezado de la aplicacion.</p>
+              </div>
+            </div>
+            <div className="settings-brand">
+              <div className="brand-editor-stage-label">
+                <span>Vista previa del encabezado, a tamaño real</span>
+                <strong>
+                  {brandLogo ? `Logo original: ${brandLogo.width} × ${brandLogo.height} px` : "Sin logo cargado"}
+                </strong>
+              </div>
+              <div
+                ref={brandDropRef}
+                className={`settings-brand-preview brand-drop-zone ${brandLogo ? "has-logo" : "empty"} ${brandDragActive ? "drag-active" : ""}`}
+              >
+                {brandDragActive ? (
+                  <div className="brand-drop-prompt">
+                    <Upload size={24} />
+                    <strong>Solta la imagen para usarla como logo</strong>
+                  </div>
+                ) : (
+                  <div className="brand-header-preview" style={brandHeaderStyle(brandPresentation)}>
+                    <div className={brandLogo ? "logo-area brand-preview-logo-slot has-logo" : "logo-area brand-preview-logo-slot empty"}>
+                      {brandLogo && (
+                        <img
+                          className="brand-logo"
+                          src={brandLogo.dataUrl}
+                          alt="Vista previa del logo"
+                          draggable={false}
+                          style={brandLogoStyle(brandPresentation)}
+                        />
+                      )}
+                    </div>
+                    <div className="brand-preview-tools" aria-hidden="true">
+                      <span>Rescaneo</span>
+                    </div>
+                    {brandPresentation.name.trim() && (
+                      <div className="header-brand-name brand-preview-name" style={brandNameStyle(brandPresentation)}>
+                        {brandPresentation.name.trim()}
+                      </div>
+                    )}
+                    {!brandLogo && !brandPresentation.name.trim() && (
+                      <div className="brand-preview-empty-hint">
+                        <ImageOff size={18} />
+                        <span>Carga un logo o escribe el nombre de tu marca</span>
+                      </div>
+                    )}
+                    <div className="brand-preview-actions" aria-hidden="true">
+                      <span>Interfaz</span>
+                      <span>Biblioteca actual</span>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {brandLogo && (
+                <div className="brand-logo-editor">
+                  <div className="brand-control-heading">
+                    <strong>Ajustar logo</strong>
+                    <button
+                      type="button"
+                      onClick={() => onChangeBrandPresentation((current) => ({
+                        ...current,
+                        logoScale: DEFAULT_BRAND_PRESENTATION.logoScale,
+                        logoOffsetX: DEFAULT_BRAND_PRESENTATION.logoOffsetX,
+                        logoOffsetY: DEFAULT_BRAND_PRESENTATION.logoOffsetY,
+                      }))}
+                      disabled={brandPresentation.logoScale === 100 && brandPresentation.logoOffsetX === 0 && brandPresentation.logoOffsetY === 0}
+                    >
+                      <RotateCcw size={13} /> Restablecer
+                    </button>
+                  </div>
+                  <label className="brand-range-control">
+                    <span>Tamaño <b>{brandPresentation.logoScale}%</b></span>
+                    <input
+                      type="range"
+                      min={BRAND_LOGO_SCALE_MIN}
+                      max={BRAND_LOGO_SCALE_MAX}
+                      step="5"
+                      value={brandPresentation.logoScale}
+                      onChange={(event) => updateBrandPresentation("logoScale", Number(event.target.value))}
+                    />
+                  </label>
+                  <div className="brand-position-controls">
+                    <label className="brand-range-control">
+                      <span>Horizontal <b>{brandPresentation.logoOffsetX > 0 ? "+" : ""}{brandPresentation.logoOffsetX}px</b></span>
+                      <input
+                        type="range"
+                        min="-24"
+                        max="24"
+                        step="1"
+                        value={brandPresentation.logoOffsetX}
+                        onChange={(event) => updateBrandPresentation("logoOffsetX", Number(event.target.value))}
+                      />
+                    </label>
+                    <label className="brand-range-control">
+                      <span>Vertical <b>{brandPresentation.logoOffsetY > 0 ? "+" : ""}{brandPresentation.logoOffsetY}px</b></span>
+                      <input
+                        type="range"
+                        min="-18"
+                        max="18"
+                        step="1"
+                        value={brandPresentation.logoOffsetY}
+                        onChange={(event) => updateBrandPresentation("logoOffsetY", Number(event.target.value))}
+                      />
+                    </label>
+                  </div>
+                </div>
+              )}
+
+              <div className="brand-name-editor">
+                <div className="brand-control-heading">
+                  <strong>Nombre de marca</strong>
+                  <small>Si queda vacío, no aparece en la aplicación.</small>
+                </div>
+                <input
+                  className="brand-name-input"
+                  type="text"
+                  maxLength={40}
+                  value={brandPresentation.name}
+                  onChange={(event) => updateBrandPresentation("name", event.target.value)}
+                  placeholder="Por ejemplo: ROXWANA"
+                />
+                <div className="brand-font-row">
+                  <div ref={fontPickerRef} className="brand-font-picker">
+                    <span className="brand-font-label">Fuente</span>
+                    <button
+                      type="button"
+                      className={fontListOpen ? "brand-font-trigger open" : "brand-font-trigger"}
+                      onClick={() => {
+                        setFontSearch("");
+                        setFontListOpen((open) => !open);
+                      }}
+                      aria-expanded={fontListOpen}
+                    >
+                      <b style={{ fontFamily: `"${brandPresentation.nameFont.replace(/["\\]/g, "")}", sans-serif` }}>
+                        {brandPresentation.nameFont}
+                      </b>
+                      <ChevronDown size={14} />
+                    </button>
+                    {fontListOpen && (
+                      <div ref={fontPopoverRef} className="brand-font-popover">
+                        <input
+                          autoFocus
+                          type="text"
+                          className="brand-font-search"
+                          value={fontSearch}
+                          onChange={(event) => setFontSearch(event.target.value)}
+                          placeholder="Buscar entre tus fuentes..."
+                        />
+                        <div className="brand-font-options">
+                          {visibleFonts.map((font) => (
+                            <button
+                              key={font}
+                              type="button"
+                              className={font === brandPresentation.nameFont ? "brand-font-option selected" : "brand-font-option"}
+                              onClick={() => {
+                                updateBrandPresentation("nameFont", font);
+                                setFontListOpen(false);
+                              }}
+                            >
+                              <span style={{ fontFamily: `"${font.replace(/["\\]/g, "")}", sans-serif` }}>
+                                {brandPresentation.name.trim() || font}
+                              </span>
+                              <small>{font}</small>
+                            </button>
+                          ))}
+                          {visibleFonts.length === 0 && (
+                            <p className="brand-font-empty">Ninguna fuente coincide con "{fontSearch.trim()}".</p>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                  <button type="button" onClick={() => void loadSystemFonts()} disabled={fontLoadState === "loading"}>
+                    {fontLoadState === "loading" ? <Loader2 size={14} className="spin" /> : <FileText size={14} />}
+                    {fontLoadState === "loaded" ? `${systemFonts.length} fuentes` : "Releer fuentes"}
+                  </button>
+                </div>
+                {fontLoadState === "error" && (
+                  <small className="brand-font-note">No se pudo leer la carpeta de fuentes de Windows, así que la lista muestra solo las fuentes básicas del sistema.</small>
+                )}
+                <div className="brand-color-swatches" role="group" aria-label="Colores para el nombre">
+                  {BRAND_COLOR_SWATCHES.map((color) => (
+                    <button
+                      key={color}
+                      type="button"
+                      className={color.toLowerCase() === brandPresentation.nameColor.toLowerCase() ? "brand-swatch selected" : "brand-swatch"}
+                      style={{ backgroundColor: color }}
+                      title={color.toUpperCase()}
+                      aria-label={`Usar el color ${color.toUpperCase()}`}
+                      onClick={() => updateBrandPresentation("nameColor", color)}
+                    />
+                  ))}
+                </div>
+                <div className="brand-name-style-row">
+                  <label className="brand-color-control">
+                    <span>Otro color</span>
+                    <span className="brand-color-input">
+                      <input
+                        type="color"
+                        value={brandPresentation.nameColor}
+                        onChange={(event) => updateBrandPresentation("nameColor", event.target.value)}
+                      />
+                      <b>{brandPresentation.nameColor.toUpperCase()}</b>
+                    </span>
+                  </label>
+                  <label className="brand-range-control">
+                    <span>Tamaño del nombre <b>{brandPresentation.nameSize}px</b></span>
+                    <input
+                      type="range"
+                      min="14"
+                      max="44"
+                      step="1"
+                      value={brandPresentation.nameSize}
+                      onChange={(event) => updateBrandPresentation("nameSize", Number(event.target.value))}
+                    />
+                  </label>
+                </div>
+              </div>
+
+              <div className="settings-brand-actions">
+                <button type="button" onClick={onChooseBrandLogo} disabled={brandLogoBusy}>
+                  {brandLogoState.phase === "saving" ? <Loader2 size={15} className="spin" /> : <Upload size={15} />}
+                  <span>{brandLogo ? "Cambiar imagen" : "Cargar imagen"}</span>
+                </button>
+                {brandLogo && (
+                  <button type="button" className="danger" onClick={onRemoveBrandLogo} disabled={brandLogoBusy} title="Quitar logo">
+                    {brandLogoState.phase === "removing" ? <Loader2 size={15} className="spin" /> : <Trash2 size={15} />}
+                  </button>
+                )}
+              </div>
+              <small>Arrastra una imagen sobre el encabezado o elegila con el boton. Los cambios de tamaño, posición, nombre, fuente y color se guardan automáticamente.</small>
+              {brandLogoState.message && (
+                <div className={`update-status ${brandLogoState.phase}`} aria-live="polite">
+                  <span>{brandLogoState.message}</span>
+                </div>
+              )}
+            </div>
+          </section>
+
+          <section className="settings-card appearance-settings-card">
+            <div className="settings-card-header">
+              <Sun size={19} />
+              <div>
+                <h2>Apariencia</h2>
+                <p>Colores de la aplicacion y apertura de referencias.</p>
+              </div>
+            </div>
+            <div className="settings-section-label">Tema de la aplicacion</div>
+            <div className="theme-mode-options" role="group" aria-label="Tema de la aplicacion">
+              <button
+                type="button"
+                className={theme === "dark" ? "theme-mode-option active" : "theme-mode-option"}
+                onClick={() => onChangeTheme("dark")}
+                aria-pressed={theme === "dark"}
+              >
+                <Moon size={18} />
+                <span>
+                  <strong>Oscuro</strong>
+                  <small>Fondo negro y paneles oscuros.</small>
+                </span>
+              </button>
+              <button
+                type="button"
+                className={theme === "light" ? "theme-mode-option active" : "theme-mode-option"}
+                onClick={() => onChangeTheme("light")}
+                aria-pressed={theme === "light"}
+              >
+                <Sun size={18} />
+                <span>
+                  <strong>Claro</strong>
+                  <small>Fondo blanco y texto oscuro.</small>
+                </span>
+              </button>
+            </div>
+            <div className="settings-section-label">Visor de referencias</div>
+            <div className="viewer-mode-options">
+              {([
+                {
+                  value: "full" as const,
+                  title: "Pantalla completa",
+                  detail: "Ocupa toda la ventana, con los datos y las acciones en un panel a la derecha.",
+                },
+                {
+                  value: "window" as const,
+                  title: "Ventana centrada",
+                  detail: "Un recuadro en el medio con el fondo desenfocado. Los controles van sobre la imagen y se esconden solos.",
+                },
+              ]).map((option) => (
+                <button
+                  type="button"
+                  key={option.value}
+                  className={`viewer-mode-option ${referenceViewer === option.value ? "active" : ""}`}
+                  onClick={() => onChangeReferenceViewer(option.value)}
+                  aria-pressed={referenceViewer === option.value}
+                >
+                  <span className={`viewer-mode-preview ${option.value}`} aria-hidden="true"><span /></span>
+                  <strong>{option.title}</strong>
+                  <small>{option.detail}</small>
+                </button>
+              ))}
+            </div>
+            <small className="viewer-mode-note">En los dos casos cerras con Escape y pasas de una a otra con las flechas del teclado.</small>
           </section>
 
         </div>

@@ -49,7 +49,9 @@ button:disabled {
   width: 100vw;
   height: 100vh;
   display: grid;
-  grid-template-rows: 78px auto 1fr;
+  /* El encabezado arranca en 78 px pero crece si el logo se agranda desde
+     Configuracion, en lugar de recortarlo. */
+  grid-template-rows: minmax(78px, auto) auto 1fr;
   overflow: hidden;
   color: #ece7dd;
   background:
@@ -57,15 +59,38 @@ button:disabled {
     linear-gradient(135deg, #090a0a 0%, #030404 55%, #0d0d0d 100%);
 }
 
+/* Cuatro columnas: logo, botones de la izquierda, hueco libre para el nombre
+   de la marca, y botones de la derecha. El hueco es el unico que se estira,
+   asi que el nombre queda siempre centrado entre los dos grupos de botones. */
 .visual-header {
+  position: relative;
   grid-row: 1;
   display: grid;
-  grid-template-columns: 88px minmax(0, 1fr) auto;
+  grid-template-columns: 88px auto minmax(0, 1fr) auto;
   align-items: center;
   gap: 14px;
   padding: 10px 16px;
   border-bottom: 1px solid #242424;
   background: rgb(11 11 11 / 94%);
+}
+
+/* Todo lo que cuelgue del encabezado vive en el mismo renglon, y cada bloque
+   tiene su columna fija: asi la barra nunca se parte en dos filas, aunque
+   cambie el orden del HTML o se agregue un elemento nuevo. */
+.visual-header > * {
+  grid-row: 1;
+}
+
+.visual-header > .logo-area {
+  grid-column: 1;
+}
+
+.visual-header > .window-actions {
+  grid-column: 2;
+}
+
+.visual-header > .app-actions {
+  grid-column: 4;
 }
 
 .logo-area,
@@ -90,12 +115,17 @@ button:disabled {
   align-items: center;
 }
 
+/* El hueco del logo mide siempre lo mismo. `overflow: visible` deja que la
+   imagen agrandada use el aire que ya tiene el encabezado alrededor, en vez de
+   quedar recortada por el borde de su caja. El margen interno derecho corre el
+   centro hacia la izquierda, asi al crecer se aleja de la rayita separadora. */
 .logo-area {
   position: relative;
   width: 76px;
   height: 52px;
   justify-content: center;
   min-width: 0;
+  overflow: visible;
   padding-right: 15px;
 }
 
@@ -114,9 +144,33 @@ button:disabled {
   display: block;
   width: auto;
   height: auto;
-  max-width: 64px;
-  max-height: 48px;
+  /* Topes duros: el logo crece dentro del encabezado y nunca lo agranda ni se
+     le sale. 72 px de alto entran en los 78 px de la barra con 3 px de aire, y
+     84 px de ancho dejan al logo mas panoramico sin tocar la rayita
+     separadora ni el borde izquierdo de la ventana. */
+  max-width: min(calc(64px * var(--brand-logo-scale, 1)), 84px);
+  max-height: min(calc(48px * var(--brand-logo-scale, 1)), 72px);
   object-fit: contain;
+  transform-origin: center;
+  transition: transform 0.14s ease, max-width 0.14s ease, max-height 0.14s ease;
+  user-select: none;
+}
+
+/* El nombre vive en la columna libre que queda entre los botones de la
+   izquierda y los de la derecha, y se centra dentro de ella. Asi sigue
+   centrado solo aunque se agreguen o saquen botones a cualquier lado. */
+.header-brand-name {
+  grid-column: 3;
+  justify-self: center;
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  line-height: 1;
+  text-align: center;
+  text-overflow: ellipsis;
+  text-shadow: 0 2px 0 rgb(0 0 0 / 42%);
+  white-space: nowrap;
+  pointer-events: none;
   user-select: none;
 }
 
@@ -489,6 +543,13 @@ button:disabled {
   box-shadow: 0 14px 32px rgb(0 0 0 / 20%);
 }
 
+/* Identidad de marca necesita el ancho completo: adentro tiene la vista previa
+   del encabezado y dos columnas de controles. Biblioteca y Datos comparten la
+   primera fila a media columna cada una. */
+.brand-settings-card {
+  grid-column: 1 / -1;
+}
+
 .library-settings-card {
   border-color: rgb(210 147 50 / 58%);
   background:
@@ -525,6 +586,8 @@ button:disabled {
 }
 
 .settings-screen .settings-brand {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
   margin: 0;
   padding: 0;
   border: 0;
@@ -532,16 +595,388 @@ button:disabled {
 }
 
 .settings-screen .settings-brand-preview {
-  min-height: 116px;
+  grid-column: 1 / -1;
+  min-height: 78px;
+  display: block;
 }
 
-.settings-screen .settings-brand-preview img {
-  max-width: calc(100% - 24px);
-  max-height: 98px;
+.settings-screen .settings-brand-preview .brand-logo {
+  max-width: min(calc(64px * var(--brand-logo-scale, 1)), 84px);
+  max-height: min(calc(48px * var(--brand-logo-scale, 1)), 72px);
 }
 
 .settings-screen .settings-brand-actions button {
   min-height: 38px;
+}
+
+.brand-editor-stage-label,
+.settings-screen .settings-brand-actions,
+.settings-screen .settings-brand > small,
+.settings-screen .settings-brand > .update-status {
+  grid-column: 1 / -1;
+}
+
+.brand-editor-stage-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  color: #9c958d;
+  font-size: 10px;
+}
+
+.brand-editor-stage-label strong {
+  color: #d6c6af;
+  font-weight: 650;
+}
+
+.brand-header-preview {
+  position: relative;
+  width: 100%;
+  min-height: 78px;
+  display: grid;
+  grid-template-columns: 88px auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 14px;
+  overflow: hidden;
+  padding: 10px 16px;
+  background: rgb(11 11 11 / 98%);
+}
+
+.brand-header-preview > * {
+  grid-row: 1;
+}
+
+.brand-preview-logo-slot {
+  grid-column: 1;
+}
+
+.brand-preview-tools {
+  grid-column: 2;
+}
+
+.brand-preview-name {
+  max-width: 100%;
+}
+
+.brand-preview-tools,
+.brand-preview-actions {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.brand-preview-actions {
+  grid-column: 4;
+  justify-self: end;
+}
+
+.brand-preview-tools span,
+.brand-preview-actions span {
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 9px;
+  border: 1px solid #343638;
+  border-radius: 6px;
+  color: #9c9a97;
+  background: #111315;
+  font-size: 9px;
+}
+
+.brand-preview-empty-hint {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: #77736d;
+  font-size: 10px;
+  transform: translate(-50%, -50%);
+}
+
+.brand-logo-editor,
+.brand-name-editor {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid #2d3033;
+  border-radius: 7px;
+  background: #0d0e0f;
+}
+
+.brand-control-heading {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.brand-control-heading strong {
+  color: #e4ddd4;
+  font-size: 11px;
+}
+
+.brand-control-heading small,
+.brand-font-note {
+  color: #7f7972;
+  font-size: 9px;
+}
+
+.brand-control-heading button,
+.brand-font-row > button {
+  min-height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 9px;
+  border: 1px solid #3a3c40;
+  border-radius: 6px;
+  color: #cfc7bd;
+  background: #17191b;
+  font-size: 9px;
+}
+
+.brand-range-control,
+.brand-font-row label,
+.brand-color-control {
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.brand-range-control > span,
+.brand-font-row label > span,
+.brand-color-control > span:first-child {
+  display: flex;
+  justify-content: space-between;
+  color: #8f8981;
+  font-size: 9px;
+}
+
+.brand-range-control b {
+  color: #dfb76f;
+}
+
+.brand-range-control input[type="range"] {
+  width: 100%;
+  accent-color: #d29332;
+}
+
+.brand-position-controls,
+.brand-name-style-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.brand-name-input,
+.brand-font-row input[type="text"] {
+  min-width: 0;
+  height: 36px;
+  padding: 0 10px;
+  border: 1px solid #35383b;
+  border-radius: 6px;
+  outline: none;
+  color: #eee7dd;
+  background: #121416;
+  font-size: 11px;
+}
+
+.brand-name-input:focus,
+.brand-font-row input[type="text"]:focus {
+  border-color: #d29332;
+  box-shadow: 0 0 0 2px rgb(210 147 50 / 12%);
+}
+
+.brand-font-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 8px;
+}
+
+.brand-color-input {
+  height: 34px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  border: 1px solid #35383b;
+  border-radius: 6px;
+  background: #121416;
+}
+
+.brand-color-input input {
+  width: 32px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.brand-color-input b {
+  color: #b9b1a8;
+  font-size: 9px;
+}
+
+/* Selector de fuentes: cada opcion se dibuja con su propia tipografia para que
+   se pueda elegir mirando, no leyendo nombres. */
+.brand-font-picker {
+  position: relative;
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+}
+
+.brand-font-label {
+  color: #9c958d;
+  font-size: 10px;
+}
+
+.brand-font-trigger {
+  min-width: 0;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 10px;
+  border: 1px solid #35383b;
+  border-radius: 6px;
+  color: #eee7dd;
+  background: #121416;
+  cursor: pointer;
+}
+
+.brand-font-trigger.open,
+.brand-font-trigger:hover {
+  border-color: #d29332;
+}
+
+.brand-font-trigger b {
+  overflow: hidden;
+  font-size: 14px;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.brand-font-trigger svg {
+  flex: 0 0 auto;
+  color: #9c958d;
+}
+
+.brand-font-popover {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  left: 0;
+  z-index: 20;
+  display: grid;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid #3c3f43;
+  border-radius: 8px;
+  background: #16181a;
+  box-shadow: 0 16px 34px rgb(0 0 0 / 52%);
+}
+
+.brand-font-popover.upwards {
+  top: auto;
+  bottom: calc(100% + 4px);
+}
+
+.brand-font-search {
+  height: 32px;
+  padding: 0 9px;
+  border: 1px solid #35383b;
+  border-radius: 6px;
+  outline: none;
+  color: #eee7dd;
+  background: #0f1113;
+  font-size: 11px;
+}
+
+.brand-font-search:focus {
+  border-color: #d29332;
+}
+
+.brand-font-options {
+  max-height: 232px;
+  display: grid;
+  gap: 2px;
+  overflow-y: auto;
+}
+
+.brand-font-option {
+  display: grid;
+  gap: 1px;
+  padding: 6px 8px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  color: #eee7dd;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.brand-font-option:hover {
+  background: #212427;
+}
+
+.brand-font-option.selected {
+  border-color: rgb(210 147 50 / 62%);
+  background: rgb(210 147 50 / 12%);
+}
+
+.brand-font-option > span {
+  overflow: hidden;
+  font-size: 17px;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.brand-font-option > small {
+  color: #8f8981;
+  font-size: 9px;
+}
+
+.brand-font-empty {
+  padding: 10px 4px;
+  color: #8f8981;
+  font-size: 11px;
+  text-align: center;
+}
+
+.brand-color-swatches {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.brand-swatch {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid rgb(255 255 255 / 22%);
+  border-radius: 50%;
+  cursor: pointer;
+  transition: transform 0.12s ease, box-shadow 0.12s ease;
+}
+
+.brand-swatch:hover {
+  transform: scale(1.12);
+}
+
+.brand-swatch.selected {
+  box-shadow: 0 0 0 2px #16181a, 0 0 0 4px #d29332;
 }
 
 .settings-screen .settings-library-path {
@@ -555,17 +990,53 @@ button:disabled {
   max-width: 100%;
 }
 
+/* Las cuatro acciones de la biblioteca: cuadrados en una sola fila, siempre
+   cuatro. El tope de ancho los mantiene en la escala del panel aunque la
+   tarjeta sea mas ancha; sin el, cada cuadrado se inflaria hasta 200 px de
+   lado, cinco veces la altura de cualquier otro control de esta pantalla. */
 .settings-action-list {
+  max-width: 480px;
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
 }
 
+/* Forma normal de las acciones del panel: una fila con el icono al lado del
+   texto. Solo los cuatro cuadrados de la lista de arriba se salen de aqui. */
 .settings-screen .settings-action {
   min-height: 42px;
   height: auto;
   margin: 0;
   padding: 8px 12px;
+  transition: border-color 0.14s ease, background-color 0.14s ease, transform 0.14s ease;
+}
+
+.settings-action-list .settings-action {
+  aspect-ratio: 1;
+  min-height: 0;
+  flex-direction: column;
+  justify-content: center;
+  gap: 10px;
+  padding: 10px 8px;
+  border-radius: 8px;
+  font-size: 11px;
+  line-height: 1.25;
+  text-align: center;
+  text-wrap: balance;
+}
+
+.settings-action-list .settings-action > svg {
+  flex: 0 0 auto;
+  opacity: 0.92;
+}
+
+.settings-action-list .settings-action:hover:not(:disabled) {
+  transform: translateY(-1px);
+}
+
+.settings-action-list .settings-action.secondary:hover:not(:disabled) {
+  border-color: #55585d;
+  background: #1b1e21;
 }
 
 .settings-action-list .update-status {
@@ -2628,7 +3099,7 @@ button:disabled {
   width: 100vw;
   height: 100vh;
   display: grid;
-  grid-template-rows: 76px 48px auto minmax(0, 1fr);
+  grid-template-rows: minmax(76px, auto) 48px auto minmax(0, 1fr);
   overflow: hidden;
   color: #eeeaff;
   background:
@@ -2676,11 +3147,15 @@ button:disabled {
   gap: 12px;
 }
 
+/* Mismo criterio que el encabezado principal: hueco fijo, imagen escalable, y
+   un margen interno derecho que aleja el logo del borde al agrandarlo. */
 .references-logo {
   width: 58px;
   height: 50px;
   flex: 0 0 58px;
   justify-content: center;
+  overflow: visible;
+  padding-right: 8px;
   border-right: 1px solid #443369;
   color: #bca8ff;
 }
@@ -2688,8 +3163,8 @@ button:disabled {
 .references-logo img {
   width: auto;
   height: auto;
-  max-width: 47px;
-  max-height: 44px;
+  max-width: min(calc(47px * var(--brand-logo-scale, 1)), 62px);
+  max-height: min(calc(44px * var(--brand-logo-scale, 1)), 66px);
   object-fit: contain;
 }
 
@@ -3976,12 +4451,70 @@ button:disabled {
   background-color: #f2f5f8;
 }
 
+:root[data-theme="light"] .brand-header-preview {
+  border-color: #cbd3dc;
+  background: #ffffff;
+}
+
+:root[data-theme="light"] .brand-logo-editor,
+:root[data-theme="light"] .brand-name-editor,
+:root[data-theme="light"] .brand-name-input,
+:root[data-theme="light"] .brand-font-row input[type="text"],
+:root[data-theme="light"] .brand-font-trigger,
+:root[data-theme="light"] .brand-font-search,
+:root[data-theme="light"] .brand-color-input {
+  border-color: #c8d0d9;
+  color: #26323f;
+  background: #f6f8fa;
+}
+
+:root[data-theme="light"] .brand-font-popover {
+  border-color: #c8d0d9;
+  background: #ffffff;
+  box-shadow: 0 16px 34px rgb(30 45 62 / 18%);
+}
+
+:root[data-theme="light"] .brand-font-option {
+  color: #26323f;
+}
+
+:root[data-theme="light"] .brand-font-option:hover {
+  background: #eef2f6;
+}
+
+:root[data-theme="light"] .brand-swatch {
+  border-color: rgb(38 50 63 / 22%);
+}
+
+:root[data-theme="light"] .brand-swatch.selected {
+  box-shadow: 0 0 0 2px #ffffff, 0 0 0 4px #d29332;
+}
+
+:root[data-theme="light"] .brand-control-heading strong,
+:root[data-theme="light"] .brand-editor-stage-label strong {
+  color: #293541;
+}
+
+:root[data-theme="light"] .brand-preview-tools span,
+:root[data-theme="light"] .brand-preview-actions span,
+:root[data-theme="light"] .brand-control-heading button,
+:root[data-theme="light"] .brand-font-row > button {
+  border-color: #bfc8d2;
+  color: #293541;
+  background: #f5f7f9;
+}
+
 :root[data-theme="light"] .settings-brand-actions button,
 :root[data-theme="light"] .settings-backup-actions button,
 :root[data-theme="light"] .settings-action.secondary {
   border-color: #bfc8d2;
   color: #293541;
   background: #f5f7f9;
+}
+
+:root[data-theme="light"] .settings-action-list .settings-action.secondary:hover:not(:disabled) {
+  border-color: #9fadbc;
+  background: #eaeef3;
 }
 
 :root[data-theme="light"] .theme-mode-option,
@@ -4445,7 +4978,7 @@ button:disabled {
 
 @media (max-width: 1280px) {
   .visual-header {
-    grid-template-columns: 82px minmax(0, 1fr) auto;
+    grid-template-columns: 82px auto minmax(0, 1fr) auto;
   }
 
   .brand-word {
@@ -4467,11 +5000,11 @@ button:disabled {
 
 @media (max-width: 940px) {
   .visual-shell {
-    grid-template-rows: 66px auto 1fr;
+    grid-template-rows: minmax(66px, auto) auto 1fr;
   }
 
   .visual-header {
-    grid-template-columns: auto 1fr auto;
+    grid-template-columns: auto auto minmax(0, 1fr) auto;
     padding: 8px 10px;
     gap: 8px;
   }
@@ -4483,11 +5016,12 @@ button:disabled {
   }
 
   .brand-logo {
-    max-width: 48px;
-    max-height: 42px;
+    max-width: min(calc(48px * var(--brand-logo-scale, 1)), 66px);
+    max-height: min(calc(42px * var(--brand-logo-scale, 1)), 58px);
   }
 
   .brand-word,
+  .header-brand-name,
   .quick-pills {
     display: none;
   }
