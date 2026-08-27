@@ -3,7 +3,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { watch } from "@tauri-apps/plugin-fs";
 import { relaunch } from "@tauri-apps/plugin-process";
-import { check, type DownloadEvent } from "@tauri-apps/plugin-updater";
+import { check, type DownloadEvent, type Update } from "@tauri-apps/plugin-updater";
 import {
   Check,
   BriefcaseBusiness,
@@ -24,6 +24,7 @@ import {
   Loader2,
   Maximize2,
   Minus,
+  Moon,
   MoreVertical,
   PanelLeftClose,
   PanelLeftOpen,
@@ -35,12 +36,13 @@ import {
   Settings,
   Shuffle,
   Sparkles,
+  Sun,
   Tags,
   Trash2,
   Upload,
   X,
 } from "lucide-react";
-import { memo, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { memo, useCallback, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   addTag,
@@ -129,6 +131,9 @@ const LEFT_PANEL_RESERVED_WIDTH = 640;
 const RANDOM_HISTORY_STORAGE_KEY = "roxwana-random-history";
 const REFERENCES_SIDEBAR_STORAGE_KEY = "roxwana-references-sidebar-open";
 const REFERENCE_VIEWER_STORAGE_KEY = "roxwana-reference-viewer";
+const THEME_STORAGE_KEY = "roxwana-theme";
+
+type AppTheme = "dark" | "light";
 
 function clampNumber(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
@@ -158,6 +163,15 @@ function getInitialReferenceViewer(): ReferenceViewerMode {
   return "full";
 }
 
+function getInitialTheme(): AppTheme {
+  try {
+    return window.localStorage.getItem(THEME_STORAGE_KEY) === "light" ? "light" : "dark";
+  } catch {
+    // Keep the original dark appearance when local storage is unavailable.
+  }
+  return "dark";
+}
+
 function getInitialLeftPanelWidth() {
   try {
     const stored = Number(window.localStorage.getItem(LEFT_PANEL_WIDTH_STORAGE_KEY));
@@ -175,7 +189,7 @@ const statusOptions: Array<{ value: DesignStatus; label: string }> = [
   { value: "discarded", label: "Descartar" },
 ];
 
-type UpdatePhase = "idle" | "checking" | "downloading" | "installing" | "none" | "done" | "error";
+type UpdatePhase = "idle" | "checking" | "available" | "downloading" | "installing" | "none" | "done" | "error";
 
 type AppUpdateState = {
   phase: UpdatePhase;
@@ -328,11 +342,13 @@ export default function App() {
   const [thumbMode, setThumbMode] = useState<"compact" | "grid" | "list">("compact");
   const [showIconLabels, setShowIconLabels] = useState(false);
   const [referenceViewer, setReferenceViewer] = useState<ReferenceViewerMode>(getInitialReferenceViewer);
+  const [theme, setTheme] = useState<AppTheme>(getInitialTheme);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [detailsById, setDetailsById] = useState<Record<string, Design>>({});
   const [pageIndex, setPageIndex] = useState(0);
   const [isChangingPage, setIsChangingPage] = useState(false);
   const [updateState, setUpdateState] = useState<AppUpdateState>(initialUpdateState);
+  const [availableUpdate, setAvailableUpdate] = useState<Update | null>(null);
   const [thumbnailPrep, setThumbnailPrep] = useState<ThumbnailPrepState>(initialThumbnailPrepState);
   const [previewPrep, setPreviewPrep] = useState<ThumbnailPrepState>(initialThumbnailPrepState);
   const [backupState, setBackupState] = useState<BackupState>(initialBackupState);
@@ -346,6 +362,27 @@ export default function App() {
   const suppressClickUntil = useRef(0);
   const holdCursorTimer = useRef(0);
   const deferredFilters = useDeferredValue(filters);
+
+  const changeTheme = useCallback((nextTheme: AppTheme) => {
+    document.documentElement.dataset.theme = nextTheme;
+    document.documentElement.style.colorScheme = nextTheme;
+    try {
+      window.localStorage.setItem(THEME_STORAGE_KEY, nextTheme);
+    } catch {
+      // The selected theme still applies for the current session.
+    }
+    setTheme(nextTheme);
+  }, []);
+
+  useLayoutEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    document.documentElement.style.colorScheme = theme;
+    try {
+      window.localStorage.setItem(THEME_STORAGE_KEY, theme);
+    } catch {
+      // The selected theme still applies for the current session.
+    }
+  }, [theme]);
 
   useEffect(() => {
     try {
@@ -721,7 +758,18 @@ export default function App() {
       defaultPath: library?.rootPath ?? DEFAULT_LIBRARY_PATH,
       title: "Elegir carpeta de estampas",
     });
-    if (typeof selected === "string") await runScan(selected);
+    if (typeof selected !== "string") return;
+
+    const currentPath = library?.rootPath ?? DEFAULT_LIBRARY_PATH;
+    const normalizePath = (path: string) => path.replace(/[\\/]+$/, "").toLocaleLowerCase();
+    if (
+      normalizePath(selected) !== normalizePath(currentPath)
+      && !window.confirm(`Vas a cambiar la biblioteca.\n\nActual:\n${currentPath}\n\nNueva:\n${selected}\n\n¿Continuar?`)
+    ) {
+      return;
+    }
+
+    await runScan(selected);
   };
 
   const saveBrandLogoPath = useCallback(async (selected: string) => {
@@ -1398,6 +1446,7 @@ export default function App() {
   const checkForUpdates = useCallback(async () => {
     if (["checking", "downloading", "installing"].includes(updateState.phase)) return;
 
+    setAvailableUpdate(null);
     setUpdateState({
       phase: "checking",
       message: "Buscando actualizacion...",
@@ -1415,49 +1464,12 @@ export default function App() {
         return;
       }
 
-      let downloaded = 0;
-      let contentLength = 0;
+      setAvailableUpdate(update);
       setUpdateState({
-        phase: "downloading",
-        message: `Descargando version ${update.version}...`,
-        progress: 0,
+        phase: "available",
+        message: `Nueva actualizacion encontrada: ROXWANA v${update.version}.`,
+        progress: null,
       });
-
-      await update.downloadAndInstall((event: DownloadEvent) => {
-        if (event.event === "Started") {
-          contentLength = event.data.contentLength ?? 0;
-          downloaded = 0;
-          setUpdateState({
-            phase: "downloading",
-            message: `Descargando version ${update.version}...`,
-            progress: contentLength > 0 ? 0 : null,
-          });
-        }
-
-        if (event.event === "Progress") {
-          downloaded += event.data.chunkLength;
-          setUpdateState({
-            phase: "downloading",
-            message: `Descargando version ${update.version}...`,
-            progress: contentLength > 0 ? Math.min(99, Math.round((downloaded / contentLength) * 100)) : null,
-          });
-        }
-
-        if (event.event === "Finished") {
-          setUpdateState({
-            phase: "installing",
-            message: "Instalando actualizacion...",
-            progress: 100,
-          });
-        }
-      });
-
-      setUpdateState({
-        phase: "done",
-        message: "Actualizacion instalada. Reiniciando...",
-        progress: 100,
-      });
-      await relaunch();
     } catch (updateError) {
       const message = String(updateError);
       if (message.includes("valid release JSON") || message.includes("latest.json") || message.includes("404")) {
@@ -1471,11 +1483,68 @@ export default function App() {
 
       setUpdateState({
         phase: "error",
-        message: `No se pudo actualizar: ${message}`,
+        message: `No se pudo buscar la actualizacion: ${message}`,
         progress: null,
       });
     }
   }, [updateState.phase]);
+
+  const installAvailableUpdate = useCallback(async () => {
+    if (!availableUpdate || ["checking", "downloading", "installing"].includes(updateState.phase)) return;
+
+    try {
+      let downloaded = 0;
+      let contentLength = 0;
+      setUpdateState({
+        phase: "downloading",
+        message: `Descargando ROXWANA v${availableUpdate.version}...`,
+        progress: 0,
+      });
+
+      await availableUpdate.downloadAndInstall((event: DownloadEvent) => {
+        if (event.event === "Started") {
+          contentLength = event.data.contentLength ?? 0;
+          downloaded = 0;
+          setUpdateState({
+            phase: "downloading",
+            message: `Descargando ROXWANA v${availableUpdate.version}...`,
+            progress: contentLength > 0 ? 0 : null,
+          });
+        }
+
+        if (event.event === "Progress") {
+          downloaded += event.data.chunkLength;
+          setUpdateState({
+            phase: "downloading",
+            message: `Descargando ROXWANA v${availableUpdate.version}...`,
+            progress: contentLength > 0 ? Math.min(99, Math.round((downloaded / contentLength) * 100)) : null,
+          });
+        }
+
+        if (event.event === "Finished") {
+          setUpdateState({
+            phase: "installing",
+            message: "Instalando actualizacion...",
+            progress: 100,
+          });
+        }
+      });
+
+      setAvailableUpdate(null);
+      setUpdateState({
+        phase: "done",
+        message: "Actualizacion instalada. Reiniciando...",
+        progress: 100,
+      });
+      await relaunch();
+    } catch (updateError) {
+      setUpdateState({
+        phase: "error",
+        message: `No se pudo instalar la actualizacion: ${String(updateError)}`,
+        progress: null,
+      });
+    }
+  }, [availableUpdate, updateState.phase]);
 
   const goToOffset = (offset: number) => {
     if (filteredDesigns.length === 0) return;
@@ -1568,7 +1637,9 @@ export default function App() {
           onChooseFolder={chooseFolder}
           onRunScan={() => runScan()}
           updateState={updateState}
+          availableUpdateVersion={availableUpdate?.version ?? null}
           onCheckForUpdates={checkForUpdates}
+          onInstallUpdate={installAvailableUpdate}
           thumbnailPrep={thumbnailPrep}
           onPrepareThumbnails={prepareThumbnails}
           previewPrep={previewPrep}
@@ -1579,6 +1650,8 @@ export default function App() {
           onRestoreBackup={restoreBackupCopy}
           referenceViewer={referenceViewer}
           onChangeReferenceViewer={setReferenceViewer}
+          theme={theme}
+          onChangeTheme={changeTheme}
           error={error}
           onDismissError={() => setError(null)}
           onBack={() => setSettingsOpen(false)}
@@ -1604,9 +1677,9 @@ export default function App() {
     <main className="visual-shell">
       <Header
         brandLogo={brandLogo}
+        libraryPath={library?.rootPath ?? DEFAULT_LIBRARY_PATH}
         setFilters={setFilters}
         loading={loading || scanning}
-        onChooseFolder={chooseFolder}
         onRunScan={() => runScan()}
         onRandomDesign={chooseRandom}
         randomProgress={randomProgress}
@@ -2588,9 +2661,9 @@ function ReferenceWindow({
 
 function Header({
   brandLogo,
+  libraryPath,
   setFilters,
   loading,
-  onChooseFolder,
   onRunScan,
   onRandomDesign,
   randomProgress,
@@ -2602,9 +2675,9 @@ function Header({
   setUiScale,
 }: {
   brandLogo: BrandLogo | null;
+  libraryPath: string;
   setFilters: React.Dispatch<React.SetStateAction<Filters>>;
   loading: boolean;
-  onChooseFolder: () => void;
   onRunScan: () => void;
   onRandomDesign: () => void;
   randomProgress: RandomProgress;
@@ -2619,7 +2692,9 @@ function Header({
   // arrastra solo se mueve este borrador y el zoom se aplica al soltar.
   const [scaleDraft, setScaleDraft] = useState<number | null>(null);
   const [interfaceOpen, setInterfaceOpen] = useState(false);
+  const [libraryOpen, setLibraryOpen] = useState(false);
   const interfaceMenuRef = useRef<HTMLDivElement>(null);
+  const libraryMenuRef = useRef<HTMLDivElement>(null);
   const scaleValue = scaleDraft ?? uiScale;
 
   const commitScale = useCallback(() => {
@@ -2655,6 +2730,22 @@ function Header({
     };
   }, [interfaceOpen]);
 
+  useEffect(() => {
+    if (!libraryOpen) return;
+    const closeLibraryMenu = (event: PointerEvent) => {
+      if (!libraryMenuRef.current?.contains(event.target as Node)) setLibraryOpen(false);
+    };
+    const closeWithEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setLibraryOpen(false);
+    };
+    window.addEventListener("pointerdown", closeLibraryMenu);
+    window.addEventListener("keydown", closeWithEscape);
+    return () => {
+      window.removeEventListener("pointerdown", closeLibraryMenu);
+      window.removeEventListener("keydown", closeWithEscape);
+    };
+  }, [libraryOpen]);
+
   const applyScale = (scale: number) => {
     setScaleDraft(null);
     setUiScale(scale);
@@ -2679,10 +2770,6 @@ function Header({
       </section>
 
       <section className="window-actions">
-        <button className="action-button" onClick={onChooseFolder} title="Cambiar biblioteca de estampas">
-          <FolderOpen size={17} />
-          <span>Elegir biblioteca</span>
-        </button>
         <button className="action-button rescan-action" onClick={onRunScan} title="Rescanear la biblioteca">
           <RefreshCw size={18} className={loading ? "spin" : ""} />
           <span>Rescaneo</span>
@@ -2707,7 +2794,10 @@ function Header({
           <button
             type="button"
             className={interfaceOpen ? "interface-trigger active" : "interface-trigger"}
-            onClick={() => setInterfaceOpen((open) => !open)}
+            onClick={() => {
+              setLibraryOpen(false);
+              setInterfaceOpen((open) => !open);
+            }}
             aria-expanded={interfaceOpen}
           >
             Interfaz
@@ -2786,6 +2876,28 @@ function Header({
             </div>
           )}
         </div>
+        <div ref={libraryMenuRef} className="library-menu">
+          <button
+            type="button"
+            className={libraryOpen ? "library-trigger active" : "library-trigger"}
+            onClick={() => {
+              setInterfaceOpen(false);
+              setLibraryOpen((open) => !open);
+            }}
+            aria-expanded={libraryOpen}
+            aria-controls="current-library-popover"
+          >
+            <FolderOpen size={15} />
+            <span>Biblioteca actual</span>
+            <ChevronDown size={14} className={libraryOpen ? "open" : ""} />
+          </button>
+          {libraryOpen && (
+            <div id="current-library-popover" className="library-popover">
+              <small>Ubicacion de la biblioteca</small>
+              <strong title={libraryPath}>{libraryPath}</strong>
+            </div>
+          )}
+        </div>
         <button className="action-button references-entry" onClick={onOpenReferences} title="Abrir el muro de referencias">
           <Sparkles size={17} />
           <span>Referencias</span>
@@ -2811,7 +2923,9 @@ function SettingsScreen({
   onChooseFolder,
   onRunScan,
   updateState,
+  availableUpdateVersion,
   onCheckForUpdates,
+  onInstallUpdate,
   thumbnailPrep,
   onPrepareThumbnails,
   previewPrep,
@@ -2822,6 +2936,8 @@ function SettingsScreen({
   onRestoreBackup,
   referenceViewer,
   onChangeReferenceViewer,
+  theme,
+  onChangeTheme,
   error,
   onDismissError,
   onBack,
@@ -2836,7 +2952,9 @@ function SettingsScreen({
   onChooseFolder: () => void;
   onRunScan: () => void;
   updateState: AppUpdateState;
+  availableUpdateVersion: string | null;
   onCheckForUpdates: () => void;
+  onInstallUpdate: () => void;
   thumbnailPrep: ThumbnailPrepState;
   onPrepareThumbnails: () => void;
   previewPrep: ThumbnailPrepState;
@@ -2847,6 +2965,8 @@ function SettingsScreen({
   onRestoreBackup: () => void;
   referenceViewer: ReferenceViewerMode;
   onChangeReferenceViewer: (mode: ReferenceViewerMode) => void;
+  theme: AppTheme;
+  onChangeTheme: (theme: AppTheme) => void;
   error: string | null;
   onDismissError: () => void;
   onBack: () => void;
@@ -2948,6 +3068,64 @@ function SettingsScreen({
 
       <div className="settings-screen-scroll">
         <div className="settings-grid">
+          <section className="settings-card library-settings-card">
+            <div className="settings-card-header">
+              <FolderOpen size={19} />
+              <div>
+                <h2>Biblioteca y rendimiento</h2>
+                <p>Consulta la ubicacion actual o cambia la carpeta principal.</p>
+              </div>
+            </div>
+            <div className="settings-library-path">
+              <small>Biblioteca actual</small>
+              <strong title={library?.rootPath ?? DEFAULT_LIBRARY_PATH}>{library?.rootPath ?? DEFAULT_LIBRARY_PATH}</strong>
+            </div>
+            <div className="settings-action-list">
+              <button className="settings-action" onClick={onChooseFolder} disabled={loading}>
+                <FolderOpen size={16} />
+                <span>Cambiar biblioteca</span>
+              </button>
+              <button className="settings-action secondary" onClick={onRunScan} disabled={loading}>
+                <RefreshCw size={16} className={loading ? "spin" : ""} />
+                <span>Escanear biblioteca</span>
+              </button>
+              <button className="settings-action secondary" onClick={onPrepareThumbnails} disabled={thumbnailBusy || !library}>
+                {thumbnailBusy ? <Loader2 size={16} className="spin" /> : <FileImage size={16} />}
+                <span>{thumbnailBusy ? "Preparando..." : "Preparar miniaturas"}</span>
+              </button>
+              {thumbnailPrep.message && (
+                <div className={`update-status ${thumbnailPrep.phase}`} aria-live="polite">
+                  <span>{thumbnailPrep.message}</span>
+                  {thumbnailPrep.total > 0 && (
+                    <>
+                      <small>{thumbnailPrep.done.toLocaleString("es-AR")} de {thumbnailPrep.total.toLocaleString("es-AR")}</small>
+                      <div className="update-progress" aria-label={`Progreso ${thumbnailProgress ?? 0}%`}>
+                        <span style={{ width: `${thumbnailProgress ?? 0}%` }} />
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
+              <button className="settings-action secondary" onClick={onPreparePreviews} disabled={previewBusy || !library}>
+                {previewBusy ? <Loader2 size={16} className="spin" /> : <Maximize2 size={16} />}
+                <span>{previewBusy ? "Optimizando visor..." : "Optimizar visor"}</span>
+              </button>
+              {previewPrep.message && (
+                <div className={`update-status ${previewPrep.phase}`} aria-live="polite">
+                  <span>{previewPrep.message}</span>
+                  {previewPrep.total > 0 && (
+                    <>
+                      <small>{previewPrep.done.toLocaleString("es-AR")} de {previewPrep.total.toLocaleString("es-AR")}</small>
+                      <div className="update-progress" aria-label={`Progreso ${previewProgress ?? 0}%`}>
+                        <span style={{ width: `${previewProgress ?? 0}%` }} />
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
+            </div>
+          </section>
+
           <section className="settings-card">
             <div className="settings-card-header">
               <FileImage size={19} />
@@ -2995,14 +3173,42 @@ function SettingsScreen({
             </div>
           </section>
 
-          <section className="settings-card">
+          <section className="settings-card appearance-settings-card">
             <div className="settings-card-header">
-              <Maximize2 size={19} />
+              <Sun size={19} />
               <div>
-                <h2>Visor de referencias</h2>
-                <p>Como se abre una referencia al hacerle clic.</p>
+                <h2>Apariencia</h2>
+                <p>Colores de la aplicacion y apertura de referencias.</p>
               </div>
             </div>
+            <div className="settings-section-label">Tema de la aplicacion</div>
+            <div className="theme-mode-options" role="group" aria-label="Tema de la aplicacion">
+              <button
+                type="button"
+                className={theme === "dark" ? "theme-mode-option active" : "theme-mode-option"}
+                onClick={() => onChangeTheme("dark")}
+                aria-pressed={theme === "dark"}
+              >
+                <Moon size={18} />
+                <span>
+                  <strong>Oscuro</strong>
+                  <small>Fondo negro y paneles oscuros.</small>
+                </span>
+              </button>
+              <button
+                type="button"
+                className={theme === "light" ? "theme-mode-option active" : "theme-mode-option"}
+                onClick={() => onChangeTheme("light")}
+                aria-pressed={theme === "light"}
+              >
+                <Sun size={18} />
+                <span>
+                  <strong>Claro</strong>
+                  <small>Fondo blanco y texto oscuro.</small>
+                </span>
+              </button>
+            </div>
+            <div className="settings-section-label">Visor de referencias</div>
             <div className="viewer-mode-options">
               {([
                 {
@@ -3030,64 +3236,6 @@ function SettingsScreen({
               ))}
             </div>
             <small className="viewer-mode-note">En los dos casos cerras con Escape y pasas de una a otra con las flechas del teclado.</small>
-          </section>
-
-          <section className="settings-card">
-            <div className="settings-card-header">
-              <FolderOpen size={19} />
-              <div>
-                <h2>Biblioteca y rendimiento</h2>
-                <p>Ubicacion de las estampas y caches visuales.</p>
-              </div>
-            </div>
-            <div className="settings-library-path">
-              <small>Biblioteca actual</small>
-              <strong title={library?.rootPath ?? DEFAULT_LIBRARY_PATH}>{library?.rootPath ?? DEFAULT_LIBRARY_PATH}</strong>
-            </div>
-            <div className="settings-action-list">
-              <button className="settings-action secondary" onClick={onChooseFolder} disabled={loading}>
-                <FolderOpen size={16} />
-                <span>Cambiar biblioteca</span>
-              </button>
-              <button className="settings-action" onClick={onRunScan} disabled={loading}>
-                <RefreshCw size={16} className={loading ? "spin" : ""} />
-                <span>Escanear biblioteca</span>
-              </button>
-              <button className="settings-action secondary" onClick={onPrepareThumbnails} disabled={thumbnailBusy || !library}>
-                {thumbnailBusy ? <Loader2 size={16} className="spin" /> : <FileImage size={16} />}
-                <span>{thumbnailBusy ? "Preparando..." : "Preparar miniaturas"}</span>
-              </button>
-              {thumbnailPrep.message && (
-                <div className={`update-status ${thumbnailPrep.phase}`} aria-live="polite">
-                  <span>{thumbnailPrep.message}</span>
-                  {thumbnailPrep.total > 0 && (
-                    <>
-                      <small>{thumbnailPrep.done.toLocaleString("es-AR")} de {thumbnailPrep.total.toLocaleString("es-AR")}</small>
-                      <div className="update-progress" aria-label={`Progreso ${thumbnailProgress ?? 0}%`}>
-                        <span style={{ width: `${thumbnailProgress ?? 0}%` }} />
-                      </div>
-                    </>
-                  )}
-                </div>
-              )}
-              <button className="settings-action secondary" onClick={onPreparePreviews} disabled={previewBusy || !library}>
-                {previewBusy ? <Loader2 size={16} className="spin" /> : <Maximize2 size={16} />}
-                <span>{previewBusy ? "Optimizando visor..." : "Optimizar visor"}</span>
-              </button>
-              {previewPrep.message && (
-                <div className={`update-status ${previewPrep.phase}`} aria-live="polite">
-                  <span>{previewPrep.message}</span>
-                  {previewPrep.total > 0 && (
-                    <>
-                      <small>{previewPrep.done.toLocaleString("es-AR")} de {previewPrep.total.toLocaleString("es-AR")}</small>
-                      <div className="update-progress" aria-label={`Progreso ${previewProgress ?? 0}%`}>
-                        <span style={{ width: `${previewProgress ?? 0}%` }} />
-                      </div>
-                    </>
-                  )}
-                </div>
-              )}
-            </div>
           </section>
 
           <section className="settings-card">
@@ -3124,24 +3272,47 @@ function SettingsScreen({
                 </div>
               )}
             </div>
-            <button className="settings-action secondary" onClick={onCheckForUpdates} disabled={updateBusy}>
-              {updateState.phase === "done" || updateState.phase === "none" ? (
-                <Check size={16} />
-              ) : (
-                <RefreshCw size={16} className={updateBusy ? "spin" : ""} />
-              )}
-              <span>{updateBusy ? "Actualizando..." : "Buscar actualizacion"}</span>
-            </button>
-            {updateState.message && (
-              <div className={`update-status ${updateState.phase}`} aria-live="polite">
-                <span>{updateState.message}</span>
-                {updateState.progress !== null && (
-                  <div className="update-progress" aria-label={`Progreso ${updateState.progress}%`}>
-                    <span style={{ width: `${updateState.progress}%` }} />
-                  </div>
+            <div className="settings-update">
+              <div className="settings-section-label">Actualizaciones</div>
+              <button
+                className="settings-action secondary"
+                onClick={onCheckForUpdates}
+                disabled={updateBusy || availableUpdateVersion !== null}
+              >
+                {updateState.phase === "none" || updateState.phase === "done" ? (
+                  <Check size={16} />
+                ) : (
+                  <RefreshCw size={16} className={updateState.phase === "checking" ? "spin" : ""} />
                 )}
-              </div>
-            )}
+                <span>{updateState.phase === "checking" ? "Buscando..." : "Buscar actualizacion"}</span>
+              </button>
+              {availableUpdateVersion && (
+                <div className="update-available">
+                  <div>
+                    <small>Nueva version disponible</small>
+                    <strong>ROXWANA v{availableUpdateVersion}</strong>
+                  </div>
+                  <button className="settings-action" onClick={onInstallUpdate} disabled={updateBusy}>
+                    {updateState.phase === "downloading" || updateState.phase === "installing" ? (
+                      <Loader2 size={16} className="spin" />
+                    ) : (
+                      <RefreshCw size={16} />
+                    )}
+                    <span>{updateBusy ? "Actualizando..." : "Actualizar ahora"}</span>
+                  </button>
+                </div>
+              )}
+              {updateState.message && (
+                <div className={`update-status ${updateState.phase}`} aria-live="polite">
+                  <span>{updateState.message}</span>
+                  {updateState.progress !== null && (
+                    <div className="update-progress" aria-label={`Progreso ${updateState.progress}%`}>
+                      <span style={{ width: `${updateState.progress}%` }} />
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
           </section>
 
         </div>
