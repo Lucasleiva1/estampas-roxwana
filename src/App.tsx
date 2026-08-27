@@ -5,6 +5,7 @@ import { watch } from "@tauri-apps/plugin-fs";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type DownloadEvent, type Update } from "@tauri-apps/plugin-updater";
 import {
+  ArrowRight,
   Check,
   BriefcaseBusiness,
   ChevronDown,
@@ -18,6 +19,7 @@ import {
   FolderPlus,
   Grid2X2,
   Heart,
+  Image as ImageIcon,
   ImageOff,
   LayoutGrid,
   List,
@@ -117,7 +119,6 @@ import type { Design, DesignStatus, Filters, LibraryResponse, ReferenceItem, Ref
 import illustratorIcon from "./assets/illustrator.png";
 import photoshopIcon from "./assets/photoshop.png";
 
-const DEFAULT_LIBRARY_PATH = "C:\\Users\\jaell\\Documents\\estampas-roxwana";
 const PAGE_SIZE = 50;
 const supportFilters = [".png", ".jpg", ".ai", ".psd", ".eps", ".txt"];
 const defaultZoom = 100;
@@ -136,6 +137,7 @@ const REFERENCES_SIDEBAR_STORAGE_KEY = "roxwana-references-sidebar-open";
 const REFERENCE_VIEWER_STORAGE_KEY = "roxwana-reference-viewer";
 const THEME_STORAGE_KEY = "roxwana-theme";
 const BRAND_PRESENTATION_STORAGE_KEY = "roxwana-brand-presentation";
+const WELCOME_DISMISSED_STORAGE_KEY = "roxwana-welcome-dismissed";
 const SYSTEM_FONT_FALLBACKS = [
   "Arial",
   "Arial Black",
@@ -433,6 +435,14 @@ function writeRandomHistory(rootPath: string, usedIds: string[]) {
   }
 }
 
+function getInitialWelcomeDismissed() {
+  try {
+    return window.localStorage.getItem(WELCOME_DISMISSED_STORAGE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
 export default function App() {
   const [appMode, setAppMode] = useState<"library" | "references">("library");
   const [library, setLibrary] = useState<LibraryResponse | null>(null);
@@ -455,6 +465,7 @@ export default function App() {
   const [theme, setTheme] = useState<AppTheme>(getInitialTheme);
   const [brandPresentation, setBrandPresentation] = useState<BrandPresentation>(getInitialBrandPresentation);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [welcomeDismissed, setWelcomeDismissed] = useState(getInitialWelcomeDismissed);
   const [detailsById, setDetailsById] = useState<Record<string, Design>>({});
   const [pageIndex, setPageIndex] = useState(0);
   const [isChangingPage, setIsChangingPage] = useState(false);
@@ -597,7 +608,8 @@ export default function App() {
   }, []);
 
   const runScan = useCallback(
-    async (rootPath = library?.rootPath ?? DEFAULT_LIBRARY_PATH) => {
+    async (rootPath = library?.rootPath ?? "") => {
+      if (!rootPath) return;
       setScanning(true);
       setError(null);
       try {
@@ -633,7 +645,8 @@ export default function App() {
 
   const refreshReferences = useCallback(
     async (manual = false) => {
-      const rootPath = library?.rootPath ?? DEFAULT_LIBRARY_PATH;
+      const rootPath = library?.rootPath ?? "";
+      if (!rootPath) return;
       if (manual) setReferencesScanning(true);
       setReferencesError(null);
       try {
@@ -873,7 +886,7 @@ export default function App() {
         else stopWatching = stop;
       })
       .catch((watchError) => {
-        if (!disposed) setError(`No pude vigilar la carpeta de estampas: ${String(watchError)}`);
+        if (!disposed) setError(`No pude vigilar la carpeta de imagenes: ${String(watchError)}`);
       });
 
     return () => {
@@ -989,15 +1002,16 @@ export default function App() {
     const selected = await openDialog({
       directory: true,
       multiple: false,
-      defaultPath: library?.rootPath ?? DEFAULT_LIBRARY_PATH,
-      title: "Elegir carpeta de estampas",
+      defaultPath: library?.rootPath || undefined,
+      title: "Elegir carpeta de imagenes",
     });
     if (typeof selected !== "string") return;
 
-    const currentPath = library?.rootPath ?? DEFAULT_LIBRARY_PATH;
+    const currentPath = library?.rootPath ?? "";
     const normalizePath = (path: string) => path.replace(/[\\/]+$/, "").toLocaleLowerCase();
     if (
-      normalizePath(selected) !== normalizePath(currentPath)
+      currentPath
+      && normalizePath(selected) !== normalizePath(currentPath)
       && !window.confirm(`Vas a cambiar la biblioteca.\n\nActual:\n${currentPath}\n\nNueva:\n${selected}\n\n¿Continuar?`)
     ) {
       return;
@@ -1005,6 +1019,15 @@ export default function App() {
 
     await runScan(selected);
   };
+
+  const continueWithoutFolder = useCallback(() => {
+    try {
+      window.localStorage.setItem(WELCOME_DISMISSED_STORAGE_KEY, "1");
+    } catch {
+      // La decision sigue aplicada durante esta sesion.
+    }
+    setWelcomeDismissed(true);
+  }, []);
 
   const saveBrandLogoPath = useCallback(async (selected: string) => {
     setBrandLogoState({ phase: "saving", message: "Preparando y guardando el logo..." });
@@ -1455,7 +1478,7 @@ export default function App() {
 
   const chooseRandom = useCallback(() => {
     if (!library || randomDesigns.length === 0) {
-      setError("No hay estampas con imagen para elegir al azar.");
+      setError("No hay imagenes para elegir al azar.");
       return;
     }
 
@@ -1635,7 +1658,7 @@ export default function App() {
     const previous = pendingBaseline.current;
     pendingBaseline.current = pending;
     if (pending === 0) return;
-    // Arranca en la primera carga y cada vez que aparecen estampas nuevas sin
+    // Arranca en la primera carga y cada vez que aparecen imagenes nuevas sin
     // miniatura (por ejemplo despues de un rescaneo). Comparar contra la marca
     // anterior evita reintentar en bucle los archivos que no se pueden convertir.
     if (previous !== null && pending <= previous) return;
@@ -1849,13 +1872,26 @@ export default function App() {
       setFilters(createDefaultFilters());
       setBackupState({
         phase: "loaded",
-        message: `Copia cargada: ${response.categories.length.toLocaleString("es-AR")} categorias y ${response.designs.length.toLocaleString("es-AR")} estampas.`,
+        message: `Copia cargada: ${response.categories.length.toLocaleString("es-AR")} categorias y ${response.designs.length.toLocaleString("es-AR")} imagenes.`,
         path: selected,
       });
     } catch (backupError) {
       setBackupState({ phase: "error", message: `No se pudo cargar: ${String(backupError)}`, path: selected });
     }
   }, [applyLibrary]);
+
+  // Instalacion nueva: todavia no se eligio ninguna carpeta de imagenes. Sin
+  // esto la aplicacion abriria vacia y sin decir que hacer.
+  if (!loading && !library?.rootPath && !welcomeDismissed) {
+    return (
+      <WelcomeScreen
+        onChooseFolder={chooseFolder}
+        onContinueWithoutFolder={continueWithoutFolder}
+        error={error}
+        onDismissError={() => setError(null)}
+      />
+    );
+  }
 
   if (settingsOpen) {
     return (
@@ -1899,7 +1935,7 @@ export default function App() {
   if (appMode === "references") {
     return (
       <ReferencesScreen
-        rootPath={library?.rootPath ?? DEFAULT_LIBRARY_PATH}
+        rootPath={library?.rootPath ?? ""}
         brandLogo={brandLogo}
         brandPresentation={brandPresentation}
         data={referencesData}
@@ -1922,7 +1958,7 @@ export default function App() {
       <Header
         brandLogo={brandLogo}
         brandPresentation={brandPresentation}
-        libraryPath={library?.rootPath ?? DEFAULT_LIBRARY_PATH}
+        libraryPath={library?.rootPath ?? ""}
         setFilters={setFilters}
         loading={loading || scanning}
         onRunScan={() => runScan()}
@@ -2028,7 +2064,7 @@ export default function App() {
           {pointerDrag.kind === "group" ? <FolderPlus size={15} /> : null}
           <span>
             {pointerDrag.kind === "design"
-              ? library?.designs.find((design) => design.id === pointerDrag.id)?.name ?? "Estampa"
+              ? library?.designs.find((design) => design.id === pointerDrag.id)?.name ?? "Imagen"
               : pointerDrag.id}
           </span>
         </div>
@@ -3000,7 +3036,7 @@ function Header({
           className="icon-only random-action"
           onClick={onRandomDesign}
           disabled={randomProgress.total === 0}
-          title={`Elegir una estampa al azar sin repetir. Quedan ${randomRemaining.toLocaleString("es-AR")} de ${randomProgress.total.toLocaleString("es-AR")}.`}
+          title={`Elegir una imagen al azar sin repetir. Quedan ${randomRemaining.toLocaleString("es-AR")} de ${randomProgress.total.toLocaleString("es-AR")}.`}
         >
           <Shuffle size={15} />
         </button>
@@ -3136,6 +3172,58 @@ function Header({
         </div>
       </section>
     </header>
+  );
+}
+
+/// Primera pantalla de una instalacion nueva. Explica que va a pasar antes de
+/// abrir el explorador, porque elegir la carpeta crea contenido adentro.
+function WelcomeScreen({
+  onChooseFolder,
+  onContinueWithoutFolder,
+  error,
+  onDismissError,
+}: {
+  onChooseFolder: () => void;
+  onContinueWithoutFolder: () => void;
+  error: string | null;
+  onDismissError: () => void;
+}) {
+  return (
+    <main className="welcome-shell">
+      <section className="welcome-card">
+        <div className="welcome-mark">
+          <ImageIcon className="welcome-mark-image" size={42} strokeWidth={1.55} />
+          <Sparkles className="welcome-mark-sparkle" size={21} strokeWidth={1.8} />
+        </div>
+        <h1>Biblioteca de imágenes</h1>
+        <p className="welcome-lead">Elegí cómo querés empezar.</p>
+        <div className="welcome-notice">
+          <strong>Antes de continuar</strong>
+          <p>
+            Al elegir una carpeta para tu biblioteca, dentro de ella se crearán cuatro carpetas:
+            Categorías, Trabajos, Referencias y Varios. Tus archivos actuales no se modifican.
+          </p>
+          <p>
+            Si continuás sin carpeta, podés entrar igual. Para mostrar tus imágenes, después tendrás
+            que elegir una desde Configuración.
+          </p>
+        </div>
+        <button type="button" className="welcome-action" onClick={onChooseFolder}>
+          <FolderOpen size={18} />
+          <span>Elegir carpeta y empezar</span>
+        </button>
+        <button type="button" className="welcome-action welcome-action-secondary" onClick={onContinueWithoutFolder}>
+          <span>Continuar sin carpeta</span>
+          <ArrowRight size={18} />
+        </button>
+        {error && (
+          <div className="welcome-error" role="alert">
+            <span>{error}</span>
+            <button type="button" onClick={onDismissError}>Entendido</button>
+          </div>
+        )}
+      </section>
+    </main>
   );
 }
 
@@ -3392,7 +3480,7 @@ function SettingsScreen({
             </div>
             <div className="settings-library-path">
               <small>Biblioteca actual</small>
-              <strong title={library?.rootPath ?? DEFAULT_LIBRARY_PATH}>{library?.rootPath ?? DEFAULT_LIBRARY_PATH}</strong>
+              <strong title={library?.rootPath || "Sin carpeta elegida"}>{library?.rootPath || "Sin carpeta elegida"}</strong>
             </div>
             {/* Los cuatro botones van juntos en una sola fila de cuadrados. Los
                 avisos de progreso quedan debajo, fuera de la fila, para no
@@ -3454,7 +3542,7 @@ function SettingsScreen({
             <div className="settings-backup">
               <div className="settings-section-label">Copia de seguridad</div>
               <small>
-                Preferencias automáticas: versión actual y dos anteriores dentro de {(library?.rootPath ?? DEFAULT_LIBRARY_PATH).replace(/[\\/]+$/, "")}\Preferences
+                Preferencias automáticas: versión actual y dos anteriores dentro de {(library?.rootPath ?? "").replace(/[\\/]+$/, "")}\Preferences
               </small>
               <div className="settings-backup-actions">
                 <button type="button" onClick={onSaveBackup} disabled={backupBusy} title="Guardar copia de seguridad">
@@ -4013,16 +4101,16 @@ function LeftFilters({
   const deleteExplanation = (node: SidebarDragSource) => {
     if (node.kind === "group") {
       const inside = sidebar.find((item) => item.kind === "group" && sameCategory(item.name, node.name))?.children ?? [];
-      if (inside.length === 0) return "El grupo esta vacio. No se borra ninguna categoria ni ninguna estampa.";
+      if (inside.length === 0) return "El grupo esta vacio. No se borra ninguna categoria ni ninguna imagen.";
       return inside.length === 1
-        ? "La categoria que tiene adentro vuelve al panel. No se borra ninguna categoria ni ninguna estampa."
-        : `Las ${inside.length.toLocaleString("es-AR")} categorias que tiene adentro vuelven al panel. No se borra ninguna categoria ni ninguna estampa.`;
+        ? "La categoria que tiene adentro vuelve al panel. No se borra ninguna categoria ni ninguna imagen."
+        : `Las ${inside.length.toLocaleString("es-AR")} categorias que tiene adentro vuelven al panel. No se borra ninguna categoria ni ninguna imagen.`;
     }
     const count = categoryCounts.get(node.name) ?? 0;
     if (count === 0) return "La categoria esta vacia. No se borra ningun archivo.";
     return count === 1
-      ? "La estampa que tiene queda sin categoria. No se borra ningun archivo."
-      : `Las ${count.toLocaleString("es-AR")} estampas que tiene quedan sin categoria. No se borra ningun archivo.`;
+      ? "La imagen que tiene queda sin categoria. No se borra ningun archivo."
+      : `Las ${count.toLocaleString("es-AR")} imagenes que tiene quedan sin categoria. No se borra ningun archivo.`;
   };
 
   const dropsOn = (kind: SidebarNodeKind, name: string) =>
@@ -4068,7 +4156,7 @@ function LeftFilters({
               }}
             >
               <span className="filter-name">
-                <span className="category-count" aria-label={`${(categoryCounts.get(category) ?? 0).toLocaleString("es-AR")} estampas`}>
+                <span className="category-count" aria-label={`${(categoryCounts.get(category) ?? 0).toLocaleString("es-AR")} imagenes`}>
                   {(categoryCounts.get(category) ?? 0).toLocaleString("es-AR")}
                 </span>
                 <span className="category-label">{category}</span>
@@ -4137,7 +4225,7 @@ function LeftFilters({
               >
                 <span className="filter-name">
                   {group.collapsed ? <ChevronRight size={15} /> : <ChevronDown size={15} />}
-                  <span className="category-count" aria-label={`${total.toLocaleString("es-AR")} estampas`}>
+                  <span className="category-count" aria-label={`${total.toLocaleString("es-AR")} imagenes`}>
                     {total.toLocaleString("es-AR")}
                   </span>
                   <span className="category-label">{group.name}</span>
@@ -4230,7 +4318,7 @@ function LeftFilters({
         <button
           className={filters.favoritesOnly ? "filter-row favorites-row active" : "filter-row favorites-row"}
           onClick={onFavoritesFilter}
-          title="Ver todas mis estampas favoritas"
+          title="Ver todas mis imagenes favoritas"
         >
           <span className="filter-name">
             <Heart size={17} fill={filters.favoritesOnly ? "currentColor" : "none"} />
@@ -4241,11 +4329,11 @@ function LeftFilters({
         <button
           className={!filters.favoritesOnly && filters.categories.length === 0 ? "filter-row active" : "filter-row"}
           onClick={onClear}
-          title="Ver todos los disenos"
+          title="Ver todas las imagenes"
         >
           <span className="filter-name">
             <FileText size={16} />
-            Todos los disenos
+            Todas las imagenes
           </span>
           <span>{allDesigns.length.toLocaleString("es-AR")}</span>
         </button>
@@ -4257,7 +4345,7 @@ function LeftFilters({
           ].filter(Boolean).join(" ")}
           data-drop-name={UNCATEGORIZED_CATEGORY}
           data-drop-kind="category"
-          title="Ver estampas sin categoria. Arrastra una estampa aca para quitarle la categoria."
+          title="Ver imagenes sin categoria. Arrastra una imagen aca para quitarle la categoria."
         >
           <button
             className={filters.categories.some((item) => sameCategory(item, UNCATEGORIZED_CATEGORY)) ? "filter-row active" : "filter-row"}
@@ -4271,7 +4359,7 @@ function LeftFilters({
             }}
           >
             <span className="filter-name">
-              <span className="category-count" aria-label={`${uncategorizedCount.toLocaleString("es-AR")} estampas`}>
+              <span className="category-count" aria-label={`${uncategorizedCount.toLocaleString("es-AR")} imagenes`}>
                 {uncategorizedCount.toLocaleString("es-AR")}
               </span>
               <span className="category-label">{UNCATEGORIZED_CATEGORY}</span>
@@ -4378,7 +4466,7 @@ function Viewer({
 
   /**
    * Carga el archivo original a pedido para poder hacer zoom con detalle real.
-   * Es temporal: al cambiar de estampa o cerrar la app se vuelve a la copia liviana.
+   * Es temporal: al cambiar de imagen o cerrar la app se vuelve a la copia liviana.
    */
   const toggleOriginal = useCallback(() => {
     if (showingOriginal) {
@@ -4532,7 +4620,7 @@ function Viewer({
           <img
             ref={imageRef}
             src={preview}
-            alt={design?.name ?? "Estampa"}
+            alt={design?.name ?? "Imagen"}
             className={zoom > 100 ? "is-zoomed" : ""}
             draggable={false}
             onError={() => setPreviewSourceIndex((current) => current + 1)}
@@ -4723,7 +4811,7 @@ function RightRail({
           <input
             value={filters.query}
             onChange={(event) => setFilters((current) => ({ ...current, query: event.target.value }))}
-            placeholder="Buscar disenos..."
+            placeholder="Buscar imagenes..."
           />
         </label>
         <button className={thumbMode === "compact" ? "mini-toggle active" : "mini-toggle"} onClick={() => setThumbMode("compact")} title="Compacto">
@@ -4860,7 +4948,7 @@ const ThumbCard = memo(function ThumbCard({
   }, [design.id, design.previewCachePath, design.previewPath, design.thumbnailPath]);
 
   const createCategory = () => {
-    const category = window.prompt("Nueva categoria para esta estampa");
+    const category = window.prompt("Nueva categoria para esta imagen");
     if (category?.trim()) {
       onCategory(design, category);
     }
@@ -4908,7 +4996,7 @@ const ThumbCard = memo(function ThumbCard({
           onToggleCategoryMenu(design.id);
         }}
         title={currentCategory ? `Categoria: ${currentCategory}` : "Clasificar"}
-        aria-label="Clasificar estampa"
+        aria-label="Clasificar imagen"
       >
         <Tags size={16} />
       </button>
@@ -5026,7 +5114,7 @@ function BottomTray({
         </div>
 
         {metricItems.length > 0 && (
-          <div className="extension-metrics" title="Archivos de esta estampa">
+          <div className="extension-metrics" title="Archivos de esta imagen">
             {metricItems.map((item) => (
               <IconMetric key={item.id} kind={item.kind} label={item.label} value={item.value} tone={item.tone} />
             ))}

@@ -13,11 +13,22 @@ use std::{
 use tauri::{AppHandle, Manager};
 use walkdir::WalkDir;
 
-const DEFAULT_LIBRARY_PATH: &str = r"C:\Users\jaell\Documents\estampas-roxwana";
 const FREEPIK_DIR_NAME: &str = "Freepik";
 const WORKS_DIR_NAME: &str = "Trabajos";
 const CATEGORIES_DIR_NAME: &str = "Categorías";
 const LOOSE_DIR_NAME: &str = "Suelta";
+/// Nombre de la carpeta suelta en las instalaciones nuevas. Convive con
+/// `Suelta`: las dos hacen lo mismo, para que una biblioteca armada antes siga
+/// funcionando igual.
+const MISC_DIR_NAME: &str = "Varios";
+/// Carpetas que se crean al elegir una biblioteca por primera vez, para que el
+/// usuario sepa donde va cada cosa sin tener que adivinar.
+const STARTER_DIR_NAMES: &[&str] = &[
+    CATEGORIES_DIR_NAME,
+    WORKS_DIR_NAME,
+    REFERENCES_DIR_NAME,
+    MISC_DIR_NAME,
+];
 const REFERENCES_DIR_NAME: &str = "Referencias";
 const PREFERENCES_DIR_NAME: &str = "Preferences";
 const LEGACY_COMPLETE_DIR_NAME: &str = "1-COMPLETAS";
@@ -218,10 +229,15 @@ fn get_initial_state(app: AppHandle) -> Result<LibraryResponse, String> {
     let conn = open_database(&app)?;
     ensure_database(&conn)?;
     migrate_legacy_cache_to_portable(&app, &conn)?;
-    let root =
-        get_setting(&conn, "library_root")?.unwrap_or_else(|| DEFAULT_LIBRARY_PATH.to_string());
-    let root_exists = PathBuf::from(&root).exists();
+    // Sin biblioteca elegida la ruta queda vacia: es una instalacion nueva y la
+    // interfaz muestra la bienvenida en lugar de inventar una carpeta.
+    let root = get_setting(&conn, "library_root")?.unwrap_or_default();
+    let root_exists = !root.is_empty() && PathBuf::from(&root).exists();
     drop(conn);
+
+    if root_exists {
+        allow_library_assets(&app, Path::new(&root));
+    }
 
     if root_exists {
         apply_portable_preferences_authority(&app, Path::new(&root))?;
@@ -390,7 +406,7 @@ fn get_library_from_db(app: AppHandle) -> Result<LibraryResponse, String> {
     let conn = open_database(&app)?;
     ensure_database(&conn)?;
     let root =
-        get_setting(&conn, "library_root")?.unwrap_or_else(|| DEFAULT_LIBRARY_PATH.to_string());
+        get_setting(&conn, "library_root")?.unwrap_or_default();
     load_library_from_db(&conn, &root)
 }
 
@@ -1039,7 +1055,7 @@ fn restore_database_backup(app: AppHandle, backup_path: String) -> Result<Librar
     let conn = open_database(&app)?;
     ensure_database(&conn)?;
     let root =
-        get_setting(&conn, "library_root")?.unwrap_or_else(|| DEFAULT_LIBRARY_PATH.to_string());
+        get_setting(&conn, "library_root")?.unwrap_or_default();
     let response = load_library_from_db(&conn, &root)?;
     drop(conn);
     if Path::new(&root).is_dir() {
@@ -1563,11 +1579,39 @@ fn safe_folder_name(value: &str) -> Result<String, String> {
     Ok(cleaned)
 }
 
+/// Autoriza a la ventana a mostrar las imagenes de la biblioteca elegida. Sin
+/// esto la aplicacion encuentra las estampas pero no puede dibujarlas: se ven
+/// los recuadros vacios. El permiso queda guardado por el plugin de scope, asi
+/// que se concede una vez y sobrevive a los reinicios.
+fn allow_library_assets(app: &AppHandle, root: &Path) {
+    let scope = app.asset_protocol_scope();
+    if let Err(error) = scope.allow_directory(root, true) {
+        eprintln!("No se pudo autorizar la carpeta de la biblioteca: {error}");
+    }
+}
+
+/// Deja creadas las carpetas de trabajo dentro de la biblioteca elegida para
+/// que el usuario sepa donde va cada cosa. Nunca toca lo que ya existe.
+fn ensure_starter_directories(root: &Path) -> Result<(), String> {
+    for name in STARTER_DIR_NAMES {
+        let directory = root.join(name);
+        if directory.is_dir() {
+            continue;
+        }
+        fs::create_dir_all(&directory)
+            .map_err(|error| format!("No se pudo crear la carpeta {name}: {error}"))?;
+    }
+    Ok(())
+}
+
 fn scan_library_impl(app: &AppHandle, root_path: &str) -> Result<LibraryResponse, String> {
     let root = PathBuf::from(root_path);
     if !root.exists() {
         return Err(format!("La carpeta no existe: {root_path}"));
     }
+
+    allow_library_assets(app, &root);
+    ensure_starter_directories(&root)?;
 
     let conn = open_database(app)?;
     ensure_database(&conn)?;
@@ -2226,6 +2270,7 @@ fn reorganized_design_path(root: &Path, design_path: &Path) -> Option<PathBuf> {
         || first_name.eq_ignore_ascii_case(WORKS_DIR_NAME)
         || is_categories_container_name(first_name)
         || first_name.eq_ignore_ascii_case(LOOSE_DIR_NAME)
+        || first_name.eq_ignore_ascii_case(MISC_DIR_NAME)
         || first_name.eq_ignore_ascii_case(REFERENCES_DIR_NAME)
         || first_name.eq_ignore_ascii_case(PORTABLE_CACHE_DIR_NAME)
     {
@@ -3531,7 +3576,9 @@ fn is_classifying_container_name(name: &str) -> bool {
 }
 
 fn is_loose_container_name(name: &str) -> bool {
-    name.eq_ignore_ascii_case(FREEPIK_DIR_NAME) || name.eq_ignore_ascii_case(LOOSE_DIR_NAME)
+    name.eq_ignore_ascii_case(FREEPIK_DIR_NAME)
+        || name.eq_ignore_ascii_case(LOOSE_DIR_NAME)
+        || name.eq_ignore_ascii_case(MISC_DIR_NAME)
 }
 
 fn is_reference_library_path(root: &Path, path: &Path) -> bool {
@@ -4884,6 +4931,60 @@ mod tests {
             sanitize_font_family("  Segoe UI \u{0}").as_deref(),
             Some("Segoe UI")
         );
+    }
+
+    #[test]
+    fn creates_the_starter_directories_in_an_empty_library() {
+        let dir = tempdir().unwrap();
+        ensure_starter_directories(dir.path()).unwrap();
+        for esperada in ["Categorías", "Trabajos", "Referencias", "Varios"] {
+            assert!(
+                dir.path().join(esperada).is_dir(),
+                "falta la carpeta {esperada}"
+            );
+        }
+        // Freepik es propia de la biblioteca original: no se crea de cero.
+        assert!(!dir.path().join("Freepik").exists());
+    }
+
+    #[test]
+    fn starter_directories_never_touch_existing_content() {
+        let dir = tempdir().unwrap();
+        let trabajos = dir.path().join("Trabajos").join("Che Guevara");
+        fs::create_dir_all(&trabajos).unwrap();
+        fs::write(trabajos.join("imagen.png"), b"image").unwrap();
+        let suelto = dir.path().join("estampa-suelta.png");
+        fs::write(&suelto, b"image").unwrap();
+
+        ensure_starter_directories(dir.path()).unwrap();
+
+        assert!(trabajos.join("imagen.png").is_file());
+        assert!(suelto.is_file());
+        assert!(dir.path().join("Varios").is_dir());
+    }
+
+    /// Una carpeta recien elegida puede tener imagenes sueltas sin ninguna
+    /// estructura: tienen que aparecer igual.
+    #[test]
+    fn reads_loose_images_from_a_freshly_chosen_folder() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("estampa-1.png"), b"image").unwrap();
+        let subcarpeta = dir.path().join("lo que sea");
+        fs::create_dir_all(&subcarpeta).unwrap();
+        fs::write(subcarpeta.join("estampa-2.jpg"), b"image").unwrap();
+        ensure_starter_directories(dir.path()).unwrap();
+
+        let designs = collect_designs(dir.path()).unwrap();
+        assert_eq!(designs.len(), 2, "se perdieron estampas: {designs:?}");
+    }
+
+    #[test]
+    fn recognizes_varios_like_suelta() {
+        assert!(is_loose_container_name("Varios"));
+        assert!(is_loose_container_name("varios"));
+        assert!(is_loose_container_name("Suelta"));
+        assert!(is_loose_container_name("Freepik"));
+        assert!(!is_loose_container_name("Trabajos"));
     }
 
     #[test]

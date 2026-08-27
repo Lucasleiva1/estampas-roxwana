@@ -447,6 +447,154 @@ button:disabled {
     linear-gradient(135deg, #090a0a 0%, #030404 58%, #0d0d0d 100%);
 }
 
+/* Bienvenida de una instalacion nueva, antes de elegir la carpeta. */
+.welcome-shell {
+  width: 100vw;
+  height: 100vh;
+  display: grid;
+  place-items: center;
+  overflow: auto;
+  padding: 28px;
+  color: #ece7dd;
+  background:
+    radial-gradient(circle at 50% 8%, rgb(130 28 31 / 14%), transparent 42%),
+    linear-gradient(135deg, #090a0a 0%, #030404 58%, #0d0d0d 100%);
+}
+
+.welcome-card {
+  width: min(560px, 100%);
+  display: grid;
+  justify-items: center;
+  gap: 13px;
+  padding: 27px 30px 25px;
+  border: 1px solid #2d3033;
+  border-radius: 14px;
+  background: rgb(12 13 14 / 92%);
+  box-shadow: 0 22px 48px rgb(0 0 0 / 34%);
+  text-align: center;
+}
+
+.welcome-mark {
+  position: relative;
+  width: 64px;
+  height: 58px;
+  color: #d29332;
+}
+
+.welcome-mark-image {
+  position: absolute;
+  left: 8px;
+  bottom: 3px;
+  filter: drop-shadow(0 0 8px rgb(210 147 50 / 18%));
+}
+
+.welcome-mark-sparkle {
+  position: absolute;
+  top: 0;
+  right: 3px;
+  color: #f3c15c;
+  fill: rgb(243 193 92 / 24%);
+  filter: drop-shadow(0 0 7px rgb(243 193 92 / 34%));
+}
+
+.welcome-card h1 {
+  color: #f3ece1;
+  font-size: 22px;
+  font-weight: 720;
+}
+
+.welcome-lead {
+  max-width: 42ch;
+  color: #a49d94;
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.welcome-notice {
+  width: 100%;
+  display: grid;
+  gap: 8px;
+  margin-top: 2px;
+  padding: 14px 16px;
+  border: 1px solid #2d3033;
+  border-radius: 10px;
+  background: #0d0e0f;
+  text-align: left;
+}
+
+.welcome-notice strong {
+  color: #e6ded2;
+  font-size: 13px;
+  font-weight: 680;
+}
+
+.welcome-notice p {
+  margin: 0;
+  color: #8f8981;
+  font-size: 11.5px;
+  line-height: 1.55;
+}
+
+.welcome-action {
+  width: 100%;
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  margin-top: 2px;
+  padding: 0 22px;
+  border: 1px solid rgb(224 20 31 / 72%);
+  border-radius: 8px;
+  color: #fff1ec;
+  background: linear-gradient(180deg, rgb(127 20 24 / 78%), rgb(36 13 13 / 94%));
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: border-color 0.14s ease, transform 0.14s ease;
+}
+
+.welcome-action:hover {
+  border-color: #ff5b52;
+  transform: translateY(-1px);
+}
+
+.welcome-action-secondary {
+  margin-top: -5px;
+  border-color: #3c4044;
+  color: #ded8ce;
+  background: #101112;
+}
+
+.welcome-action-secondary:hover {
+  border-color: #777b80;
+}
+
+.welcome-error {
+  width: 100%;
+  display: grid;
+  gap: 8px;
+  padding: 11px 13px;
+  border: 1px solid rgb(224 20 31 / 46%);
+  border-radius: 8px;
+  color: #ffd9d4;
+  background: rgb(70 16 18 / 42%);
+  font-size: 11px;
+  line-height: 1.5;
+  text-align: left;
+}
+
+.welcome-error button {
+  justify-self: start;
+  padding: 5px 11px;
+  border: 1px solid rgb(255 255 255 / 22%);
+  border-radius: 6px;
+  color: inherit;
+  background: transparent;
+  font-size: 11px;
+  cursor: pointer;
+}
+
 .settings-screen {
   width: 100%;
   height: 100%;
@@ -4303,11 +4451,45 @@ button:disabled {
 }
 
 :root[data-theme="light"] .visual-shell,
-:root[data-theme="light"] .settings-shell {
+:root[data-theme="light"] .settings-shell,
+:root[data-theme="light"] .welcome-shell {
   color: #18212c;
   background:
     radial-gradient(circle at 44% 18%, rgb(197 66 70 / 7%), transparent 34%),
     linear-gradient(135deg, #f7f9fb 0%, #e9edf2 58%, #f3f5f8 100%);
+}
+
+:root[data-theme="light"] .welcome-card {
+  border-color: #cdd5de;
+  background: #ffffff;
+  box-shadow: 0 22px 48px rgb(30 45 62 / 14%);
+}
+
+:root[data-theme="light"] .welcome-card h1 {
+  color: #1d2733;
+}
+
+:root[data-theme="light"] .welcome-lead {
+  color: #5b6675;
+}
+
+:root[data-theme="light"] .welcome-notice {
+  border-color: #d7dee6;
+  background: #f6f8fa;
+}
+
+:root[data-theme="light"] .welcome-notice strong {
+  color: #26323f;
+}
+
+:root[data-theme="light"] .welcome-notice p {
+  color: #64707e;
+}
+
+:root[data-theme="light"] .welcome-action-secondary {
+  border-color: #cbd3dc;
+  color: #344152;
+  background: #f5f7f9;
 }
 
 :root[data-theme="light"] .visual-header,

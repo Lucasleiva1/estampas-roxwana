@@ -2,8 +2,6 @@ import { invoke } from "@tauri-apps/api/core";
 import type { SidebarNode } from "./categories";
 import type { Design, DesignStatus, ReferenceItem, ReferenceStatus, ReferencesResponse, LibraryResponse } from "./types";
 
-const DEFAULT_LIBRARY_PATH = "C:\\Users\\jaell\\Documents\\estampas-roxwana";
-
 export interface BackupInfo {
   path: string;
   folder: string;
@@ -18,7 +16,7 @@ export interface BrandLogo {
   height: number;
 }
 
-export async function scanLibrary(rootPath = DEFAULT_LIBRARY_PATH) {
+export async function scanLibrary(rootPath: string) {
   return invoke<LibraryResponse>("scan_library", { rootPath });
 }
 
