@@ -22,8 +22,16 @@ export async function scanLibrary(rootPath = DEFAULT_LIBRARY_PATH) {
   return invoke<LibraryResponse>("scan_library", { rootPath });
 }
 
+export async function reloadPreferencesIfUnusable(rootPath: string) {
+  return invoke<LibraryResponse | null>("reload_preferences_if_unusable", { rootPath });
+}
+
 export async function rescanPaths(rootPath: string, paths: string[]) {
   return invoke<LibraryResponse>("rescan_paths", { rootPath, paths });
+}
+
+export async function detectLibraryChanges(rootPath: string) {
+  return invoke<LibraryResponse | null>("detect_library_changes", { rootPath });
 }
 
 export async function getInitialState() {

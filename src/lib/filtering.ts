@@ -56,6 +56,33 @@ export function countForExtension(design: Design, extension: string) {
   return design.files.filter((file) => file.extension.toLowerCase() === `.${key}`).length;
 }
 
+function normalizedDirectory(path: string) {
+  return path.replace(/\\/g, "/").replace(/\/+$/, "").toLocaleLowerCase();
+}
+
+export function designsInSameDirectory(designs: Design[], selected: Design) {
+  const directory = normalizedDirectory(selected.directory);
+  const matches = designs.filter((design) => normalizedDirectory(design.directory) === directory);
+  return matches.length > 0 ? matches : [selected];
+}
+
+export function countForExtensionAcrossDesigns(designs: Design[], extension: string) {
+  return designs.reduce((total, design) => total + countForExtension(design, extension), 0);
+}
+
+export function countPreviewFiles(design: Design) {
+  if (design.files.length > 0) {
+    return design.files.filter((file) => file.kind === "preview").length;
+  }
+
+  const supportFiles = Object.values(design.counts).reduce((total, count) => total + count, 0);
+  return Math.max(0, design.totalFiles - supportFiles);
+}
+
+export function countPreviewFilesAcrossDesigns(designs: Design[]) {
+  return designs.reduce((total, design) => total + countPreviewFiles(design), 0);
+}
+
 export function toggleValue<T>(values: T[], value: T) {
   return values.includes(value) ? values.filter((item) => item !== value) : [...values, value];
 }

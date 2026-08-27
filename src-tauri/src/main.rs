@@ -19,6 +19,7 @@ const WORKS_DIR_NAME: &str = "Trabajos";
 const CATEGORIES_DIR_NAME: &str = "Categorías";
 const LOOSE_DIR_NAME: &str = "Suelta";
 const REFERENCES_DIR_NAME: &str = "Referencias";
+const PREFERENCES_DIR_NAME: &str = "Preferences";
 const LEGACY_COMPLETE_DIR_NAME: &str = "1-COMPLETAS";
 const PREVIEW_EXTENSIONS: &[&str] = &[".jpg", ".jpeg", ".png", ".webp"];
 const SUPPORT_EXTENSIONS: &[&str] = &[".ai", ".psd", ".svg", ".pdf", ".eps", ".zip", ".txt"];
@@ -27,6 +28,11 @@ const REFERENCE_STATUSES: &[&str] = &["pending", "working", "done"];
 const CONTENT_LAYOUT_VERSION: &str = "github-layout-restored-v1";
 const BACKUP_FILE_NAME: &str = "biblioteca-visual-respaldo.sqlite";
 const RESTORE_SAFETY_FILE_NAME: &str = "biblioteca-visual-antes-de-cargar.sqlite";
+const PORTABLE_PREFERENCES_FILE_NAME: &str = "roxwana-preferences-v1.0.0.sqlite";
+const PORTABLE_PREFERENCES_PREVIOUS_FILE_NAME: &str =
+    "roxwana-preferences-v1.0.0-anterior-1.sqlite";
+const PORTABLE_PREFERENCES_OLDER_FILE_NAME: &str = "roxwana-preferences-v1.0.0-anterior-2.sqlite";
+const PORTABLE_PREFERENCES_REVISION_SETTING: &str = "portable_preferences_revision";
 const BRAND_LOGO_FILE_NAME: &str = "brand-logo.png";
 const BRAND_LOGO_MAX_SOURCE_BYTES: u64 = 40 * 1024 * 1024;
 const BRAND_LOGO_MAX_PIXELS: u64 = 100_000_000;
@@ -215,12 +221,17 @@ fn get_initial_state(app: AppHandle) -> Result<LibraryResponse, String> {
     let root =
         get_setting(&conn, "library_root")?.unwrap_or_else(|| DEFAULT_LIBRARY_PATH.to_string());
     let root_exists = PathBuf::from(&root).exists();
+    drop(conn);
+
+    if root_exists {
+        apply_portable_preferences_authority(&app, Path::new(&root))?;
+    }
+
+    let conn = open_database(&app)?;
+    ensure_database(&conn)?;
     let layout_needs_rescan =
         get_setting(&conn, "content_layout_version")?.as_deref() != Some(CONTENT_LAYOUT_VERSION);
-    let should_scan = root_exists
-        && (active_design_count(&conn)? == 0
-            || active_library_has_missing_paths(&conn)?
-            || layout_needs_rescan);
+    let should_scan = root_exists && (active_design_count(&conn)? == 0 || layout_needs_rescan);
 
     if !root_exists {
         conn.execute("UPDATE designs SET missing = 1", [])
@@ -294,6 +305,8 @@ fn update_reference_favorite(
         params![favorite as i32, reference_id],
     )
     .map_err(to_string)?;
+    drop(conn);
+    sync_portable_preferences(&app)?;
     Ok(())
 }
 
@@ -313,6 +326,8 @@ fn update_reference_status(
         params![status, reference_id],
     )
     .map_err(to_string)?;
+    drop(conn);
+    sync_portable_preferences(&app)?;
     Ok(())
 }
 
@@ -323,7 +338,9 @@ fn send_reference_to_work(
     reference_id: String,
     work_name: String,
 ) -> Result<ReferenceItem, String> {
-    send_reference_to_work_impl(&app, &root_path, &reference_id, &work_name)
+    let reference = send_reference_to_work_impl(&app, &root_path, &reference_id, &work_name)?;
+    sync_portable_preferences(&app)?;
+    Ok(reference)
 }
 
 #[tauri::command]
@@ -344,7 +361,26 @@ fn get_design_detail(app: AppHandle, design_id: String) -> Result<Option<Design>
 
 #[tauri::command]
 fn scan_library(app: AppHandle, root_path: String) -> Result<LibraryResponse, String> {
+    let root = PathBuf::from(&root_path);
+    if root.is_dir() {
+        apply_portable_preferences_authority(&app, &root)?;
+    }
     scan_library_impl(&app, &root_path)
+}
+
+#[tauri::command]
+fn reload_preferences_if_unusable(
+    app: AppHandle,
+    root_path: String,
+) -> Result<Option<LibraryResponse>, String> {
+    let root = PathBuf::from(&root_path);
+    let current = portable_preferences_path(&root);
+    if !root.is_dir() || (current.is_file() && validate_backup_database(&current).is_ok()) {
+        return Ok(None);
+    }
+
+    apply_portable_preferences_authority(&app, &root)?;
+    scan_library_impl(&app, &root_path).map(Some)
 }
 
 #[tauri::command]
@@ -358,6 +394,16 @@ fn rescan_paths(
     }
 
     rescan_paths_impl(&app, &root_path, &paths)
+}
+
+#[tauri::command]
+async fn detect_library_changes(
+    app: AppHandle,
+    root_path: String,
+) -> Result<Option<LibraryResponse>, String> {
+    tauri::async_runtime::spawn_blocking(move || detect_library_changes_impl(&app, &root_path))
+        .await
+        .map_err(to_string)?
 }
 
 #[tauri::command]
@@ -544,6 +590,8 @@ fn update_design_favorite(app: AppHandle, design_id: String, favorite: bool) -> 
         params![favorite as i32, design_id],
     )
     .map_err(to_string)?;
+    drop(conn);
+    sync_portable_preferences(&app)?;
     Ok(())
 }
 
@@ -560,6 +608,8 @@ fn update_design_status(app: AppHandle, design_id: String, status: String) -> Re
         params![status, design_id],
     )
     .map_err(to_string)?;
+    drop(conn);
+    sync_portable_preferences(&app)?;
     Ok(())
 }
 
@@ -582,6 +632,8 @@ fn update_design_category(
         params![normalized, design_id],
     )
     .map_err(to_string)?;
+    drop(conn);
+    sync_portable_preferences(&app)?;
     Ok(normalized)
 }
 
@@ -598,6 +650,8 @@ fn create_category(app: AppHandle, name: String) -> Result<String, String> {
         Some(&category.to_lowercase()),
     )?;
     upsert_category(&conn, &category, true)?;
+    drop(conn);
+    sync_portable_preferences(&app)?;
     Ok(category)
 }
 
@@ -653,6 +707,8 @@ fn rename_category(
     )
     .map_err(to_string)?;
 
+    drop(conn);
+    sync_portable_preferences(&app)?;
     Ok(renamed)
 }
 
@@ -687,6 +743,8 @@ fn delete_category(app: AppHandle, name: String) -> Result<(), String> {
         params![lower_name],
     )
     .map_err(to_string)?;
+    drop(conn);
+    sync_portable_preferences(&app)?;
     Ok(())
 }
 
@@ -697,7 +755,10 @@ fn save_sidebar_layout(
 ) -> Result<Vec<SidebarNode>, String> {
     let mut conn = open_database(&app)?;
     ensure_database(&conn)?;
-    write_sidebar_layout(&mut conn, &nodes)
+    let sidebar = write_sidebar_layout(&mut conn, &nodes)?;
+    drop(conn);
+    sync_portable_preferences(&app)?;
+    Ok(sidebar)
 }
 
 #[tauri::command]
@@ -714,6 +775,8 @@ fn create_category_group(app: AppHandle, name: String) -> Result<String, String>
         params![stable_id(&format!("group:{lower}")), group, lower],
     )
     .map_err(to_string)?;
+    drop(conn);
+    sync_portable_preferences(&app)?;
     Ok(group)
 }
 
@@ -743,6 +806,8 @@ fn rename_category_group(
     if updated == 0 {
         return Err("No encontre ese grupo".to_string());
     }
+    drop(conn);
+    sync_portable_preferences(&app)?;
     Ok(renamed)
 }
 
@@ -782,6 +847,8 @@ fn delete_category_group(app: AppHandle, name: String) -> Result<(), String> {
         )
         .map_err(to_string)?;
     transaction.commit().map_err(to_string)?;
+    drop(conn);
+    sync_portable_preferences(&app)?;
     Ok(())
 }
 
@@ -799,6 +866,8 @@ fn set_category_group_collapsed(
         params![collapsed as i32, lower],
     )
     .map_err(to_string)?;
+    drop(conn);
+    sync_portable_preferences(&app)?;
     Ok(())
 }
 
@@ -821,6 +890,8 @@ fn add_design_tag(app: AppHandle, design_id: String, tag: String) -> Result<(), 
         params![design_id, tag_id],
     )
     .map_err(to_string)?;
+    drop(conn);
+    sync_portable_preferences(&app)?;
     Ok(())
 }
 
@@ -844,6 +915,8 @@ fn remove_design_tag(app: AppHandle, design_id: String, tag: String) -> Result<(
         params![design_id, lower],
     )
     .map_err(to_string)?;
+    drop(conn);
+    sync_portable_preferences(&app)?;
     Ok(())
 }
 
@@ -888,6 +961,7 @@ fn reveal_design_file(path: String) -> Result<(), String> {
 
 #[tauri::command]
 fn save_database_backup(app: AppHandle) -> Result<BackupInfo, String> {
+    refresh_portable_preferences(&app)?;
     let backup_path = default_backup_path(&app)?;
     export_database_backup(&app, &backup_path)?;
     backup_info(&backup_path)
@@ -924,7 +998,12 @@ fn restore_database_backup(app: AppHandle, backup_path: String) -> Result<Librar
     ensure_database(&conn)?;
     let root =
         get_setting(&conn, "library_root")?.unwrap_or_else(|| DEFAULT_LIBRARY_PATH.to_string());
-    load_library_from_db(&conn, &root)
+    let response = load_library_from_db(&conn, &root)?;
+    drop(conn);
+    if Path::new(&root).is_dir() {
+        sync_portable_preferences_for_root(&app, Path::new(&root))?;
+    }
+    Ok(response)
 }
 
 fn scan_references_impl(app: &AppHandle, root_path: &str) -> Result<ReferencesResponse, String> {
@@ -1043,13 +1122,16 @@ fn scan_references_impl(app: &AppHandle, root_path: &str) -> Result<ReferencesRe
 
     purge_reference_cache_rows(&conn, root_path)?;
     let references = load_references_from_db(&conn, root_path)?;
-    Ok(ReferencesResponse {
+    let response = ReferencesResponse {
         root_path: root_path.to_string(),
         references_path: path_to_string(&references_path),
         works_path: path_to_string(&works_path),
         references,
         categories: categories.into_iter().collect(),
-    })
+    };
+    drop(conn);
+    refresh_portable_preferences_for_root(app, &root)?;
+    Ok(response)
 }
 
 fn collect_reference_image_paths(references_path: &Path) -> Result<Vec<PathBuf>, String> {
@@ -1266,7 +1348,10 @@ fn scan_library_impl(app: &AppHandle, root_path: &str) -> Result<LibraryResponse
 
     normalize_design_categories(&conn)?;
     save_setting(&conn, "content_layout_version", CONTENT_LAYOUT_VERSION)?;
-    load_library_from_db(&conn, root_path)
+    let response = load_library_from_db(&conn, root_path)?;
+    drop(conn);
+    refresh_portable_preferences_for_root(app, &root)?;
+    Ok(response)
 }
 
 fn rescan_paths_impl(
@@ -1350,30 +1435,214 @@ fn rescan_paths_impl(
     }
 
     normalize_design_categories(&conn)?;
-    load_library_from_db(&conn, root_path)
+    let response = load_library_from_db(&conn, root_path)?;
+    drop(conn);
+    refresh_portable_preferences_for_root(app, &root)?;
+    Ok(response)
+}
+
+fn detect_library_changes_impl(
+    app: &AppHandle,
+    root_path: &str,
+) -> Result<Option<LibraryResponse>, String> {
+    let root = PathBuf::from(root_path);
+    if !root.is_dir() {
+        return Ok(None);
+    }
+
+    let conn = open_database(app)?;
+    ensure_database(&conn)?;
+    let changed_paths = changed_library_paths(&conn, &root)?;
+    drop(conn);
+    if changed_paths.is_empty() {
+        return Ok(None);
+    }
+
+    rescan_paths_impl(app, root_path, &changed_paths).map(Some)
+}
+
+fn changed_library_paths(conn: &Connection, root: &Path) -> Result<Vec<String>, String> {
+    let mut indexed = BTreeMap::<String, (String, u64, i64)>::new();
+    let mut stmt = conn
+        .prepare("SELECT path, size, modified FROM files WHERE missing = 0")
+        .map_err(to_string)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)? as u64,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(to_string)?;
+    for row in rows {
+        let (path, size, modified) = row.map_err(to_string)?;
+        indexed.insert(
+            normalize_path_for_id(Path::new(&path)),
+            (path, size, modified),
+        );
+    }
+    drop(stmt);
+
+    let mut changed = BTreeSet::new();
+    for entry in WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            !is_portable_cache_path(entry.path())
+                && !is_reference_library_path(root, entry.path())
+                && !is_preferences_library_path(root, entry.path())
+        })
+    {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+
+        let path = entry.path();
+        if !is_supported_extension(&extension_for(path)) {
+            continue;
+        }
+        let previous = indexed.remove(&normalize_path_for_id(path));
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(system_time_to_i64)
+            .unwrap_or(0);
+        if previous.as_ref().is_none_or(|(_, size, stored_modified)| {
+            *size != metadata.len() || *stored_modified != modified
+        }) {
+            changed.insert(path_to_string(path));
+        }
+    }
+
+    for (_, (path, _, _)) in indexed {
+        changed.insert(path);
+    }
+    Ok(changed.into_iter().collect())
 }
 
 fn load_library_from_db(conn: &Connection, root_path: &str) -> Result<LibraryResponse, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id
+            "SELECT id, name, path, directory, group_type, preview_path, preview_cache_path,
+                    thumbnail_path, total_files, updated_at, auto_category,
+                    favorite, status, category, category_user_set
              FROM designs
              WHERE missing = 0
              ORDER BY name COLLATE NOCASE",
         )
         .map_err(to_string)?;
-    let ids = stmt
-        .query_map([], |row| row.get::<_, String>(0))
+    let mut designs = stmt
+        .query_map([], |row| {
+            Ok(Design {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                path: row.get(2)?,
+                directory: row.get(3)?,
+                group_type: row.get(4)?,
+                preview_path: row.get(5)?,
+                preview_cache_path: row.get(6)?,
+                thumbnail_path: row.get(7)?,
+                total_files: row.get::<_, i64>(8)? as usize,
+                updated_at: row.get(9)?,
+                counts: SupportCounts::default(),
+                files: Vec::new(),
+                classification: Classification {
+                    favorite: row.get::<_, i64>(11)? != 0,
+                    status: row.get(12)?,
+                    category: row.get(13)?,
+                    tags: Vec::new(),
+                    category_user_set: row.get::<_, i64>(14)? != 0,
+                },
+                auto_category: row.get(10)?,
+                auto_tags: Vec::new(),
+            })
+        })
         .map_err(to_string)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(to_string)?;
+    drop(stmt);
 
-    let mut designs = Vec::with_capacity(ids.len());
-    for id in ids {
-        if let Some(design) = load_design_from_db(conn, &id, false)? {
-            designs.push(design);
+    let design_indexes = designs
+        .iter()
+        .enumerate()
+        .map(|(index, design)| (design.id.clone(), index))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut counts_stmt = conn
+        .prepare(
+            "SELECT files.design_id, files.extension, COUNT(*)
+             FROM files
+             INNER JOIN designs ON designs.id = files.design_id
+             WHERE files.missing = 0 AND designs.missing = 0
+             GROUP BY files.design_id, files.extension",
+        )
+        .map_err(to_string)?;
+    let count_rows = counts_stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? as usize,
+            ))
+        })
+        .map_err(to_string)?;
+    for row in count_rows {
+        let (design_id, extension, count) = row.map_err(to_string)?;
+        let Some(index) = design_indexes.get(&design_id) else {
+            continue;
+        };
+        let counts = &mut designs[*index].counts;
+        match extension.as_str() {
+            ".ai" => counts.ai = count,
+            ".psd" => counts.psd = count,
+            ".svg" => counts.svg = count,
+            ".pdf" => counts.pdf = count,
+            ".eps" => counts.eps = count,
+            ".zip" => counts.zip = count,
+            ".txt" => counts.txt = count,
+            extension if SUPPORT_EXTENSIONS.contains(&extension) => counts.other += count,
+            _ => {}
         }
     }
+    drop(counts_stmt);
+
+    let mut tags_stmt = conn
+        .prepare(
+            "SELECT design_tags.design_id, tags.name, design_tags.source
+             FROM design_tags
+             INNER JOIN tags ON tags.id = design_tags.tag_id
+             INNER JOIN designs ON designs.id = design_tags.design_id
+             WHERE designs.missing = 0
+             ORDER BY tags.name COLLATE NOCASE",
+        )
+        .map_err(to_string)?;
+    let tag_rows = tags_stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(to_string)?;
+    for row in tag_rows {
+        let (design_id, tag, source) = row.map_err(to_string)?;
+        let Some(index) = design_indexes.get(&design_id) else {
+            continue;
+        };
+        designs[*index].classification.tags.push(tag.clone());
+        if source == "auto" {
+            designs[*index].auto_tags.push(tag);
+        }
+    }
+    drop(tags_stmt);
 
     let stats = build_stats_from_db(conn)?;
     let sidebar = load_sidebar(conn)?;
@@ -1616,37 +1885,6 @@ fn active_design_count(conn: &Connection) -> Result<usize, String> {
     )
     .map(|count| count as usize)
     .map_err(to_string)
-}
-
-fn active_library_has_missing_paths(conn: &Connection) -> Result<bool, String> {
-    let mut stmt = conn
-        .prepare("SELECT path, group_type FROM designs WHERE missing = 0")
-        .map_err(to_string)?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-        .map_err(to_string)?;
-
-    for row in rows {
-        let (path, group_type) = row.map_err(to_string)?;
-        if group_type == "folder" && !PathBuf::from(path).exists() {
-            return Ok(true);
-        }
-    }
-
-    let mut files_stmt = conn
-        .prepare("SELECT path FROM files WHERE missing = 0")
-        .map_err(to_string)?;
-    let file_paths = files_stmt
-        .query_map([], |row| row.get::<_, String>(0))
-        .map_err(to_string)?;
-    for file_path in file_paths {
-        if !PathBuf::from(file_path.map_err(to_string)?).exists() {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 fn load_relocation_matches(
@@ -2034,6 +2272,7 @@ fn encode_base64(bytes: &[u8]) -> String {
 
 static BRAND_LOGO_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+static PORTABLE_PREFERENCES_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn open_database(app: &AppHandle) -> Result<Connection, String> {
     let db_path = database_path(app)?;
@@ -2057,6 +2296,180 @@ fn backup_directory(app: &AppHandle) -> Result<PathBuf, String> {
         .join("copias-de-seguridad");
     fs::create_dir_all(&dir).map_err(to_string)?;
     Ok(dir)
+}
+
+fn portable_preferences_path(root: &Path) -> PathBuf {
+    root.join(PREFERENCES_DIR_NAME)
+        .join(PORTABLE_PREFERENCES_FILE_NAME)
+}
+
+fn portable_preferences_paths(root: &Path) -> [PathBuf; 3] {
+    let directory = root.join(PREFERENCES_DIR_NAME);
+    [
+        directory.join(PORTABLE_PREFERENCES_FILE_NAME),
+        directory.join(PORTABLE_PREFERENCES_PREVIOUS_FILE_NAME),
+        directory.join(PORTABLE_PREFERENCES_OLDER_FILE_NAME),
+    ]
+}
+
+#[cfg(test)]
+fn preferences_revision(conn: &Connection) -> Result<i64, String> {
+    Ok(get_setting(conn, PORTABLE_PREFERENCES_REVISION_SETTING)?
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0))
+}
+
+fn apply_portable_preferences_authority(app: &AppHandle, root: &Path) -> Result<bool, String> {
+    let sources = portable_preferences_paths(root);
+    let _guard = PORTABLE_PREFERENCES_LOCK
+        .lock()
+        .map_err(|_| "No se pudo bloquear la copia portable de preferencias".to_string())?;
+    replace_local_database_from_authority(&sources, &database_path(app)?)
+        .map(|source| source.is_some())
+}
+
+fn replace_local_database_from_authority(
+    sources: &[PathBuf],
+    db_path: &Path,
+) -> Result<Option<PathBuf>, String> {
+    let mut invalid_sources = Vec::new();
+    for source in sources {
+        if !source.is_file() {
+            continue;
+        }
+        if let Err(error) = validate_backup_database(source) {
+            invalid_sources.push(format!("{} ({error})", source.display()));
+            continue;
+        }
+
+        remove_database_files(db_path)?;
+        fs::copy(source, db_path).map_err(|error| {
+            format!("No se pudieron cargar las preferencias portables: {error}")
+        })?;
+        return Ok(Some(source.clone()));
+    }
+
+    if !invalid_sources.is_empty() {
+        return Err(format!(
+            "Las tres copias de Preferences estan danadas o no son validas: {}",
+            invalid_sources.join("; ")
+        ));
+    }
+
+    // Preferences es la fuente de verdad. Solo cuando no queda ninguna de las
+    // tres versiones se descarta la configuracion local y se vuelve al inicio.
+    remove_database_files(db_path)?;
+    let conn = Connection::open(db_path).map_err(to_string)?;
+    ensure_database(&conn)?;
+    drop(conn);
+    Ok(None)
+}
+
+fn copy_valid_preference_snapshot(source: &Path, target: &Path) -> Result<bool, String> {
+    if !source.is_file() || validate_backup_database(source).is_err() {
+        return Ok(false);
+    }
+
+    let temporary = target.with_extension("sqlite.rotate.tmp");
+    remove_file_if_exists(&temporary)?;
+    fs::copy(source, &temporary)
+        .map_err(|error| format!("No se pudo rotar el historial de Preferences: {error}"))?;
+    validate_backup_database(&temporary)?;
+    remove_file_if_exists(target)?;
+    fs::rename(&temporary, target)
+        .map_err(|error| format!("No se pudo completar el historial de Preferences: {error}"))?;
+    Ok(true)
+}
+
+fn rotate_portable_preferences(paths: &[PathBuf; 3]) -> Result<(), String> {
+    let [current, previous, older] = paths;
+    copy_valid_preference_snapshot(previous, older)?;
+    copy_valid_preference_snapshot(current, previous)?;
+    Ok(())
+}
+
+fn ensure_portable_history_seeded(paths: &[PathBuf; 3]) -> Result<(), String> {
+    let [current, previous, older] = paths;
+    if !previous.is_file() || validate_backup_database(previous).is_err() {
+        copy_valid_preference_snapshot(current, previous)?;
+    }
+    if !older.is_file() || validate_backup_database(older).is_err() {
+        copy_valid_preference_snapshot(previous, older)?;
+    }
+    Ok(())
+}
+
+fn write_portable_preferences_for_root(
+    app: &AppHandle,
+    root: &Path,
+    rotate_history: bool,
+) -> Result<PathBuf, String> {
+    if !root.is_dir() {
+        return Err(format!(
+            "No existe la carpeta de la biblioteca: {}",
+            root.display()
+        ));
+    }
+
+    let _guard = PORTABLE_PREFERENCES_LOCK
+        .lock()
+        .map_err(|_| "No se pudo bloquear la copia portable de preferencias".to_string())?;
+    let paths = portable_preferences_paths(root);
+    let target = &paths[0];
+    let directory = target
+        .parent()
+        .ok_or_else(|| "La copia portable no tiene carpeta padre".to_string())?;
+    fs::create_dir_all(directory)
+        .map_err(|error| format!("No se pudo crear Preferences: {error}"))?;
+
+    let conn = open_database(app)?;
+    ensure_database(&conn)?;
+    save_setting(
+        &conn,
+        PORTABLE_PREFERENCES_REVISION_SETTING,
+        &now_i64().to_string(),
+    )?;
+    drop(conn);
+    if rotate_history {
+        rotate_portable_preferences(&paths)?;
+    }
+    export_database_backup(app, target)?;
+    ensure_portable_history_seeded(&paths)?;
+    Ok(target.clone())
+}
+
+fn sync_portable_preferences_for_root(app: &AppHandle, root: &Path) -> Result<PathBuf, String> {
+    write_portable_preferences_for_root(app, root, true)
+}
+
+fn refresh_portable_preferences_for_root(app: &AppHandle, root: &Path) -> Result<PathBuf, String> {
+    write_portable_preferences_for_root(app, root, false)
+}
+
+fn sync_portable_preferences(app: &AppHandle) -> Result<Option<PathBuf>, String> {
+    write_portable_preferences(app, true)
+}
+
+fn refresh_portable_preferences(app: &AppHandle) -> Result<Option<PathBuf>, String> {
+    write_portable_preferences(app, false)
+}
+
+fn write_portable_preferences(
+    app: &AppHandle,
+    rotate_history: bool,
+) -> Result<Option<PathBuf>, String> {
+    let conn = open_database(app)?;
+    ensure_database(&conn)?;
+    let root = get_setting(&conn, "library_root")?;
+    drop(conn);
+    let Some(root) = root else {
+        return Ok(None);
+    };
+    let root = PathBuf::from(root);
+    if !root.is_dir() {
+        return Ok(None);
+    }
+    write_portable_preferences_for_root(app, &root, rotate_history).map(Some)
 }
 
 fn default_backup_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -2431,6 +2844,7 @@ fn collect_designs_from_walk_roots(
             .filter_entry(|entry| {
                 !is_portable_cache_path(entry.path())
                     && !is_reference_library_path(&root, entry.path())
+                    && !is_preferences_library_path(&root, entry.path())
             })
         {
             let entry = entry.map_err(to_string)?;
@@ -2650,6 +3064,18 @@ fn is_reference_library_path(root: &Path, path: &Path) -> bool {
             .as_os_str()
             .to_str()
             .is_some_and(|name| name.eq_ignore_ascii_case(REFERENCES_DIR_NAME))
+    })
+}
+
+fn is_preferences_library_path(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    relative.components().next().is_some_and(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|name| name.eq_ignore_ascii_case(PREFERENCES_DIR_NAME))
     })
 }
 
@@ -3166,7 +3592,9 @@ fn migrate_legacy_cache_to_portable(app: &AppHandle, conn: &Connection) -> Resul
                 continue;
             };
             let legacy = PathBuf::from(&stored_path);
-            if !legacy.exists() || is_portable_cache_path(&legacy) {
+            // Las rutas portables son el caso normal. Reconocerlas por el texto
+            // antes de tocar el disco evita miles de comprobaciones al iniciar.
+            if is_portable_cache_path(&legacy) || !legacy.exists() {
                 continue;
             }
             let Some(extension) = legacy.extension().and_then(|value| value.to_str()) else {
@@ -3859,7 +4287,9 @@ fn main() {
             get_library_from_db,
             get_design_detail,
             scan_library,
+            reload_preferences_if_unusable,
             rescan_paths,
+            detect_library_changes,
             generate_thumbnail,
             generate_thumbnails_bulk,
             generate_preview,
@@ -4003,6 +4433,298 @@ mod tests {
     }
 
     #[test]
+    fn ignores_the_portable_preferences_directory_during_library_scan() {
+        let dir = tempdir().unwrap();
+        let preferences = dir.path().join(PREFERENCES_DIR_NAME);
+        fs::create_dir_all(&preferences).unwrap();
+        fs::write(preferences.join("no-mostrar.png"), b"preferences").unwrap();
+        fs::write(dir.path().join("visible.png"), b"library").unwrap();
+
+        let designs = collect_designs(dir.path()).unwrap();
+
+        assert_eq!(designs.len(), 1);
+        assert_eq!(designs[0].name, "Visible");
+        assert!(designs.iter().all(|design| {
+            !design
+                .files
+                .iter()
+                .any(|file| file.path.contains(PREFERENCES_DIR_NAME))
+        }));
+    }
+
+    #[test]
+    fn detects_only_new_modified_or_deleted_library_files() {
+        let dir = tempdir().unwrap();
+        let design_dir = dir.path().join(FREEPIK_DIR_NAME).join("Coleccion");
+        fs::create_dir_all(&design_dir).unwrap();
+        let existing = design_dir.join("existente.jpg");
+        fs::write(&existing, b"original").unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_database(&conn).unwrap();
+        for design in collect_designs(dir.path()).unwrap() {
+            persist_design(&conn, &design).unwrap();
+        }
+        assert!(changed_library_paths(&conn, dir.path()).unwrap().is_empty());
+
+        fs::write(&existing, b"contenido modificado y mas largo").unwrap();
+        let added = design_dir.join("nuevo.psd");
+        fs::write(&added, b"editable").unwrap();
+        let preferences_file = dir.path().join(PREFERENCES_DIR_NAME).join("ignorar.jpg");
+        fs::create_dir_all(preferences_file.parent().unwrap()).unwrap();
+        fs::write(&preferences_file, b"preferencia").unwrap();
+
+        let changed = changed_library_paths(&conn, dir.path()).unwrap();
+        assert_eq!(changed.len(), 2);
+        assert!(changed.contains(&path_to_string(&existing)));
+        assert!(changed.contains(&path_to_string(&added)));
+        assert!(!changed.contains(&path_to_string(&preferences_file)));
+
+        fs::remove_file(&existing).unwrap();
+        let changed_after_delete = changed_library_paths(&conn, dir.path()).unwrap();
+        assert_eq!(changed_after_delete.len(), 2);
+        assert!(changed_after_delete.contains(&path_to_string(&existing)));
+        assert!(changed_after_delete.contains(&path_to_string(&added)));
+    }
+
+    #[test]
+    fn bulk_library_loading_matches_individual_design_loading() {
+        let dir = tempdir().unwrap();
+        let design_dir = dir.path().join(FREEPIK_DIR_NAME).join("Coleccion");
+        fs::create_dir_all(&design_dir).unwrap();
+        fs::write(design_dir.join("vista.jpg"), b"imagen").unwrap();
+        fs::write(design_dir.join("editable.psd"), b"photoshop").unwrap();
+        fs::write(design_dir.join("vector.ai"), b"illustrator").unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_database(&conn).unwrap();
+        let collected = collect_designs(dir.path()).unwrap();
+        assert_eq!(collected.len(), 1);
+        persist_design(&conn, &collected[0]).unwrap();
+        sync_auto_tags(&conn, &collected[0].id, &collected[0].auto_tags).unwrap();
+        conn.execute(
+            "UPDATE designs SET favorite = 1, status = 'working' WHERE id = ?1",
+            params![collected[0].id],
+        )
+        .unwrap();
+        let manual_tag = upsert_tag(&conn, "favorita").unwrap();
+        conn.execute(
+            "INSERT INTO design_tags (design_id, tag_id, source) VALUES (?1, ?2, 'manual')",
+            params![collected[0].id, manual_tag],
+        )
+        .unwrap();
+
+        let bulk = load_library_from_db(&conn, &path_to_string(dir.path())).unwrap();
+        let individual = load_design_from_db(&conn, &collected[0].id, false)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(bulk.designs.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&bulk.designs[0]).unwrap(),
+            serde_json::to_value(individual).unwrap()
+        );
+    }
+
+    #[test]
+    fn uses_a_versioned_portable_preferences_file_and_revision() {
+        let dir = tempdir().unwrap();
+        let paths = portable_preferences_paths(dir.path());
+        assert_eq!(
+            portable_preferences_path(dir.path()),
+            dir.path()
+                .join(PREFERENCES_DIR_NAME)
+                .join("roxwana-preferences-v1.0.0.sqlite")
+        );
+        assert_eq!(
+            paths[1],
+            dir.path()
+                .join(PREFERENCES_DIR_NAME)
+                .join("roxwana-preferences-v1.0.0-anterior-1.sqlite")
+        );
+        assert_eq!(
+            paths[2],
+            dir.path()
+                .join(PREFERENCES_DIR_NAME)
+                .join("roxwana-preferences-v1.0.0-anterior-2.sqlite")
+        );
+
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_database(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO category_groups (id, name, lower_name, sort_order, collapsed)
+             VALUES ('group-test', 'Mi grupo', 'mi grupo', 0, 0)",
+            [],
+        )
+        .unwrap();
+        save_setting(&conn, PORTABLE_PREFERENCES_REVISION_SETTING, "123").unwrap();
+
+        assert_eq!(preferences_revision(&conn).unwrap(), 123);
+    }
+
+    #[test]
+    fn portable_preferences_are_authoritative_when_present_or_missing() {
+        let dir = tempdir().unwrap();
+        let local = dir.path().join("local.sqlite");
+        let portable = dir.path().join("portable.sqlite");
+        let previous = dir.path().join("previous.sqlite");
+        let older = dir.path().join("older.sqlite");
+        let sources = [portable.clone(), previous.clone(), older];
+
+        let local_conn = Connection::open(&local).unwrap();
+        ensure_database(&local_conn).unwrap();
+        local_conn
+            .execute(
+                "INSERT INTO category_groups (id, name, lower_name, sort_order, collapsed)
+                 VALUES ('local-group', 'Solo local', 'solo local', 0, 0)",
+                [],
+            )
+            .unwrap();
+        drop(local_conn);
+
+        assert!(replace_local_database_from_authority(&sources, &local)
+            .unwrap()
+            .is_none());
+        let reset_conn = Connection::open(&local).unwrap();
+        let reset_groups: i64 = reset_conn
+            .query_row("SELECT COUNT(*) FROM category_groups", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(reset_groups, 0);
+        drop(reset_conn);
+
+        let portable_conn = Connection::open(&portable).unwrap();
+        ensure_database(&portable_conn).unwrap();
+        portable_conn
+            .execute(
+                "INSERT INTO category_groups (id, name, lower_name, sort_order, collapsed)
+                 VALUES ('portable-group', 'Desde Preferences', 'desde preferences', 0, 0)",
+                [],
+            )
+            .unwrap();
+        drop(portable_conn);
+
+        assert_eq!(
+            replace_local_database_from_authority(&sources, &local).unwrap(),
+            Some(portable.clone())
+        );
+        let restored_conn = Connection::open(&local).unwrap();
+        let restored_group: String = restored_conn
+            .query_row("SELECT name FROM category_groups", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(restored_group, "Desde Preferences");
+        drop(restored_conn);
+
+        fs::write(&portable, b"archivo danado").unwrap();
+        let previous_conn = Connection::open(&previous).unwrap();
+        ensure_database(&previous_conn).unwrap();
+        previous_conn
+            .execute(
+                "INSERT INTO category_groups (id, name, lower_name, sort_order, collapsed)
+                 VALUES ('previous-group', 'Desde anterior', 'desde anterior', 0, 0)",
+                [],
+            )
+            .unwrap();
+        drop(previous_conn);
+
+        assert_eq!(
+            replace_local_database_from_authority(&sources, &local).unwrap(),
+            Some(previous)
+        );
+        let fallback_conn = Connection::open(&local).unwrap();
+        let fallback_group: String = fallback_conn
+            .query_row("SELECT name FROM category_groups", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(fallback_group, "Desde anterior");
+    }
+
+    #[test]
+    fn rotates_two_valid_portable_preference_snapshots() {
+        let dir = tempdir().unwrap();
+        let paths = portable_preferences_paths(dir.path());
+        fs::create_dir_all(paths[0].parent().unwrap()).unwrap();
+        let create_snapshot = |path: &Path, group_id: &str, group_name: &str| {
+            let conn = Connection::open(path).unwrap();
+            ensure_database(&conn).unwrap();
+            conn.execute(
+                "INSERT INTO category_groups (id, name, lower_name, sort_order, collapsed)
+                 VALUES (?1, ?2, lower(?2), 0, 0)",
+                params![group_id, group_name],
+            )
+            .unwrap();
+        };
+        create_snapshot(&paths[0], "current", "Actual");
+        create_snapshot(&paths[1], "previous", "Anterior");
+
+        rotate_portable_preferences(&paths).unwrap();
+
+        let previous_conn = Connection::open(&paths[1]).unwrap();
+        let previous_name: String = previous_conn
+            .query_row("SELECT name FROM category_groups", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(previous_name, "Actual");
+        let older_conn = Connection::open(&paths[2]).unwrap();
+        let older_name: String = older_conn
+            .query_row("SELECT name FROM category_groups", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(older_name, "Anterior");
+    }
+
+    #[test]
+    fn seeds_missing_portable_history_without_consuming_updates() {
+        let dir = tempdir().unwrap();
+        let paths = portable_preferences_paths(dir.path());
+        fs::create_dir_all(paths[0].parent().unwrap()).unwrap();
+        let conn = Connection::open(&paths[0]).unwrap();
+        ensure_database(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO category_groups (id, name, lower_name, sort_order, collapsed)
+             VALUES ('baseline', 'Configuracion base', 'configuracion base', 0, 0)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        ensure_portable_history_seeded(&paths).unwrap();
+
+        for path in &paths[1..] {
+            validate_backup_database(path).unwrap();
+            let copy_conn = Connection::open(path).unwrap();
+            let group_name: String = copy_conn
+                .query_row("SELECT name FROM category_groups", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(group_name, "Configuracion base");
+        }
+    }
+
+    #[test]
+    fn keeps_direct_work_files_separate_and_includes_editables() {
+        let dir = tempdir().unwrap();
+        let work = dir.path().join(WORKS_DIR_NAME).join("Che Guevara");
+        fs::create_dir_all(&work).unwrap();
+        fs::write(work.join("imagen-1.png"), b"image-one").unwrap();
+        fs::write(work.join("imagen-2.png"), b"image-two").unwrap();
+        fs::write(work.join("archivo.psd"), b"editable").unwrap();
+
+        let designs = collect_designs(dir.path()).unwrap();
+
+        assert_eq!(designs.len(), 3);
+        assert!(designs.iter().all(|design| {
+            design.group_type == "loose_file"
+                && design.files.len() == 1
+                && design.auto_category.as_deref() == Some("Che Guevara")
+        }));
+        assert!(designs.iter().any(|design| {
+            design.name == "Archivo"
+                && design.preview_path.is_none()
+                && design.counts.psd == 1
+                && design.files[0].file_name == "archivo.psd"
+        }));
+        assert!(work.join("imagen-1.png").is_file());
+        assert!(work.join("imagen-2.png").is_file());
+        assert!(work.join("archivo.psd").is_file());
+    }
+
+    #[test]
     fn reads_each_nested_work_item_and_assigns_the_work_name() {
         let dir = tempdir().unwrap();
         let work = dir.path().join(WORKS_DIR_NAME).join("Campana verano");
@@ -4069,12 +4791,8 @@ mod tests {
     fn reference_scan_ignores_portable_cache_at_any_depth() {
         let dir = tempdir().unwrap();
         let category = dir.path().join(REFERENCES_DIR_NAME).join("Che");
-        let cache = category
-            .join(PORTABLE_CACHE_DIR_NAME)
-            .join("thumbnails");
-        let nested_cache = cache
-            .join(PORTABLE_CACHE_DIR_NAME)
-            .join("thumbnails");
+        let cache = category.join(PORTABLE_CACHE_DIR_NAME).join("thumbnails");
+        let nested_cache = cache.join(PORTABLE_CACHE_DIR_NAME).join("thumbnails");
         fs::create_dir_all(&nested_cache).unwrap();
 
         let original = category.join("original.jpg");
@@ -4106,7 +4824,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(purge_reference_cache_rows(&conn, "D:\\Biblioteca").unwrap(), 1);
+        assert_eq!(
+            purge_reference_cache_rows(&conn, "D:\\Biblioteca").unwrap(),
+            1
+        );
         let remaining: Vec<String> = conn
             .prepare("SELECT id FROM reference_images ORDER BY id")
             .unwrap()

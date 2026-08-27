@@ -1,6 +1,14 @@
 import { describe, expect, it } from "vitest";
 import { classifyExtension } from "../src/lib/fileTypes";
-import { UNCATEGORIZED_CATEGORY, chooseRandomDesign, createDefaultFilters, filterDesigns } from "../src/lib/filtering";
+import {
+  UNCATEGORIZED_CATEGORY,
+  chooseRandomDesign,
+  countForExtensionAcrossDesigns,
+  countPreviewFilesAcrossDesigns,
+  createDefaultFilters,
+  designsInSameDirectory,
+  filterDesigns,
+} from "../src/lib/filtering";
 import {
   categoryNode,
   flattenSidebar,
@@ -88,6 +96,35 @@ describe("filtering", () => {
   it("chooses a stable random item when a random function is provided", () => {
     expect(chooseRandomDesign(["a", "b", "c"], () => 0.5)).toBe("b");
     expect(chooseRandomDesign([], () => 0.5)).toBeNull();
+  });
+});
+
+describe("physical folder metrics", () => {
+  it("counts differently named images and editable files without merging their items", () => {
+    const image = design({
+      id: "image",
+      name: "Toy Dtf",
+      path: "D:/estampas-roxwana/Trabajos/toy-story/toy_dtf",
+      directory: "D:/estampas-roxwana/Trabajos/toy-story",
+      totalFiles: 1,
+      counts: { ai: 0, psd: 0, svg: 0, pdf: 0, eps: 0, zip: 0, txt: 0, other: 0 },
+    });
+    const editable = design({
+      id: "editable",
+      name: "Toy",
+      path: "D:/estampas-roxwana/Trabajos/toy-story/toy",
+      directory: "D:\\estampas-roxwana\\Trabajos\\toy-story\\",
+      previewPath: null,
+      totalFiles: 1,
+      counts: { ai: 0, psd: 1, svg: 0, pdf: 0, eps: 0, zip: 0, txt: 0, other: 0 },
+    });
+    const unrelated = design({ id: "other", directory: "D:/estampas-roxwana/Trabajos/otra" });
+
+    const folderItems = designsInSameDirectory([image, editable, unrelated], image);
+
+    expect(folderItems.map((item) => item.id)).toEqual(["image", "editable"]);
+    expect(countPreviewFilesAcrossDesigns(folderItems)).toBe(1);
+    expect(countForExtensionAcrossDesigns(folderItems, ".psd")).toBe(1);
   });
 });
 

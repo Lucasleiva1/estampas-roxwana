@@ -47,6 +47,7 @@ import {
   createCategory as createLibraryCategory,
   createCategoryGroup as createLibraryGroup,
   createReferenceCategory,
+  detectLibraryChanges,
   deleteCategory as deleteLibraryCategory,
   deleteCategoryGroup as deleteLibraryGroup,
   generatePreview,
@@ -61,6 +62,7 @@ import {
   openBackupFolder,
   removeBrandLogo,
   removeTag,
+  reloadPreferencesIfUnusable,
   rescanPaths,
   revealDesignFile,
   renameCategory as renameLibraryCategory,
@@ -80,7 +82,16 @@ import {
   updateStatus,
   type BrandLogo,
 } from "./lib/api";
-import { UNCATEGORIZED_CATEGORY, chooseRandomDesign, countForExtension, createDefaultFilters, filterDesigns } from "./lib/filtering";
+import {
+  UNCATEGORIZED_CATEGORY,
+  chooseRandomDesign,
+  countForExtension,
+  countForExtensionAcrossDesigns,
+  countPreviewFilesAcrossDesigns,
+  createDefaultFilters,
+  designsInSameDirectory,
+  filterDesigns,
+} from "./lib/filtering";
 import {
   categoryNode,
   flattenSidebar,
@@ -464,6 +475,34 @@ export default function App() {
     };
   }, [applyLibrary]);
 
+  // La biblioteca guardada queda disponible de inmediato. Después se compara
+  // el disco en segundo plano y solo se reescanean las carpetas que cambiaron
+  // mientras ROXWANA estuvo cerrada.
+  const backgroundCheckRoot = useRef<string | null>(null);
+  useEffect(() => {
+    const rootPath = library?.rootPath;
+    if (!rootPath || backgroundCheckRoot.current === rootPath) return;
+    backgroundCheckRoot.current = rootPath;
+    let disposed = false;
+    const timer = window.setTimeout(() => {
+      void detectLibraryChanges(rootPath)
+        .then((response) => {
+          if (!disposed && response) {
+            applyLibrary(response);
+            setDetailsById({});
+          }
+        })
+        .catch((checkError) => {
+          if (!disposed) setError(`No pude comprobar los cambios recientes: ${String(checkError)}`);
+        });
+    }, 700);
+
+    return () => {
+      disposed = true;
+      window.clearTimeout(timer);
+    };
+  }, [applyLibrary, library?.rootPath]);
+
   useEffect(() => {
     let alive = true;
     getBrandLogo()
@@ -489,12 +528,30 @@ export default function App() {
     if (!rootPath) return;
     const normalizedRoot = rootPath.replace(/\\/g, "/").replace(/\/$/, "").toLocaleLowerCase();
     const referencesPrefix = `${normalizedRoot}/referencias`;
+    const preferencesPrefix = `${normalizedRoot}/preferences`;
 
     let disposed = false;
     let stopWatching: (() => void) | null = null;
     let flushTimer = 0;
     let rescanRunning = false;
+    let preferencesReloadRunning = false;
     const pendingPaths = new Set<string>();
+
+    const reloadUnusablePreferences = async () => {
+      if (disposed || preferencesReloadRunning) return;
+      preferencesReloadRunning = true;
+      try {
+        const response = await reloadPreferencesIfUnusable(rootPath);
+        if (!disposed && response) {
+          applyLibrary(response);
+          setDetailsById({});
+        }
+      } catch (preferencesError) {
+        if (!disposed) setError(`No pude reiniciar las preferencias: ${String(preferencesError)}`);
+      } finally {
+        preferencesReloadRunning = false;
+      }
+    };
 
     const scheduleFlush = () => {
       window.clearTimeout(flushTimer);
@@ -524,12 +581,18 @@ export default function App() {
       rootPath,
       (event) => {
         if (typeof event.type === "object" && "access" in event.type) return;
+        let preferencesChanged = false;
         for (const path of event.paths) {
           const normalized = path.replace(/\\/g, "/").toLocaleLowerCase();
           if (normalized.split("/").includes("_roxwana-cache")) continue;
           if (normalized === referencesPrefix || normalized.startsWith(`${referencesPrefix}/`)) continue;
+          if (normalized === preferencesPrefix || normalized.startsWith(`${preferencesPrefix}/`)) {
+            preferencesChanged = true;
+            continue;
+          }
           pendingPaths.add(path);
         }
+        if (preferencesChanged) void reloadUnusablePreferences();
         if (pendingPaths.size > 0) scheduleFlush();
       },
       { recursive: true, delayMs: 750 },
@@ -562,6 +625,10 @@ export default function App() {
   );
   const selectedSummary = filteredDesigns[selectedIndex] ?? filteredDesigns[0] ?? null;
   const selectedDesign = selectedSummary ? detailsById[selectedSummary.id] ?? selectedSummary : null;
+  const selectedDirectoryDesigns = useMemo(
+    () => (selectedDesign ? designsInSameDirectory(library?.designs ?? [], selectedDesign) : []),
+    [library?.designs, selectedDesign],
+  );
 
   useEffect(() => {
     setPageIndex(0);
@@ -1600,6 +1667,7 @@ export default function App() {
 
         <Viewer
           design={selectedDesign}
+          directoryDesigns={selectedDirectoryDesigns}
           loading={loading || scanning}
           zoom={zoom}
           setZoom={setZoom}
@@ -3032,6 +3100,9 @@ function SettingsScreen({
             </div>
             <div className="settings-backup">
               <div className="settings-section-label">Copia de seguridad</div>
+              <small>
+                Preferencias automáticas: versión actual y dos anteriores dentro de {(library?.rootPath ?? DEFAULT_LIBRARY_PATH).replace(/[\\/]+$/, "")}\Preferences
+              </small>
               <div className="settings-backup-actions">
                 <button type="button" onClick={onSaveBackup} disabled={backupBusy} title="Guardar copia de seguridad">
                   {backupState.phase === "saving" ? <Loader2 size={15} className="spin" /> : <Save size={15} />}
@@ -3565,6 +3636,7 @@ function LeftFilters({
 
 function Viewer({
   design,
+  directoryDesigns,
   loading,
   zoom,
   setZoom,
@@ -3573,6 +3645,7 @@ function Viewer({
   onOpenFolder,
 }: {
   design: Design | null;
+  directoryDesigns: Design[];
   loading: boolean;
   zoom: number;
   setZoom: (zoom: number) => void;
@@ -3596,8 +3669,9 @@ function Viewer({
   const canLoadOriginal = Boolean(originalPath) && originalPath !== previewPaths[0];
   const showingOriginal = Boolean(originalPath) && previewPath === originalPath;
   const previewFile = design?.files.find((file) => file.path === design.previewPath) ?? design?.files[0] ?? null;
-  const imageCount = design ? countForExtension(design, ".jpg") + countForExtension(design, ".jpeg") + countForExtension(design, ".png") + countForExtension(design, ".webp") : 0;
-  const applicationAssets = design ? editableApplicationAssets(design) : [];
+  const metricDesigns = directoryDesigns.length > 0 ? directoryDesigns : design ? [design] : [];
+  const imageCount = countPreviewFilesAcrossDesigns(metricDesigns);
+  const applicationAssets = editableApplicationAssets(metricDesigns);
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const artboardRef = useRef<HTMLDivElement | null>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
@@ -3605,9 +3679,9 @@ function Viewer({
   const assetItems = design
       ? [
           { id: "img", kind: "image" as const, label: "Imagen", value: imageCount, tone: "red" as const },
-          { id: "eps", kind: "eps" as const, label: "EPS", value: countForExtension(design, ".eps"), tone: "gold" as const },
-        { id: "pdf", kind: "pdf" as const, label: "PDF", value: countForExtension(design, ".pdf"), tone: "neutral" as const },
-        { id: "txt", kind: "txt" as const, label: "Texto", value: countForExtension(design, ".txt"), tone: "neutral" as const },
+          { id: "eps", kind: "eps" as const, label: "EPS", value: countForExtensionAcrossDesigns(metricDesigns, ".eps"), tone: "gold" as const },
+        { id: "pdf", kind: "pdf" as const, label: "PDF", value: countForExtensionAcrossDesigns(metricDesigns, ".pdf"), tone: "neutral" as const },
+        { id: "txt", kind: "txt" as const, label: "Texto", value: countForExtensionAcrossDesigns(metricDesigns, ".txt"), tone: "neutral" as const },
       ].filter((item) => item.value > 0)
     : [];
 
@@ -3816,7 +3890,7 @@ function Viewer({
           </div>
 
           {applicationAssets.length > 0 && (
-            <div className="viewer-app-badges" aria-label="Aplicaciones de los archivos editables">
+            <div className="viewer-app-badges" aria-label="Aplicaciones de los archivos editables de esta carpeta">
               {applicationAssets.map((asset) => (
                 <span
                   key={asset.kind}
@@ -3831,7 +3905,7 @@ function Viewer({
           )}
 
           {assetItems.length > 0 && (
-            <div className="overlay-assets" aria-label="Archivos de esta estampa">
+            <div className="overlay-assets" aria-label="Archivos de esta carpeta">
               {assetItems.map((item) => (
                 <AssetPill key={item.id} kind={item.kind} label={item.label} value={item.value} tone={item.tone} />
               ))}
@@ -3858,14 +3932,15 @@ function Viewer({
 
 type AssetKind = "image" | "ai" | "psd" | "eps" | "pdf" | "txt";
 
-function editableApplicationAssets(design: Design) {
+function editableApplicationAssets(designOrDesigns: Design | Design[]) {
+  const designs = Array.isArray(designOrDesigns) ? designOrDesigns : [designOrDesigns];
   return [
     {
       kind: "ai" as const,
       label: "Illustrator",
-      count: countForExtension(design, ".ai") + countForExtension(design, ".eps"),
+      count: countForExtensionAcrossDesigns(designs, ".ai") + countForExtensionAcrossDesigns(designs, ".eps"),
     },
-    { kind: "psd" as const, label: "Photoshop", count: countForExtension(design, ".psd") },
+    { kind: "psd" as const, label: "Photoshop", count: countForExtensionAcrossDesigns(designs, ".psd") },
   ].filter((asset) => asset.count > 0);
 }
 
