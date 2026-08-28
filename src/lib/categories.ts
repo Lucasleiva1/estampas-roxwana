@@ -34,6 +34,35 @@ export function flattenSidebar(layout: SidebarNode[]) {
   return layout.flatMap((node) => (node.kind === "group" ? node.children : [node.name]));
 }
 
+function normalizedSearchText(value: string) {
+  return value
+    .trim()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLocaleLowerCase("es-AR");
+}
+
+/**
+ * Reduce temporalmente el panel a los nombres que empiezan con lo escrito. Los
+ * grupos se abren durante la busqueda para que una coincidencia interna nunca
+ * quede escondida, pero su estado guardado no se modifica.
+ */
+export function filterSidebarByName(layout: SidebarNode[], query: string) {
+  const search = normalizedSearchText(query);
+  if (!search) return layout;
+
+  return layout.flatMap((node): SidebarNode[] => {
+    const nodeMatches = normalizedSearchText(node.name).startsWith(search);
+    if (node.kind === "category") return nodeMatches ? [node] : [];
+
+    const matchingChildren = nodeMatches
+      ? node.children
+      : node.children.filter((child) => normalizedSearchText(child).startsWith(search));
+    if (!nodeMatches && matchingChildren.length === 0) return [];
+    return [{ ...node, collapsed: false, children: matchingChildren }];
+  });
+}
+
 export function groupOf(layout: SidebarNode[], category: string) {
   return layout.find(
     (node) => node.kind === "group" && node.children.some((child) => sameCategory(child, category)),

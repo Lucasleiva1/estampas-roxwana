@@ -11,10 +11,8 @@
     {
       "identifier": "fs:scope",
       "allow": [
-        { "path": "$HOME/**/*" },
         { "path": "$APPCACHE/**/*" },
-        { "path": "$APPLOCALDATA/**/*" },
-        { "path": "D:\\estampas-roxwana\\**" }
+        { "path": "$APPLOCALDATA/**/*" }
       ]
     },
     "opener:default",

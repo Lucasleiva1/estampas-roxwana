@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { SidebarNode } from "./categories";
-import type { Design, DesignStatus, ReferenceItem, ReferenceStatus, ReferencesResponse, LibraryResponse } from "./types";
+import type { Design, DesignStatus, FolderCheck, ReferenceItem, ReferenceStatus, ReferencesResponse, LibraryResponse } from "./types";
 
 export interface BackupInfo {
   path: string;
@@ -14,6 +14,12 @@ export interface BrandLogo {
   dataUrl: string;
   width: number;
   height: number;
+}
+
+/** Revisa permisos y ubicacion de una carpeta antes de adoptarla como
+ *  biblioteca. Lanza con un mensaje explicado si Windows no la deja usar. */
+export async function checkLibraryFolder(path: string) {
+  return invoke<FolderCheck>("check_library_folder", { path });
 }
 
 export async function scanLibrary(rootPath: string) {

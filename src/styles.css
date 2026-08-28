@@ -570,6 +570,10 @@ button:disabled {
   border-color: #777b80;
 }
 
+.welcome-error > span {
+  white-space: pre-line;
+}
+
 .welcome-error {
   width: 100%;
   display: grid;
@@ -798,6 +802,47 @@ button:disabled {
   grid-column: 1;
 }
 
+/* El hueco del logo dentro de la barra es el lugar donde se pone la imagen:
+   cuando esta vacio se dibuja punteado, del tamano real que va a ocupar el
+   logo, e invita a hacer clic o a soltarle el archivo encima. */
+.brand-logo-slot-button {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  /* El separador vertical del encabezado real no va sobre un control. */
+  padding-right: 0;
+  border: 1px dashed #5c5348;
+  border-radius: 6px;
+  color: #8d857b;
+  background: rgb(255 255 255 / 3%);
+  font-size: 9px;
+  line-height: 1.2;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color 0.16s ease, color 0.16s ease, background-color 0.16s ease;
+}
+
+.brand-logo-slot-button::after {
+  content: none;
+}
+
+.brand-logo-slot-button svg {
+  flex: 0 0 auto;
+}
+
+.brand-logo-slot-button:hover:not(:disabled) {
+  border-color: #d29332;
+  color: #ffd9a4;
+  background: rgb(210 147 50 / 12%);
+}
+
+.brand-logo-slot-button:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
 .brand-preview-tools {
   grid-column: 2;
 }
@@ -831,16 +876,18 @@ button:disabled {
   font-size: 9px;
 }
 
-.brand-preview-empty-hint {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  color: #77736d;
-  font-size: 10px;
-  transform: translate(-50%, -50%);
+/* Sin imagen cargada los controles del logo siguen en su lugar, apagados y sin
+   responder. Cuando entra la imagen se encienden con una transicion, y ese
+   cambio es la señal de que ya se pueden usar. */
+.brand-logo-editor {
+  transition: opacity 0.22s ease, filter 0.22s ease;
+}
+
+.brand-logo-editor.is-idle {
+  opacity: 0.34;
+  filter: saturate(0.25);
+  pointer-events: none;
+  user-select: none;
 }
 
 .brand-logo-editor,
@@ -1310,6 +1357,8 @@ button:disabled {
 
 .settings-brand-actions {
   display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-start;
   gap: 6px;
 }
 
@@ -1319,8 +1368,7 @@ button:disabled {
   align-items: center;
   justify-content: center;
   gap: 7px;
-  flex: 1;
-  padding: 0 10px;
+  padding: 0 12px;
   border: 1px solid #3a3c40;
   border-radius: 6px;
   color: #ded7ce;
@@ -1334,7 +1382,8 @@ button:disabled {
 }
 
 .settings-brand-actions button.danger {
-  max-width: 36px;
+  width: 34px;
+  max-width: 34px;
   padding: 0;
   border-color: rgb(224 20 31 / 45%);
   color: #f06b71;
@@ -1812,6 +1861,51 @@ button:disabled {
   transform: translateX(16px);
 }
 
+/* La franja de avisos ocupa una sola fila del layout aunque adentro haya un
+   error y un aviso al mismo tiempo. Es flex, no grid, para que el `grid-row`
+   de .error-strip no la vuelva a partir en dos. */
+.notice-stack {
+  grid-row: 2;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Aviso, no error: la biblioteca funciona, solo se entera de los cambios mas
+   tarde porque Windows no avisa en esa carpeta. */
+.warn-strip {
+  min-height: 40px;
+  padding: 8px 18px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  color: #ffe9c2;
+  border-bottom: 1px solid #5a3d12;
+  background: #3a2a0b;
+}
+
+.warn-strip > span {
+  min-width: 0;
+  max-height: 34vh;
+  overflow-y: auto;
+  white-space: pre-line;
+  line-height: 1.5;
+}
+
+.warn-strip button {
+  flex: none;
+  align-self: flex-start;
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border: 1px solid #7a5518;
+  border-radius: 6px;
+  color: #ffe9c2;
+  background: #241a06;
+}
+
 .error-strip {
   grid-row: 2;
   min-height: 40px;
@@ -1819,9 +1913,25 @@ button:disabled {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 14px;
   color: #ffd9d9;
   border-bottom: 1px solid #4c171a;
   background: #3a0b0e;
+}
+
+/* Los avisos de permisos y de disco vienen en varias lineas con pasos a seguir.
+   Sin esto Windows los mostraria como un renglon interminable. */
+.error-strip > span {
+  min-width: 0;
+  max-height: 34vh;
+  overflow-y: auto;
+  white-space: pre-line;
+  line-height: 1.5;
+}
+
+.error-strip button {
+  flex: none;
+  align-self: flex-start;
 }
 
 .error-strip button {
@@ -1911,11 +2021,79 @@ button:disabled {
 
 .panel-head {
   display: flex;
-  justify-content: space-between;
   align-items: center;
+  gap: 6px;
   color: #8f8d8a;
   font-size: 13px;
   text-transform: uppercase;
+}
+
+.panel-title {
+  flex: 0 0 auto;
+  font-size: 10px;
+  letter-spacing: 0.035em;
+}
+
+.category-search {
+  position: relative;
+  min-width: 38px;
+  height: 26px;
+  display: flex;
+  flex: 1 1 84px;
+  align-items: center;
+}
+
+.category-search > svg {
+  position: absolute;
+  z-index: 1;
+  left: 7px;
+  color: #706e6b;
+  pointer-events: none;
+}
+
+.category-search input {
+  width: 100%;
+  min-width: 0;
+  height: 26px;
+  padding: 0 23px 0 24px;
+  border: 1px solid #303236;
+  border-radius: 5px;
+  outline: none;
+  color: #e7e1d8;
+  background: #0c0d0e;
+  font-size: 11px;
+  text-transform: none;
+}
+
+.category-search input::placeholder {
+  color: #666461;
+}
+
+.category-search input:focus {
+  border-color: #8d2025;
+  background: #111214;
+}
+
+.category-search input::-webkit-search-cancel-button {
+  appearance: none;
+}
+
+.panel-head .category-search-clear {
+  position: absolute;
+  z-index: 2;
+  right: 3px;
+  width: 20px;
+  height: 20px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border-radius: 4px;
+  color: #85817c;
+}
+
+.panel-head .category-search-clear:hover {
+  color: #f0e8dd;
+  background: #242628;
 }
 
 .panel-head button {
@@ -1929,6 +2107,7 @@ button:disabled {
 
 .panel-actions {
   display: flex;
+  flex: 0 0 auto;
   align-items: center;
   gap: 4px;
 }
@@ -4478,6 +4657,14 @@ button:disabled {
   background: #f6f8fa;
 }
 
+.category-search-empty {
+  margin: 8px 5px;
+  color: #77736e;
+  font-size: 11px;
+  line-height: 1.45;
+  text-align: center;
+}
+
 :root[data-theme="light"] .welcome-notice strong {
   color: #26323f;
 }
@@ -4631,6 +4818,12 @@ button:disabled {
   border-color: #c5ced8;
   color: #697483;
   background-color: #f2f5f8;
+}
+
+:root[data-theme="light"] .brand-logo-slot-button {
+  border-color: #b3bdc8;
+  color: #6d7885;
+  background: rgb(30 45 62 / 4%);
 }
 
 :root[data-theme="light"] .brand-header-preview {
@@ -4791,6 +4984,28 @@ button:disabled {
 
 :root[data-theme="light"] .panel-head button {
   color: #687381;
+}
+
+:root[data-theme="light"] .category-search input {
+  border-color: #cbd3dc;
+  color: #25313d;
+  background: #ffffff;
+}
+
+:root[data-theme="light"] .category-search input::placeholder,
+:root[data-theme="light"] .category-search > svg,
+:root[data-theme="light"] .category-search-empty {
+  color: #7a8592;
+}
+
+:root[data-theme="light"] .category-search input:focus {
+  border-color: #b8252d;
+  background: #ffffff;
+}
+
+:root[data-theme="light"] .panel-head .category-search-clear:hover {
+  color: #25313d;
+  background: #edf1f5;
 }
 
 :root[data-theme="light"] .panel-head .panel-icon-button:hover,

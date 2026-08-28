@@ -5,12 +5,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
+    fs::{self, OpenOptions},
     path::{Path, PathBuf},
     process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Manager};
+use tauri_plugin_fs::FsExt;
 use walkdir::WalkDir;
 
 const FREEPIK_DIR_NAME: &str = "Freepik";
@@ -39,6 +40,7 @@ const REFERENCE_STATUSES: &[&str] = &["pending", "working", "done"];
 const CONTENT_LAYOUT_VERSION: &str = "github-layout-restored-v1";
 const BACKUP_FILE_NAME: &str = "biblioteca-visual-respaldo.sqlite";
 const RESTORE_SAFETY_FILE_NAME: &str = "biblioteca-visual-antes-de-cargar.sqlite";
+const LOCAL_DATABASE_RESCUE_FILE_NAME: &str = "biblioteca-visual-antes-de-reemplazar.sqlite";
 const PORTABLE_PREFERENCES_FILE_NAME: &str = "roxwana-preferences-v1.0.0.sqlite";
 const PORTABLE_PREFERENCES_PREVIOUS_FILE_NAME: &str =
     "roxwana-preferences-v1.0.0-anterior-1.sqlite";
@@ -58,6 +60,18 @@ struct LibraryResponse {
     categories: Vec<String>,
     sidebar: Vec<SidebarNode>,
     tags: Vec<String>,
+    /// Explicacion en criollo de por que la carpeta guardada no se puede usar
+    /// ahora mismo: disco desconectado, carpeta movida o permisos bloqueados.
+    /// Vacio cuando la biblioteca esta sana.
+    root_issue: Option<String>,
+}
+
+/// Resultado de revisar una carpeta antes de adoptarla como biblioteca.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FolderCheck {
+    path: String,
+    warnings: Vec<String>,
 }
 
 /// One row of the category panel: either a loose category or a group that holds
@@ -228,28 +242,50 @@ struct GroupBuilder {
 fn get_initial_state(app: AppHandle) -> Result<LibraryResponse, String> {
     let conn = open_database(&app)?;
     ensure_database(&conn)?;
-    migrate_legacy_cache_to_portable(&app, &conn)?;
+    // La migracion de la cache vieja es transitoria. Si falla, la aplicacion
+    // tiene que abrir igual y regenerar las miniaturas que falten: nunca puede
+    // dejar al usuario sin poder entrar.
+    if let Err(error) = migrate_legacy_cache_to_portable(&app, &conn) {
+        eprintln!("No se pudo migrar la cache anterior: {error}");
+    }
     // Sin biblioteca elegida la ruta queda vacia: es una instalacion nueva y la
     // interfaz muestra la bienvenida en lugar de inventar una carpeta.
     let root = get_setting(&conn, "library_root")?.unwrap_or_default();
-    let root_exists = !root.is_empty() && PathBuf::from(&root).exists();
     drop(conn);
 
-    if root_exists {
-        allow_library_assets(&app, Path::new(&root));
-    }
+    // Antes de tocar nada se comprueba que la carpeta guardada siga estando y
+    // siga siendo escribible. Un disco externo desconectado, una carpeta movida
+    // o el Acceso controlado a carpetas de Windows tienen que dar un mensaje
+    // claro, no una biblioteca vacia sin explicacion.
+    let mut root_issue = if root.is_empty() {
+        None
+    } else {
+        validate_library_root_usable(Path::new(&root)).err()
+    };
+    let root_usable = !root.is_empty() && root_issue.is_none();
 
-    if root_exists {
-        apply_portable_preferences_authority(&app, Path::new(&root))?;
+    if root_usable {
+        allow_library_access(&app, Path::new(&root))?;
+        // Si las copias de Preferences estan ilegibles (antivirus, OneDrive
+        // sincronizando, archivo bloqueado) se sigue con la base local en vez
+        // de dejar la aplicacion sin abrir.
+        if let Err(error) = apply_portable_preferences_authority(&app, Path::new(&root)) {
+            root_issue = Some(format!(
+                "No se pudieron leer las preferencias guardadas dentro de la biblioteca, así que \
+                 la aplicación abrió con la última configuración de esta PC.\n\n\
+                 Si tenés un antivirus o OneDrive sincronizando esa carpeta, esperá un momento y \
+                 volvé a abrir la aplicación.\n\n{error}"
+            ));
+        }
     }
 
     let conn = open_database(&app)?;
     ensure_database(&conn)?;
     let layout_needs_rescan =
         get_setting(&conn, "content_layout_version")?.as_deref() != Some(CONTENT_LAYOUT_VERSION);
-    let should_scan = root_exists && (active_design_count(&conn)? == 0 || layout_needs_rescan);
+    let should_scan = root_usable && (active_design_count(&conn)? == 0 || layout_needs_rescan);
 
-    if !root_exists {
+    if !root_usable {
         conn.execute("UPDATE designs SET missing = 1", [])
             .map_err(to_string)?;
         conn.execute("UPDATE files SET missing = 1", [])
@@ -257,13 +293,32 @@ fn get_initial_state(app: AppHandle) -> Result<LibraryResponse, String> {
     }
     drop(conn);
 
-    if should_scan {
-        scan_library_impl(&app, &root)
+    let mut response = if should_scan {
+        scan_library_impl(&app, &root)?
     } else {
         let conn = open_database(&app)?;
         ensure_database(&conn)?;
-        load_library_from_db(&conn, &root)
-    }
+        load_library_from_db(&conn, &root)?
+    };
+    response.root_issue = root_issue;
+    Ok(response)
+}
+
+/// Revisa una carpeta antes de adoptarla como biblioteca: devuelve error si no
+/// sirve y, si sirve, la lista de avisos que conviene mostrarle al usuario.
+///
+/// Deja la carpeta autorizada aunque el usuario todavia no haya confirmado. Sin
+/// eso la pantalla no puede probar el vigilante antes de escanear, y el permiso
+/// se reconstruye igual en cada arranque desde la ruta guardada.
+#[tauri::command]
+fn check_library_folder(app: AppHandle, path: String) -> Result<FolderCheck, String> {
+    let root = PathBuf::from(&path);
+    validate_library_root_access(&root)?;
+    allow_library_access(&app, &root)?;
+    Ok(FolderCheck {
+        warnings: library_root_warnings(&root),
+        path,
+    })
 }
 
 #[tauri::command]
@@ -338,15 +393,21 @@ async fn detect_reference_changes(
 #[tauri::command]
 fn create_reference_category(root_path: String, name: String) -> Result<String, String> {
     let folder_name = safe_folder_name(&name)?;
-    let references_path = PathBuf::from(&root_path).join(REFERENCES_DIR_NAME);
+    let root = PathBuf::from(&root_path);
+    let references_path = root.join(REFERENCES_DIR_NAME);
     fs::create_dir_all(&references_path)
-        .map_err(|error| format!("No se pudo preparar Referencias: {error}"))?;
+        .map_err(|error| describe_root_failure(&root, "preparar la carpeta Referencias", &error))?;
     let category_path = references_path.join(&folder_name);
     if category_path.exists() {
         return Err("Ya existe una carpeta de referencias con ese nombre".to_string());
     }
-    fs::create_dir(&category_path)
-        .map_err(|error| format!("No se pudo crear la carpeta de referencias: {error}"))?;
+    fs::create_dir(&category_path).map_err(|error| {
+        describe_root_failure(
+            &references_path,
+            &format!("crear la carpeta de referencias {folder_name}"),
+            &error,
+        )
+    })?;
     Ok(folder_name)
 }
 
@@ -420,9 +481,8 @@ fn get_design_detail(app: AppHandle, design_id: String) -> Result<Option<Design>
 #[tauri::command]
 fn scan_library(app: AppHandle, root_path: String) -> Result<LibraryResponse, String> {
     let root = PathBuf::from(&root_path);
-    if root.is_dir() {
-        apply_portable_preferences_authority(&app, &root)?;
-    }
+    validate_library_root_access(&root)?;
+    apply_portable_preferences_authority(&app, &root)?;
     scan_library_impl(&app, &root_path)
 }
 
@@ -1538,13 +1598,24 @@ fn copy_reference_into_work(
     work_name: &str,
 ) -> Result<PathBuf, String> {
     let folder_name = safe_folder_name(work_name)?;
-    let work_path = root.join(WORKS_DIR_NAME).join(folder_name);
-    fs::create_dir_all(&work_path)
-        .map_err(|error| format!("No se pudo crear la carpeta del trabajo: {error}"))?;
+    let works_path = root.join(WORKS_DIR_NAME);
+    let work_path = works_path.join(&folder_name);
+    fs::create_dir_all(&work_path).map_err(|error| {
+        describe_root_failure(
+            &works_path,
+            &format!("crear la carpeta del trabajo {folder_name}"),
+            &error,
+        )
+    })?;
     let destination = work_path.join(file_name);
     if !destination.exists() {
-        fs::copy(source, &destination)
-            .map_err(|error| format!("No se pudo copiar la referencia al trabajo: {error}"))?;
+        fs::copy(source, &destination).map_err(|error| {
+            describe_root_failure(
+                &work_path,
+                &format!("copiar la referencia {file_name} al trabajo"),
+                &error,
+            )
+        })?;
     }
     Ok(work_path)
 }
@@ -1579,15 +1650,322 @@ fn safe_folder_name(value: &str) -> Result<String, String> {
     Ok(cleaned)
 }
 
-/// Autoriza a la ventana a mostrar las imagenes de la biblioteca elegida. Sin
-/// esto la aplicacion encuentra las estampas pero no puede dibujarlas: se ven
-/// los recuadros vacios. El permiso queda guardado por el plugin de scope, asi
-/// que se concede una vez y sobrevive a los reinicios.
-fn allow_library_assets(app: &AppHandle, root: &Path) {
-    let scope = app.asset_protocol_scope();
-    if let Err(error) = scope.allow_directory(root, true) {
-        eprintln!("No se pudo autorizar la carpeta de la biblioteca: {error}");
+/// Autoriza exclusivamente la biblioteca elegida para mostrar imagenes y
+/// observar cambios. El permiso se reconstruye desde la ruta guardada en cada
+/// inicio: una instalacion nueva no contiene rutas de ningun usuario.
+fn allow_library_access(app: &AppHandle, root: &Path) -> Result<(), String> {
+    let asset_scope = app.asset_protocol_scope();
+    asset_scope
+        .allow_directory(root, true)
+        .map_err(|error| format!("No se pudo autorizar la vista de la biblioteca: {error}"))?;
+
+    let fs_scope = app.fs_scope();
+    fs_scope
+        .allow_directory(root, true)
+        .map_err(|error| format!("No se pudo autorizar el vigilante de la biblioteca: {error}"))?;
+    Ok(())
+}
+
+// Codigos de error de Windows que conviene traducir a una instruccion concreta.
+// El usuario de esta aplicacion no lee numeros de error: necesita saber que
+// boton tocar para desbloquear su carpeta.
+const WIN_ERROR_ACCESS_DENIED: i32 = 5;
+const WIN_ERROR_WRITE_PROTECT: i32 = 19;
+const WIN_ERROR_NOT_READY: i32 = 21;
+const WIN_ERROR_SHARING_VIOLATION: i32 = 32;
+const WIN_ERROR_DISK_FULL: i32 = 112;
+const WIN_ERROR_PATH_TOO_LONG: i32 = 206;
+
+/// Longitud a partir de la cual una ruta empieza a acercarse al limite de
+/// Windows. La cache agrega `\_roxwana-cache\thumbnails\<64 caracteres>.webp`
+/// al lado de cada imagen, asi que la carpeta elegida tiene que dejar margen.
+const ROOT_PATH_LENGTH_WARNING: usize = 120;
+
+/// Compara rutas como lo hace Windows: sin distinguir mayusculas, con las dos
+/// barras equivalentes y sin la barra final. `normalize_path_for_id` no sirve
+/// aca porque deja `C:\` como `c:/` y ninguna subcarpeta parece descender de el.
+fn comparable_path(path: &Path) -> String {
+    let text = path.to_string_lossy().replace('/', "\\").to_lowercase();
+    let trimmed = text.trim_end_matches('\\');
+    if trimmed.is_empty() {
+        text
+    } else {
+        trimmed.to_string()
     }
+}
+
+fn path_is_inside(path: &Path, ancestor: &Path) -> bool {
+    let path = comparable_path(path);
+    let ancestor = comparable_path(ancestor);
+    if ancestor.is_empty() {
+        return false;
+    }
+    path == ancestor || path.starts_with(&format!("{ancestor}\\"))
+}
+
+fn env_directory(variable: &str) -> Option<PathBuf> {
+    let value = std::env::var_os(variable)?;
+    let path = PathBuf::from(value);
+    if path.as_os_str().is_empty() {
+        None
+    } else {
+        Some(path)
+    }
+}
+
+/// Carpetas del sistema que nunca pueden ser una biblioteca. Elegir una de
+/// estas haria que el escaneo recorriera decenas de miles de archivos ajenos y
+/// que la aplicacion escribiera carpetas `_roxwana-cache` dentro de Windows o
+/// del perfil completo del usuario.
+fn protected_root_reason(root: &Path) -> Option<String> {
+    if let Some(system_drive) = env_directory("SystemDrive") {
+        if comparable_path(root) == comparable_path(&system_drive) {
+            return Some(format!(
+                "Elegiste {} entero, que es el disco donde esta instalado Windows.\n\n\
+                 Creá una carpeta propia y elegí esa, por ejemplo {}\\ROXWANA.",
+                system_drive.display(),
+                system_drive.display()
+            ));
+        }
+    }
+
+    let system_directories = [
+        ("Windows", env_directory("SystemRoot")),
+        ("Archivos de programa", env_directory("ProgramFiles")),
+        (
+            "Archivos de programa (x86)",
+            env_directory("ProgramFiles(x86)"),
+        ),
+        ("ProgramData", env_directory("ProgramData")),
+        (
+            "los datos internos de los programas",
+            env_directory("LOCALAPPDATA"),
+        ),
+        (
+            "los datos internos de los programas",
+            env_directory("APPDATA"),
+        ),
+    ];
+    for (label, directory) in system_directories {
+        let Some(directory) = directory else { continue };
+        if path_is_inside(root, &directory) {
+            return Some(format!(
+                "Esa carpeta pertenece a {label} ({}).\n\n\
+                 Windows la protege y borra su contenido al actualizar o desinstalar programas. \
+                 Elegí una carpeta tuya, por ejemplo Documentos\\ROXWANA.",
+                directory.display()
+            ));
+        }
+    }
+
+    if let Some(profile) = env_directory("USERPROFILE") {
+        if comparable_path(root) == comparable_path(&profile) {
+            return Some(format!(
+                "Elegiste tu carpeta de usuario completa ({}).\n\n\
+                 Ahí adentro está todo lo que Windows guarda de vos, y la biblioteca tendría que recorrer \
+                 decenas de miles de archivos. Elegí una carpeta puntual, por ejemplo \
+                 Documentos\\ROXWANA.",
+                profile.display()
+            ));
+        }
+        if let Some(users) = profile.parent() {
+            if comparable_path(root) == comparable_path(users) {
+                return Some(format!(
+                    "Elegiste {}, que contiene las carpetas de todos los usuarios de esta PC.\n\n\
+                     Elegí una carpeta tuya, por ejemplo Documentos\\ROXWANA.",
+                    users.display()
+                ));
+            }
+        }
+    }
+
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(install_dir) = executable.parent() {
+            if path_is_inside(root, install_dir) {
+                return Some(format!(
+                    "Esa carpeta es donde está instalada la aplicación ({}).\n\n\
+                     Al actualizar ROXWANA se reemplaza su contenido y perderías las imágenes. \
+                     Elegí una carpeta aparte.",
+                    install_dir.display()
+                ));
+            }
+        }
+    }
+
+    None
+}
+
+/// Traduce el fallo real de Windows a una instruccion que el usuario pueda
+/// seguir sin ayuda.
+fn describe_root_failure(root: &Path, action: &str, error: &std::io::Error) -> String {
+    let advice = match error.raw_os_error() {
+        Some(WIN_ERROR_ACCESS_DENIED) => {
+            "Windows bloqueó el acceso a esa carpeta.\n\n\
+             • Si está en Documentos, Escritorio o Imágenes: abrí Seguridad de Windows → \
+               Protección contra ransomware → Acceso controlado a carpetas, y permití \
+               \"ROXWANA Biblioteca Visual\".\n\
+             • Si es una carpeta de otro usuario o de red: pedí permiso de escritura.\n\
+             • O elegí otra carpeta tuya, por ejemplo Documentos\\ROXWANA."
+        }
+        Some(WIN_ERROR_WRITE_PROTECT) => {
+            "La unidad está protegida contra escritura.\n\n\
+             Si es un pendrive, fijate la pestañita de bloqueo al costado. Si es un disco externo, \
+             revisá que no esté conectado como solo lectura."
+        }
+        Some(WIN_ERROR_NOT_READY) => {
+            "La unidad no responde.\n\n\
+             Conectá el disco externo o el pendrive donde está la biblioteca y volvé a intentar."
+        }
+        Some(WIN_ERROR_DISK_FULL) => {
+            "No queda espacio libre en esa unidad.\n\n\
+             La aplicación necesita lugar para guardar las miniaturas. Liberá espacio o elegí otro disco."
+        }
+        Some(WIN_ERROR_PATH_TOO_LONG) => {
+            "La ruta es demasiado larga para Windows.\n\n\
+             Mové la biblioteca más cerca de la raíz del disco, por ejemplo D:\\ROXWANA."
+        }
+        Some(WIN_ERROR_SHARING_VIOLATION) => {
+            "Otro programa está usando esa carpeta.\n\n\
+             Cerrá el Explorador de archivos, el antivirus o el programa que la tenga abierta y volvé a intentar."
+        }
+        _ => {
+            "La aplicación necesita poder leer y guardar dentro de la carpeta que elijas: ahí van \
+             las miniaturas y tus preferencias.\n\n\
+             Elegí una carpeta donde puedas crear archivos, por ejemplo Documentos\\ROXWANA."
+        }
+    };
+    format!(
+        "{advice}\n\nNo se pudo {action}.\nCarpeta: {}\nDetalle de Windows: {error}",
+        root.display()
+    )
+}
+
+/// Comprobacion completa para adoptar una carpeta nueva: ademas de los
+/// permisos, rechaza las carpetas del sistema.
+fn validate_library_root_access(root: &Path) -> Result<(), String> {
+    if root.is_dir() {
+        if let Some(reason) = protected_root_reason(root) {
+            return Err(reason);
+        }
+    }
+    validate_library_root_usable(root)
+}
+
+/// Comprueba los permisos reales de Windows sobre una carpeta. Los archivos
+/// temporales se eliminan inmediatamente y nunca reemplazan contenido del
+/// usuario. Se usa tambien al arrancar sobre la biblioteca ya guardada, por eso
+/// no repite el rechazo de carpetas del sistema: una biblioteca que ya venia
+/// funcionando no se le quita al usuario de un dia para el otro.
+fn validate_library_root_usable(root: &Path) -> Result<(), String> {
+    if root.as_os_str().is_empty() {
+        return Err("No se eligió ninguna carpeta.".to_string());
+    }
+    if !root.is_dir() {
+        return Err(format!(
+            "La carpeta elegida no existe o ya no está disponible.\n\n\
+             Si la biblioteca vive en un disco externo o un pendrive, conectalo y volvé a intentar. \
+             Si le cambiaste el nombre o la moviste, elegila de nuevo.\n\nCarpeta: {}",
+            root.display()
+        ));
+    }
+    fs::read_dir(root)
+        .map_err(|error| describe_root_failure(root, "leer la carpeta elegida", &error))?;
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let stamp = format!("{}-{nonce}", std::process::id());
+
+    // Primera prueba: crear un archivo suelto, como la copia de Preferences.
+    let probe = root.join(format!(".roxwana-permission-check-{stamp}.tmp"));
+    let probe_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .map_err(|error| describe_root_failure(root, "guardar un archivo de prueba", &error))?;
+    drop(probe_file);
+    let file_cleanup = fs::remove_file(&probe);
+
+    // Segunda prueba: crear una subcarpeta con un archivo adentro, que es lo
+    // que hace la cache `_roxwana-cache` al lado de cada imagen. El Acceso
+    // controlado a carpetas de Windows puede permitir una cosa y bloquear la otra.
+    let probe_dir = root.join(format!(".roxwana-permission-check-{stamp}"));
+    let nested_result = fs::create_dir_all(&probe_dir).and_then(|()| {
+        let nested = probe_dir.join("prueba.tmp");
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&nested)
+            .map(drop)
+            .and_then(|()| fs::remove_file(&nested))
+    });
+    let _ = fs::remove_dir_all(&probe_dir);
+    nested_result
+        .map_err(|error| describe_root_failure(root, "crear una subcarpeta de prueba", &error))?;
+
+    file_cleanup
+        .map_err(|error| describe_root_failure(root, "borrar el archivo de prueba", &error))?;
+    Ok(())
+}
+
+/// Avisos que no impiden usar la carpeta pero que explican de antemano por que
+/// la aplicacion podria comportarse distinto en esa ubicacion.
+fn library_root_warnings(root: &Path) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let text = root.to_string_lossy().to_string();
+
+    if text.starts_with("\\\\") || text.starts_with("//") {
+        warnings.push(
+            "La carpeta está en la red, no en esta PC. Si la red se corta, las imágenes dejan de \
+             verse y el aviso automático de cambios puede no funcionar. Anda mucho mejor con la \
+             biblioteca en un disco de la máquina."
+                .to_string(),
+        );
+    }
+
+    let in_onedrive = root
+        .components()
+        .any(|component| {
+            component
+                .as_os_str()
+                .to_string_lossy()
+                .to_lowercase()
+                .starts_with("onedrive")
+        })
+        || ["OneDrive", "OneDriveCommercial", "OneDriveConsumer"]
+            .iter()
+            .filter_map(|variable| env_directory(variable))
+            .any(|directory| path_is_inside(root, &directory));
+    if in_onedrive {
+        warnings.push(
+            "La carpeta está dentro de OneDrive. Si las imágenes están \"solo en línea\", la \
+             aplicación las va a descargar al generar las miniaturas y el primer escaneo va a \
+             tardar mucho más. Conviene hacer clic derecho en la carpeta y elegir \"Conservar \
+             siempre en este dispositivo\"."
+                .to_string(),
+        );
+    }
+
+    if text.chars().count() > ROOT_PATH_LENGTH_WARNING {
+        warnings.push(format!(
+            "La ruta de la carpeta es muy larga ({} caracteres). Windows tiene un límite y las \
+             miniaturas se guardan en subcarpetas dentro de la biblioteca. Si algo falla, mové la \
+             biblioteca más cerca de la raíz del disco, por ejemplo D:\\ROXWANA.",
+            text.chars().count()
+        ));
+    }
+
+    if root.parent().is_none() {
+        warnings.push(
+            "Elegiste una unidad entera. La aplicación va a crear sus carpetas de trabajo \
+             directamente en la raíz del disco y va a recorrer todo lo que haya adentro. Si el \
+             disco tiene otras cosas, conviene elegir una carpeta puntual."
+                .to_string(),
+        );
+    }
+
+    warnings
 }
 
 /// Deja creadas las carpetas de trabajo dentro de la biblioteca elegida para
@@ -1598,19 +1976,37 @@ fn ensure_starter_directories(root: &Path) -> Result<(), String> {
         if directory.is_dir() {
             continue;
         }
-        fs::create_dir_all(&directory)
-            .map_err(|error| format!("No se pudo crear la carpeta {name}: {error}"))?;
+        fs::create_dir_all(&directory).map_err(|error| {
+            describe_root_failure(root, &format!("crear la carpeta {name}"), &error)
+        })?;
+        // Windows puede aceptar la orden y no dejar la carpeta: el Acceso
+        // controlado a carpetas, un antivirus o una unidad de red que se corta
+        // devuelven exito y despues revierten. Comprobarlo aca evita descubrirlo
+        // mas tarde con la biblioteca a medio armar.
+        if !directory.is_dir() {
+            return Err(format!(
+                "Windows aceptó crear la carpeta {name} pero después no quedó en el disco.\n\n\
+                 Suele pasar cuando un antivirus o el Acceso controlado a carpetas de Windows \
+                 revierten lo que escribe la aplicación, o cuando la unidad se desconectó en el \
+                 medio.\n\n\
+                 Permití \"ROXWANA Biblioteca Visual\" en Seguridad de Windows, o elegí otra \
+                 carpeta.\n\nCarpeta: {}",
+                directory.display()
+            ));
+        }
     }
     Ok(())
 }
 
 fn scan_library_impl(app: &AppHandle, root_path: &str) -> Result<LibraryResponse, String> {
     let root = PathBuf::from(root_path);
-    if !root.exists() {
-        return Err(format!("La carpeta no existe: {root_path}"));
+    if !root.is_dir() {
+        return Err(format!(
+            "La carpeta no existe o no esta disponible: {root_path}"
+        ));
     }
 
-    allow_library_assets(app, &root);
+    allow_library_access(app, &root)?;
     ensure_starter_directories(&root)?;
 
     let conn = open_database(app)?;
@@ -1959,6 +2355,7 @@ fn load_library_from_db(conn: &Connection, root_path: &str) -> Result<LibraryRes
         categories,
         sidebar,
         tags,
+        root_issue: None,
     })
 }
 
@@ -2852,6 +3249,31 @@ fn apply_portable_preferences_authority(app: &AppHandle, root: &Path) -> Result<
         .map(|source| source.is_some())
 }
 
+/// Copia de rescate de la base local antes de reemplazarla o borrarla. Si el
+/// usuario elige por error una carpeta equivocada, o si `Preferences` viaja
+/// incompleta en un disco externo, su clasificacion no desaparece sin red.
+/// Es best-effort a proposito: nunca puede impedir que la aplicacion abra.
+fn keep_local_database_rescue_copy(db_path: &Path) {
+    if !db_path.is_file() {
+        return;
+    }
+    let Some(parent) = db_path.parent() else {
+        return;
+    };
+    let rescue_dir = parent.join("copias-de-seguridad");
+    if fs::create_dir_all(&rescue_dir).is_err() {
+        return;
+    }
+    let target = rescue_dir.join(LOCAL_DATABASE_RESCUE_FILE_NAME);
+    let _ = fs::remove_file(&target);
+    // `VACUUM INTO` copia tambien lo que quedo en el WAL; copiar el archivo
+    // suelto perderia los ultimos cambios del usuario.
+    let Ok(conn) = Connection::open(db_path) else {
+        return;
+    };
+    let _ = conn.execute("VACUUM INTO ?1", params![path_to_string(&target)]);
+}
+
 fn replace_local_database_from_authority(
     sources: &[PathBuf],
     db_path: &Path,
@@ -2866,6 +3288,7 @@ fn replace_local_database_from_authority(
             continue;
         }
 
+        keep_local_database_rescue_copy(db_path);
         remove_database_files(db_path)?;
         fs::copy(source, db_path).map_err(|error| {
             format!("No se pudieron cargar las preferencias portables: {error}")
@@ -2882,6 +3305,8 @@ fn replace_local_database_from_authority(
 
     // Preferences es la fuente de verdad. Solo cuando no queda ninguna de las
     // tres versiones se descarta la configuracion local y se vuelve al inicio.
+    // Antes de descartarla queda una copia de rescate en copias-de-seguridad.
+    keep_local_database_rescue_copy(db_path);
     remove_database_files(db_path)?;
     let conn = Connection::open(db_path).map_err(to_string)?;
     ensure_database(&conn)?;
@@ -4785,6 +5210,18 @@ fn to_string<E: std::fmt::Display>(error: E) -> String {
 
 fn main() {
     tauri::Builder::default()
+        // Dos copias abiertas escribirian a la vez la misma base y las mismas
+        // copias de Preferences, y podrian dejarlas a medio escribir. Si el
+        // usuario vuelve a hacer doble clic en el icono, se trae al frente la
+        // ventana que ya estaba abierta. Va primero: el resto de los plugins
+        // solo tiene sentido en la unica instancia que sobrevive.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {
                 window.show()?;
@@ -4794,7 +5231,6 @@ fn main() {
         })
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
-        .plugin(tauri_plugin_persisted_scope::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -4815,6 +5251,7 @@ fn main() {
             send_reference_to_work,
             get_library_from_db,
             get_design_detail,
+            check_library_folder,
             scan_library,
             reload_preferences_if_unusable,
             rescan_paths,
@@ -4850,6 +5287,35 @@ fn main() {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn distributable_config_has_no_preselected_library_scope() {
+        let capability: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/default.json")).unwrap();
+        let fs_scope = capability["permissions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|permission| permission["identifier"] == "fs:scope")
+            .unwrap();
+        let fs_paths = fs_scope["allow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["path"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(fs_paths, ["$APPCACHE/**/*", "$APPLOCALDATA/**/*"]);
+
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let asset_paths = config["app"]["security"]["assetProtocol"]["scope"]["allow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry.as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(asset_paths, ["$APPCACHE/**/*", "$APPLOCALDATA/**/*"]);
+    }
 
     /// Arma una tabla `name` minima con los registros indicados
     /// (`platform`, `language`, `name_id`, texto) para probar el parseo.
@@ -4936,6 +5402,8 @@ mod tests {
     #[test]
     fn creates_the_starter_directories_in_an_empty_library() {
         let dir = tempdir().unwrap();
+        validate_library_root_usable(dir.path()).unwrap();
+        assert!(fs::read_dir(dir.path()).unwrap().next().is_none());
         ensure_starter_directories(dir.path()).unwrap();
         for esperada in ["Categorías", "Trabajos", "Referencias", "Varios"] {
             assert!(
@@ -4945,6 +5413,194 @@ mod tests {
         }
         // Freepik es propia de la biblioteca original: no se crea de cero.
         assert!(!dir.path().join("Freepik").exists());
+    }
+
+    /// Prueba real contra Windows: se le quita el permiso de escritura a una
+    /// carpeta con `icacls` y se comprueba que la aplicacion la rechaza con la
+    /// explicacion correcta en vez de adoptarla y fallar despues.
+    #[test]
+    fn refuses_a_folder_where_windows_actually_denies_writing() {
+        let dir = tempdir().unwrap();
+        let blocked = dir.path().join("bloqueada");
+        fs::create_dir(&blocked).unwrap();
+        let blocked_text = path_to_string(&blocked);
+
+        let Ok(user) = std::env::var("USERNAME") else {
+            return;
+        };
+        if user.is_empty() {
+            return;
+        }
+
+        let denied = Command::new("icacls")
+            .args([&blocked_text, "/deny", &format!("{user}:(W)")])
+            .output();
+        let Ok(denied) = denied else {
+            return; // Sin icacls disponible no se puede montar el escenario.
+        };
+        if !denied.status.success() {
+            return;
+        }
+
+        let outcome = validate_library_root_usable(&blocked);
+
+        // Devolver el permiso antes de comprobar nada: si el assert falla, la
+        // carpeta temporal tiene que poder borrarse igual.
+        let _ = Command::new("icacls")
+            .args([&blocked_text, "/remove:d", &user])
+            .output();
+
+        let error = outcome.expect_err("una carpeta sin permiso de escritura no puede aceptarse");
+        assert!(
+            error.contains("Acceso controlado a carpetas"),
+            "el mensaje tiene que explicar como desbloquearla, pero dijo: {error}"
+        );
+        assert!(error.contains(&blocked_text));
+    }
+
+    #[test]
+    fn explains_each_windows_permission_failure_in_plain_language() {
+        let root = Path::new("D:\\ROXWANA");
+        let cases = [
+            (WIN_ERROR_ACCESS_DENIED, "Acceso controlado a carpetas"),
+            (WIN_ERROR_WRITE_PROTECT, "protegida contra escritura"),
+            (WIN_ERROR_NOT_READY, "Conectá el disco externo"),
+            (WIN_ERROR_DISK_FULL, "espacio libre"),
+            (WIN_ERROR_PATH_TOO_LONG, "demasiado larga"),
+            (WIN_ERROR_SHARING_VIOLATION, "Otro programa está usando"),
+        ];
+        for (code, expected) in cases {
+            let error = std::io::Error::from_raw_os_error(code);
+            let message = describe_root_failure(root, "crear la carpeta Trabajos", &error);
+            assert!(
+                message.contains(expected),
+                "el error {code} deberia explicar \"{expected}\", pero dijo: {message}"
+            );
+            // Siempre tiene que decir que se estaba intentando y donde.
+            assert!(message.contains("crear la carpeta Trabajos"));
+            assert!(message.contains("D:\\ROXWANA"));
+        }
+    }
+
+    #[test]
+    fn compares_paths_like_windows_including_drive_roots() {
+        assert!(path_is_inside(
+            Path::new("C:\\Users\\ana\\Documentos"),
+            Path::new("C:\\")
+        ));
+        assert!(path_is_inside(
+            Path::new("D:/Biblioteca/Trabajos"),
+            Path::new("D:\\biblioteca")
+        ));
+        assert!(path_is_inside(
+            Path::new("D:\\Biblioteca\\"),
+            Path::new("D:\\Biblioteca")
+        ));
+        // Un nombre que empieza igual no es una subcarpeta.
+        assert!(!path_is_inside(
+            Path::new("D:\\Biblioteca2"),
+            Path::new("D:\\Biblioteca")
+        ));
+        assert!(!path_is_inside(
+            Path::new("D:\\Biblioteca"),
+            Path::new("D:\\Biblioteca\\Trabajos")
+        ));
+    }
+
+    #[test]
+    fn refuses_windows_folders_as_library() {
+        for variable in ["SystemRoot", "ProgramFiles", "ProgramData"] {
+            let Some(directory) = env_directory(variable) else {
+                continue;
+            };
+            assert!(
+                protected_root_reason(&directory).is_some(),
+                "{variable} deberia rechazarse"
+            );
+            assert!(
+                protected_root_reason(&directory.join("ROXWANA")).is_some(),
+                "una subcarpeta de {variable} deberia rechazarse"
+            );
+        }
+
+        if let Some(system_drive) = env_directory("SystemDrive") {
+            assert!(protected_root_reason(&system_drive).is_some());
+        }
+        if let Some(profile) = env_directory("USERPROFILE") {
+            assert!(protected_root_reason(&profile).is_some());
+            if let Some(users) = profile.parent() {
+                assert!(protected_root_reason(users).is_some());
+            }
+            // Documentos y Escritorio son ubicaciones normales y validas.
+            assert!(protected_root_reason(&profile.join("Documents\\ROXWANA")).is_none());
+            assert!(protected_root_reason(&profile.join("Desktop\\ROXWANA")).is_none());
+        }
+
+        assert!(protected_root_reason(Path::new("D:\\ROXWANA")).is_none());
+    }
+
+    #[test]
+    fn accepts_a_normal_folder_and_warns_about_risky_locations() {
+        let dir = tempdir().unwrap();
+        validate_library_root_usable(dir.path()).unwrap();
+        assert!(library_root_warnings(dir.path()).is_empty());
+        // La comprobacion no deja ningun archivo suelto en la carpeta.
+        assert!(fs::read_dir(dir.path()).unwrap().next().is_none());
+
+        let network = library_root_warnings(Path::new("\\\\NAS\\estampas"));
+        assert!(network.iter().any(|aviso| aviso.contains("red")));
+
+        let onedrive =
+            library_root_warnings(Path::new("C:\\Users\\ana\\OneDrive\\Documentos\\ROXWANA"));
+        assert!(onedrive.iter().any(|aviso| aviso.contains("OneDrive")));
+
+        let deep = PathBuf::from(format!("D:\\{}", "carpeta-larga\\".repeat(12)));
+        assert!(library_root_warnings(&deep)
+            .iter()
+            .any(|aviso| aviso.contains("muy larga")));
+
+        assert!(library_root_warnings(Path::new("E:\\"))
+            .iter()
+            .any(|aviso| aviso.contains("unidad entera")));
+    }
+
+    #[test]
+    fn keeps_a_rescue_copy_before_discarding_the_local_database() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("roxwana-biblioteca.sqlite");
+        let conn = Connection::open(&db_path).unwrap();
+        ensure_database(&conn).unwrap();
+        save_setting(&conn, "library_root", "D:\\Biblioteca").unwrap();
+        drop(conn);
+
+        // Sin ninguna copia de Preferences la base local se descarta; el rescate
+        // es lo unico que separa al usuario de perder su clasificacion.
+        let applied = replace_local_database_from_authority(&[], &db_path).unwrap();
+        assert!(applied.is_none());
+
+        let rescue = dir
+            .path()
+            .join("copias-de-seguridad")
+            .join(LOCAL_DATABASE_RESCUE_FILE_NAME);
+        assert!(rescue.is_file(), "falta la copia de rescate");
+        validate_backup_database(&rescue).unwrap();
+        let rescued = Connection::open(&rescue).unwrap();
+        assert_eq!(
+            get_setting(&rescued, "library_root").unwrap().as_deref(),
+            Some("D:\\Biblioteca")
+        );
+    }
+
+    #[test]
+    fn rejects_a_file_as_library_without_touching_it() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("not-a-library.txt");
+        fs::write(&file, b"keep").unwrap();
+
+        let error = validate_library_root_access(&file).unwrap_err();
+
+        assert!(error.contains("no existe o ya no está disponible"));
+        assert_eq!(fs::read(&file).unwrap(), b"keep");
     }
 
     #[test]

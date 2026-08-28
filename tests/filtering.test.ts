@@ -11,6 +11,7 @@ import {
 } from "../src/lib/filtering";
 import {
   categoryNode,
+  filterSidebarByName,
   flattenSidebar,
   moveSidebarNode,
   removeGroupFromSidebar,
@@ -173,5 +174,30 @@ describe("category panel layout", () => {
     const withGroup = [categoryNode("Skater"), group("Verano", ["Surf", "Playa"]), categoryNode("Calaveras")];
     expect(flattenSidebar(removeGroupFromSidebar(withGroup, "Verano")))
       .toEqual(["Skater", "Surf", "Playa", "Calaveras"]);
+  });
+
+  it("filters category names from the first typed letter", () => {
+    const withGroup = [
+      categoryNode("Che Guevara"),
+      categoryNode("Ángeles"),
+      group("Freepik", ["Textos Y Frases", "Skater", "Deportes", "Textos Y Efectos"], true),
+      categoryNode("Texto Che Gorra"),
+      categoryNode("Pantera"),
+    ];
+
+    expect(flattenSidebar(filterSidebarByName(withGroup, "te")))
+      .toEqual(["Textos Y Frases", "Textos Y Efectos", "Texto Che Gorra"]);
+    expect(flattenSidebar(filterSidebarByName(withGroup, "c")))
+      .toEqual(["Che Guevara"]);
+    expect(flattenSidebar(filterSidebarByName(withGroup, "angeles")))
+      .toEqual(["Ángeles"]);
+  });
+
+  it("shows a matching group with its children without changing the saved layout", () => {
+    const withGroup = [group("Bandas", ["AC DC", "The Smiths"], true), categoryNode("Rolling")];
+    const result = filterSidebarByName(withGroup, "banda");
+
+    expect(result).toEqual([group("Bandas", ["AC DC", "The Smiths"], false)]);
+    expect(withGroup[0].collapsed).toBe(true);
   });
 });

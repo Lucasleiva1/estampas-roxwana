@@ -77,6 +77,7 @@ import {
   saveSidebarLayout,
   setCategoryGroupCollapsed,
   restoreDatabaseBackup,
+  checkLibraryFolder,
   scanLibrary,
   saveDatabaseBackup,
   saveBrandLogo,
@@ -101,6 +102,7 @@ import {
 } from "./lib/filtering";
 import {
   categoryNode,
+  filterSidebarByName,
   flattenSidebar,
   moveSidebarNode,
   removeCategoryFromSidebar,
@@ -455,6 +457,10 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [scanning, setScanning] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Aviso suave cuando Windows no puede avisar de los cambios en esa carpeta y
+  // la aplicacion pasa a comprobarlos cada tanto. No es un error: la biblioteca
+  // sigue funcionando, solo se entera un poco mas tarde.
+  const [watcherFallback, setWatcherFallback] = useState<string | null>(null);
   const [zoom, setZoom] = useState(defaultZoom);
   const [uiScale, setUiScale] = useState(getInitialUiScale);
   const [leftPanelWidth, setLeftPanelWidth] = useState(getInitialLeftPanelWidth);
@@ -629,7 +635,11 @@ export default function App() {
     let alive = true;
     getInitialState()
       .then((response) => {
-        if (alive) applyLibrary(response);
+        if (!alive) return;
+        applyLibrary(response);
+        // El disco externo desconectado o una carpeta sin permisos no pueden
+        // terminar en una biblioteca vacia y muda: el motivo va a la vista.
+        if (response.rootIssue) setError(response.rootIssue);
       })
       .catch((initialError) => {
         if (alive) setError(String(initialError));
@@ -706,8 +716,39 @@ export default function App() {
     let disposed = false;
     let stopWatching: (() => void) | null = null;
     let flushTimer = 0;
+    let pollTimer = 0;
+    let pollRunning = false;
+    let lastPollAt = 0;
     let syncRunning = false;
     const pendingPaths = new Set<string>();
+
+    // Mismo respaldo que la Biblioteca: si Windows no avisa de los cambios en
+    // esa carpeta, Referencias se comprueba cada tanto y al volver a la ventana.
+    const pollForChanges = async () => {
+      if (disposed || pollRunning || syncRunning) return;
+      if (Date.now() - lastPollAt < 15000) return;
+      pollRunning = true;
+      lastPollAt = Date.now();
+      try {
+        const response = await detectReferenceChanges(rootPath);
+        if (!disposed && response) setReferencesData(response);
+      } catch {
+        // El próximo intento vuelve a probar; no se repite el error en pantalla.
+      } finally {
+        pollRunning = false;
+      }
+    };
+
+    const pollOnFocus = () => {
+      void pollForChanges();
+    };
+
+    const startChangePolling = () => {
+      if (disposed || pollTimer) return;
+      pollTimer = window.setInterval(() => void pollForChanges(), 60000);
+      window.addEventListener("focus", pollOnFocus);
+      void pollForChanges();
+    };
 
     const scheduleFlush = () => {
       window.clearTimeout(flushTimer);
@@ -748,13 +789,18 @@ export default function App() {
         if (disposed) stop();
         else stopWatching = stop;
       })
-      .catch((watchError) => {
-        if (!disposed) setReferencesError(`No pude vigilar Referencias: ${String(watchError)}`);
+      .catch(() => {
+        // Sin aviso instantaneo, Referencias no queda congelada: pasa al
+        // respaldo por tiempo. El aviso en pantalla lo da la Biblioteca, que
+        // vigila la misma carpeta y falla por el mismo motivo.
+        if (!disposed) startChangePolling();
       });
 
     return () => {
       disposed = true;
       window.clearTimeout(flushTimer);
+      window.clearInterval(pollTimer);
+      window.removeEventListener("focus", pollOnFocus);
       stopWatching?.();
     };
   }, [referencesData?.referencesPath, referencesData?.rootPath]);
@@ -814,12 +860,49 @@ export default function App() {
     const referencesPrefix = `${normalizedRoot}/referencias`;
     const preferencesPrefix = `${normalizedRoot}/preferences`;
 
+    setWatcherFallback(null);
     let disposed = false;
     let stopWatching: (() => void) | null = null;
     let flushTimer = 0;
+    let pollTimer = 0;
+    let pollRunning = false;
+    let lastPollAt = 0;
     let rescanRunning = false;
     let preferencesReloadRunning = false;
     const pendingPaths = new Set<string>();
+
+    // Respaldo para cuando Windows no avisa de los cambios. Recorre la carpeta y
+    // compara con lo indexado, asi que es caro: solo corre en modo respaldo, con
+    // un minimo de 15 segundos entre pasadas.
+    const pollForChanges = async () => {
+      if (disposed || pollRunning || rescanRunning) return;
+      if (Date.now() - lastPollAt < 15000) return;
+      pollRunning = true;
+      lastPollAt = Date.now();
+      try {
+        const response = await detectLibraryChanges(rootPath);
+        if (!disposed && response) {
+          applyLibrary(response);
+          setDetailsById({});
+        }
+      } catch {
+        // Si el disco se desconectó, el próximo intento vuelve a probar. No
+        // tiene sentido llenar la pantalla de errores repetidos.
+      } finally {
+        pollRunning = false;
+      }
+    };
+
+    const pollOnFocus = () => {
+      void pollForChanges();
+    };
+
+    const startChangePolling = () => {
+      if (disposed || pollTimer) return;
+      pollTimer = window.setInterval(() => void pollForChanges(), 60000);
+      window.addEventListener("focus", pollOnFocus);
+      void pollForChanges();
+    };
 
     const reloadUnusablePreferences = async () => {
       if (disposed || preferencesReloadRunning) return;
@@ -886,12 +969,23 @@ export default function App() {
         else stopWatching = stop;
       })
       .catch((watchError) => {
-        if (!disposed) setError(`No pude vigilar la carpeta de imagenes: ${String(watchError)}`);
+        if (disposed) return;
+        // El aviso instantaneo de Windows no funciona en todos lados: carpetas
+        // de red, algunos discos externos y ciertos antivirus lo bloquean. En
+        // vez de dejar la biblioteca sin actualizarse, se pasa a comprobar los
+        // cambios cada tanto y cada vez que el usuario vuelve a la ventana.
+        startChangePolling();
+        setWatcherFallback(
+          `El aviso automático de cambios no está disponible en esta carpeta (${String(watchError)}). `
+          + "La biblioteca se va a actualizar sola cada minuto y cada vez que volvés a la ventana.",
+        );
       });
 
     return () => {
       disposed = true;
       window.clearTimeout(flushTimer);
+      window.clearInterval(pollTimer);
+      window.removeEventListener("focus", pollOnFocus);
       stopWatching?.();
     };
   }, [applyLibrary, library?.rootPath]);
@@ -1015,6 +1109,40 @@ export default function App() {
       && !window.confirm(`Vas a cambiar la biblioteca.\n\nActual:\n${currentPath}\n\nNueva:\n${selected}\n\n¿Continuar?`)
     ) {
       return;
+    }
+
+    // Antes de adoptar la carpeta se comprueba contra el disco real que Windows
+    // deje leerla y escribirla, y que no sea una carpeta del sistema. Asi el
+    // usuario ve el motivo exacto en vez de una biblioteca que no carga.
+    setError(null);
+    let check;
+    try {
+      check = await checkLibraryFolder(selected);
+    } catch (checkError) {
+      setError(String(checkError));
+      return;
+    }
+
+    // El vigilante se prueba de verdad sobre la carpeta elegida, no se supone.
+    // Si Windows no puede avisar de los cambios ahí (carpetas de red, algunos
+    // antivirus), conviene que el usuario lo sepa antes y no después.
+    const warnings = [...check.warnings];
+    try {
+      const stop = await watch(selected, () => {}, { recursive: true, delayMs: 1000 });
+      stop();
+    } catch (watchError) {
+      warnings.push(
+        "Windows no puede avisar de los cambios en esta carpeta "
+        + `(${String(watchError)}). La aplicación va a funcionar igual, pero se entera de las `
+        + "imágenes nuevas cada minuto y cada vez que volvés a la ventana, en vez de al instante.",
+      );
+    }
+
+    if (warnings.length > 0) {
+      const detail = warnings.map((warning) => `• ${warning}`).join("\n\n");
+      if (!window.confirm(`${selected}\n\nAntes de seguir, tené en cuenta:\n\n${detail}\n\n¿Usar igual esta carpeta?`)) {
+        return;
+      }
     }
 
     await runScan(selected);
@@ -1724,7 +1852,7 @@ export default function App() {
       setAvailableUpdate(update);
       setUpdateState({
         phase: "available",
-        message: `Nueva actualizacion encontrada: ROXWANA v${update.version}.`,
+        message: `Nueva actualizacion encontrada: Biblioteca Visual v${update.version}.`,
         progress: null,
       });
     } catch (updateError) {
@@ -1754,7 +1882,7 @@ export default function App() {
       let contentLength = 0;
       setUpdateState({
         phase: "downloading",
-        message: `Descargando ROXWANA v${availableUpdate.version}...`,
+        message: `Descargando Biblioteca Visual v${availableUpdate.version}...`,
         progress: 0,
       });
 
@@ -1764,7 +1892,7 @@ export default function App() {
           downloaded = 0;
           setUpdateState({
             phase: "downloading",
-            message: `Descargando ROXWANA v${availableUpdate.version}...`,
+            message: `Descargando Biblioteca Visual v${availableUpdate.version}...`,
             progress: contentLength > 0 ? 0 : null,
           });
         }
@@ -1773,7 +1901,7 @@ export default function App() {
           downloaded += event.data.chunkLength;
           setUpdateState({
             phase: "downloading",
-            message: `Descargando ROXWANA v${availableUpdate.version}...`,
+            message: `Descargando Biblioteca Visual v${availableUpdate.version}...`,
             progress: contentLength > 0 ? Math.min(99, Math.round((downloaded / contentLength) * 100)) : null,
           });
         }
@@ -1972,12 +2100,24 @@ export default function App() {
         setUiScale={setUiScale}
       />
 
-      {error && (
-        <div className="error-strip">
-          <span>{error}</span>
-          <button onClick={() => setError(null)} title="Cerrar">
-            <X size={16} />
-          </button>
+      {(error || watcherFallback) && (
+        <div className="notice-stack">
+          {error && (
+            <div className="error-strip">
+              <span>{error}</span>
+              <button onClick={() => setError(null)} title="Cerrar">
+                <X size={16} />
+              </button>
+            </div>
+          )}
+          {watcherFallback && (
+            <div className="warn-strip">
+              <span>{watcherFallback}</span>
+              <button onClick={() => setWatcherFallback(null)} title="Cerrar">
+                <X size={16} />
+              </button>
+            </div>
+          )}
         </div>
       )}
 
@@ -3583,7 +3723,7 @@ function SettingsScreen({
                 <div className="update-available">
                   <div>
                     <small>Nueva version disponible</small>
-                    <strong>ROXWANA v{availableUpdateVersion}</strong>
+                    <strong>Biblioteca Visual v{availableUpdateVersion}</strong>
                   </div>
                   <button className="settings-action" onClick={onInstallUpdate} disabled={updateBusy}>
                     {updateState.phase === "downloading" || updateState.phase === "installing" ? (
@@ -3634,8 +3774,8 @@ function SettingsScreen({
                   </div>
                 ) : (
                   <div className="brand-header-preview" style={brandHeaderStyle(brandPresentation)}>
-                    <div className={brandLogo ? "logo-area brand-preview-logo-slot has-logo" : "logo-area brand-preview-logo-slot empty"}>
-                      {brandLogo && (
+                    {brandLogo ? (
+                      <div className="logo-area brand-preview-logo-slot has-logo">
                         <img
                           className="brand-logo"
                           src={brandLogo.dataUrl}
@@ -3643,20 +3783,25 @@ function SettingsScreen({
                           draggable={false}
                           style={brandLogoStyle(brandPresentation)}
                         />
-                      )}
-                    </div>
+                      </div>
+                    ) : (
+                      <button
+                        type="button"
+                        className="logo-area brand-preview-logo-slot empty brand-logo-slot-button"
+                        onClick={onChooseBrandLogo}
+                        disabled={brandLogoBusy}
+                        title="Elegir la imagen del logo"
+                      >
+                        <ImageOff size={17} />
+                        <span>Poné el logo acá</span>
+                      </button>
+                    )}
                     <div className="brand-preview-tools" aria-hidden="true">
                       <span>Rescaneo</span>
                     </div>
                     {brandPresentation.name.trim() && (
                       <div className="header-brand-name brand-preview-name" style={brandNameStyle(brandPresentation)}>
                         {brandPresentation.name.trim()}
-                      </div>
-                    )}
-                    {!brandLogo && !brandPresentation.name.trim() && (
-                      <div className="brand-preview-empty-hint">
-                        <ImageOff size={18} />
-                        <span>Carga un logo o escribe el nombre de tu marca</span>
                       </div>
                     )}
                     <div className="brand-preview-actions" aria-hidden="true">
@@ -3667,8 +3812,22 @@ function SettingsScreen({
                 )}
               </div>
 
-              {brandLogo && (
-                <div className="brand-logo-editor">
+              <div className="settings-brand-actions">
+                <button type="button" onClick={onChooseBrandLogo} disabled={brandLogoBusy}>
+                  {brandLogoState.phase === "saving" ? <Loader2 size={15} className="spin" /> : <Upload size={15} />}
+                  <span>{brandLogo ? "Cambiar imagen" : "Cargar imagen"}</span>
+                </button>
+                {brandLogo && (
+                  <button type="button" className="danger" onClick={onRemoveBrandLogo} disabled={brandLogoBusy} title="Quitar logo">
+                    {brandLogoState.phase === "removing" ? <Loader2 size={15} className="spin" /> : <Trash2 size={15} />}
+                  </button>
+                )}
+              </div>
+
+              {/* Los controles del logo quedan siempre a la vista. Sin imagen
+                  cargada se ven apagados y no responden; al cargarla se
+                  encienden solos y se entiende que ya se pueden usar. */}
+              <div className={brandLogo ? "brand-logo-editor" : "brand-logo-editor is-idle"} aria-disabled={!brandLogo}>
                   <div className="brand-control-heading">
                     <strong>Ajustar logo</strong>
                     <button
@@ -3679,7 +3838,7 @@ function SettingsScreen({
                         logoOffsetX: DEFAULT_BRAND_PRESENTATION.logoOffsetX,
                         logoOffsetY: DEFAULT_BRAND_PRESENTATION.logoOffsetY,
                       }))}
-                      disabled={brandPresentation.logoScale === 100 && brandPresentation.logoOffsetX === 0 && brandPresentation.logoOffsetY === 0}
+                      disabled={!brandLogo || (brandPresentation.logoScale === 100 && brandPresentation.logoOffsetX === 0 && brandPresentation.logoOffsetY === 0)}
                     >
                       <RotateCcw size={13} /> Restablecer
                     </button>
@@ -3693,6 +3852,7 @@ function SettingsScreen({
                       step="5"
                       value={brandPresentation.logoScale}
                       onChange={(event) => updateBrandPresentation("logoScale", Number(event.target.value))}
+                    disabled={!brandLogo}
                     />
                   </label>
                   <div className="brand-position-controls">
@@ -3705,6 +3865,7 @@ function SettingsScreen({
                         step="1"
                         value={brandPresentation.logoOffsetX}
                         onChange={(event) => updateBrandPresentation("logoOffsetX", Number(event.target.value))}
+                      disabled={!brandLogo}
                       />
                     </label>
                     <label className="brand-range-control">
@@ -3716,11 +3877,11 @@ function SettingsScreen({
                         step="1"
                         value={brandPresentation.logoOffsetY}
                         onChange={(event) => updateBrandPresentation("logoOffsetY", Number(event.target.value))}
+                      disabled={!brandLogo}
                       />
                     </label>
                   </div>
-                </div>
-              )}
+              </div>
 
               <div className="brand-name-editor">
                 <div className="brand-control-heading">
@@ -3733,7 +3894,7 @@ function SettingsScreen({
                   maxLength={40}
                   value={brandPresentation.name}
                   onChange={(event) => updateBrandPresentation("name", event.target.value)}
-                  placeholder="Por ejemplo: ROXWANA"
+                  placeholder="Por ejemplo: Mi marca"
                 />
                 <div className="brand-font-row">
                   <div ref={fontPickerRef} className="brand-font-picker">
@@ -3833,20 +3994,12 @@ function SettingsScreen({
                 </div>
               </div>
 
-              <div className="settings-brand-actions">
-                <button type="button" onClick={onChooseBrandLogo} disabled={brandLogoBusy}>
-                  {brandLogoState.phase === "saving" ? <Loader2 size={15} className="spin" /> : <Upload size={15} />}
-                  <span>{brandLogo ? "Cambiar imagen" : "Cargar imagen"}</span>
-                </button>
-                {brandLogo && (
-                  <button type="button" className="danger" onClick={onRemoveBrandLogo} disabled={brandLogoBusy} title="Quitar logo">
-                    {brandLogoState.phase === "removing" ? <Loader2 size={15} className="spin" /> : <Trash2 size={15} />}
-                  </button>
-                )}
-              </div>
-              <small>Arrastra una imagen sobre el encabezado o elegila con el boton. Los cambios de tamaño, posición, nombre, fuente y color se guardan automáticamente.</small>
-              {brandLogoState.message && (
-                <div className={`update-status ${brandLogoState.phase}`} aria-live="polite">
+              <small>Los cambios de tamaño, posición, nombre, fuente y color se guardan automáticamente.</small>
+              {/* Guardar bien no se avisa: el logo aparece en la barra y con eso
+                  alcanza. Solo se muestra el cartel cuando algo falla, que es
+                  cuando el usuario necesita enterarse. */}
+              {brandLogoState.phase === "error" && brandLogoState.message && (
+                <div className="update-status error" aria-live="polite">
                   <span>{brandLogoState.message}</span>
                 </div>
               )}
@@ -3972,6 +4125,7 @@ function LeftFilters({
   const [editingName, setEditingName] = useState("");
   const [pendingDelete, setPendingDelete] = useState<SidebarDragSource | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const [categorySearch, setCategorySearch] = useState("");
   const renameCancelled = useRef(false);
   const categoryCounts = useMemo(() => {
     const counts = new Map<string, number>();
@@ -3988,6 +4142,11 @@ function LeftFilters({
   const favoritesCount = useMemo(
     () => allDesigns.filter((design) => design.classification.favorite).length,
     [allDesigns],
+  );
+  const categorySearchActive = categorySearch.trim().length > 0;
+  const visibleSidebar = useMemo(
+    () => filterSidebarByName(sidebar, categorySearch),
+    [categorySearch, sidebar],
   );
 
   useEffect(() => {
@@ -4261,7 +4420,32 @@ function LeftFilters({
   return (
     <aside className="left-panel">
       <div className="panel-head">
-        <span>Categorias</span>
+        <span className="panel-title">Categorias</span>
+        <div className="category-search">
+          <Search size={13} aria-hidden="true" />
+          <input
+            type="search"
+            value={categorySearch}
+            onChange={(event) => setCategorySearch(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") setCategorySearch("");
+            }}
+            placeholder="Buscar"
+            aria-label="Buscar carpetas por nombre"
+            spellCheck={false}
+          />
+          {categorySearchActive && (
+            <button
+              type="button"
+              className="category-search-clear"
+              onClick={() => setCategorySearch("")}
+              title="Limpiar busqueda"
+              aria-label="Limpiar busqueda de carpetas"
+            >
+              <X size={11} />
+            </button>
+          )}
+        </div>
         <div className="panel-actions">
           <div className="create-menu-anchor">
             <div className="split-button">
@@ -4315,58 +4499,64 @@ function LeftFilters({
             </button>
           </form>
         )}
-        <button
-          className={filters.favoritesOnly ? "filter-row favorites-row active" : "filter-row favorites-row"}
-          onClick={onFavoritesFilter}
-          title="Ver todas mis imagenes favoritas"
-        >
-          <span className="filter-name">
-            <Heart size={17} fill={filters.favoritesOnly ? "currentColor" : "none"} />
-            Mis favoritos
-          </span>
-          <span className="favorites-count">{favoritesCount.toLocaleString("es-AR")}</span>
-        </button>
-        <button
-          className={!filters.favoritesOnly && filters.categories.length === 0 ? "filter-row active" : "filter-row"}
-          onClick={onClear}
-          title="Ver todas las imagenes"
-        >
-          <span className="filter-name">
-            <FileText size={16} />
-            Todas las imagenes
-          </span>
-          <span>{allDesigns.length.toLocaleString("es-AR")}</span>
-        </button>
-        <div
-          className={[
-            "category-row",
-            "uncategorized-category-row",
-            dragState?.kind === "design" && dropsOn("category", UNCATEGORIZED_CATEGORY) ? "design-drop-target" : "",
-          ].filter(Boolean).join(" ")}
-          data-drop-name={UNCATEGORIZED_CATEGORY}
-          data-drop-kind="category"
-          title="Ver imagenes sin categoria. Arrastra una imagen aca para quitarle la categoria."
-        >
-          <button
-            className={filters.categories.some((item) => sameCategory(item, UNCATEGORIZED_CATEGORY)) ? "filter-row active" : "filter-row"}
-            onClick={(event) => {
-              if (shouldSuppressDragClick()) {
-                event.preventDefault();
-                event.stopPropagation();
-                return;
-              }
-              onCategoryFilter(UNCATEGORIZED_CATEGORY);
-            }}
-          >
-            <span className="filter-name">
-              <span className="category-count" aria-label={`${uncategorizedCount.toLocaleString("es-AR")} imagenes`}>
-                {uncategorizedCount.toLocaleString("es-AR")}
+        {!categorySearchActive && (
+          <>
+            <button
+              className={filters.favoritesOnly ? "filter-row favorites-row active" : "filter-row favorites-row"}
+              onClick={onFavoritesFilter}
+              title="Ver todas mis imagenes favoritas"
+            >
+              <span className="filter-name">
+                <Heart size={17} fill={filters.favoritesOnly ? "currentColor" : "none"} />
+                Mis favoritos
               </span>
-              <span className="category-label">{UNCATEGORIZED_CATEGORY}</span>
-            </span>
-          </button>
-        </div>
-        {sidebar.map((node) => (node.kind === "group" ? renderGroup(node) : renderCategoryRow(node.name, false)))}
+              <span className="favorites-count">{favoritesCount.toLocaleString("es-AR")}</span>
+            </button>
+            <button
+              className={!filters.favoritesOnly && filters.categories.length === 0 ? "filter-row active" : "filter-row"}
+              onClick={onClear}
+              title="Ver todas las imagenes"
+            >
+              <span className="filter-name">
+                <FileText size={16} />
+                Todas las imagenes
+              </span>
+              <span>{allDesigns.length.toLocaleString("es-AR")}</span>
+            </button>
+            <div
+              className={[
+                "category-row",
+                "uncategorized-category-row",
+                dragState?.kind === "design" && dropsOn("category", UNCATEGORIZED_CATEGORY) ? "design-drop-target" : "",
+              ].filter(Boolean).join(" ")}
+              data-drop-name={UNCATEGORIZED_CATEGORY}
+              data-drop-kind="category"
+              title="Ver imagenes sin categoria. Arrastra una imagen aca para quitarle la categoria."
+            >
+              <button
+                className={filters.categories.some((item) => sameCategory(item, UNCATEGORIZED_CATEGORY)) ? "filter-row active" : "filter-row"}
+                onClick={(event) => {
+                  if (shouldSuppressDragClick()) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    return;
+                  }
+                  onCategoryFilter(UNCATEGORIZED_CATEGORY);
+                }}
+              >
+                <span className="filter-name">
+                  <span className="category-count" aria-label={`${uncategorizedCount.toLocaleString("es-AR")} imagenes`}>
+                    {uncategorizedCount.toLocaleString("es-AR")}
+                  </span>
+                  <span className="category-label">{UNCATEGORIZED_CATEGORY}</span>
+                </span>
+              </button>
+            </div>
+          </>
+        )}
+        {visibleSidebar.length > 0
+          ? visibleSidebar.map((node) => (node.kind === "group" ? renderGroup(node) : renderCategoryRow(node.name, false)))
+          : <p className="category-search-empty">No hay carpetas con ese nombre</p>}
       </div>
 
       <div className="left-status">

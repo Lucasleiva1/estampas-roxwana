@@ -70,6 +70,14 @@ export interface LibraryResponse {
   categories: string[];
   sidebar: SidebarNode[];
   tags: string[];
+  /** Motivo por el que la carpeta guardada no se puede usar ahora (disco
+   *  desconectado, carpeta movida, permisos bloqueados). Null si esta sana. */
+  rootIssue?: string | null;
+}
+
+export interface FolderCheck {
+  path: string;
+  warnings: string[];
 }
 
 export interface ReferenceItem {
