@@ -3456,12 +3456,19 @@ function SettingsScreen({
   /// recurso quedan las fuentes que Windows trae siempre.
   const loadSystemFonts = useCallback(async () => {
     setFontLoadState("loading");
-    const mergeFamilies = (families: string[]) =>
-      Array.from(new Set([...SYSTEM_FONT_FALLBACKS, ...families.map((family) => family.trim()).filter(Boolean)]))
+    // La lista muestra exactamente las fuentes de ESTA PC. Antes se mezclaba
+    // siempre una lista fija, y eso ofrecia fuentes que la maquina no tenia
+    // (por ejemplo Century Gothic, que llega con Office): el usuario la elegia,
+    // el nombre quedaba guardado y el texto se dibujaba con otra fuente sin
+    // avisar. La lista fija queda solo para cuando no se pudo leer ninguna.
+    const cleanFamilies = (families: string[]) =>
+      Array.from(new Set(families.map((family) => family.trim()).filter(Boolean)))
         .sort((left, right) => left.localeCompare(right, "es", { sensitivity: "base" }));
 
     try {
-      setSystemFonts(mergeFamilies(await listSystemFonts()));
+      const families = await listSystemFonts();
+      if (families.length === 0) throw new Error("La lista de fuentes llego vacia");
+      setSystemFonts(cleanFamilies(families));
       setFontLoadState("loaded");
       return;
     } catch {
@@ -3474,10 +3481,11 @@ function SettingsScreen({
       }).queryLocalFonts;
       if (!queryLocalFonts) throw new Error("WebView2 no ofrece acceso a la lista local");
       const fonts = await queryLocalFonts.call(window);
-      setSystemFonts(mergeFamilies(fonts.map((font) => font.family)));
+      if (fonts.length === 0) throw new Error("La lista de fuentes del navegador llego vacia");
+      setSystemFonts(cleanFamilies(fonts.map((font) => font.family)));
       setFontLoadState("loaded");
     } catch {
-      setSystemFonts(SYSTEM_FONT_FALLBACKS);
+      setSystemFonts(cleanFamilies(SYSTEM_FONT_FALLBACKS));
       setFontLoadState("error");
     }
   }, []);
@@ -3486,11 +3494,22 @@ function SettingsScreen({
     void loadSystemFonts();
   }, [loadSystemFonts]);
 
+  // Si la configuracion viaja a una PC que no tiene la fuente elegida, esa
+  // fuente igual aparece en el selector: si desapareciera, el usuario veria un
+  // nombre en el boton que no existe en la lista y no podria volver a elegirlo.
+  const selectableFonts = useMemo(() => {
+    const chosen = brandPresentation.nameFont.trim();
+    if (!chosen || systemFonts.some((font) => font.localeCompare(chosen, "es", { sensitivity: "base" }) === 0)) {
+      return systemFonts;
+    }
+    return [...systemFonts, chosen].sort((left, right) => left.localeCompare(right, "es", { sensitivity: "base" }));
+  }, [brandPresentation.nameFont, systemFonts]);
+
   const visibleFonts = useMemo(() => {
     const needle = fontSearch.trim().toLowerCase();
-    if (!needle) return systemFonts;
-    return systemFonts.filter((font) => font.toLowerCase().includes(needle));
-  }, [fontSearch, systemFonts]);
+    if (!needle) return selectableFonts;
+    return selectableFonts.filter((font) => font.toLowerCase().includes(needle));
+  }, [fontSearch, selectableFonts]);
 
   useEffect(() => {
     if (!fontListOpen) return;
@@ -3949,7 +3968,7 @@ function SettingsScreen({
                   </div>
                   <button type="button" onClick={() => void loadSystemFonts()} disabled={fontLoadState === "loading"}>
                     {fontLoadState === "loading" ? <Loader2 size={14} className="spin" /> : <FileText size={14} />}
-                    {fontLoadState === "loaded" ? `${systemFonts.length} fuentes` : "Releer fuentes"}
+                    {fontLoadState === "loaded" ? `${selectableFonts.length} fuentes` : "Releer fuentes"}
                   </button>
                 </div>
                 {fontLoadState === "error" && (

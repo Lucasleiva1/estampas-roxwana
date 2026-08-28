@@ -5376,6 +5376,39 @@ mod tests {
     /// trae instaladas.
     #[cfg(windows)]
     #[test]
+    /// En otra PC Windows puede estar en otra unidad y el perfil del usuario en
+    /// otra carpeta. Las dos rutas se arman desde el entorno de la maquina, no
+    /// desde rutas fijas, y hay que mirar las dos: las fuentes instaladas "solo
+    /// para mi" viven en el perfil, no en la carpeta de Windows.
+    #[test]
+    fn looks_for_fonts_where_this_machine_keeps_them() {
+        let directories = system_font_directories();
+        assert!(!directories.is_empty());
+
+        let windows_fonts = env_directory("WINDIR")
+            .or_else(|| env_directory("SystemRoot"))
+            .map(|windows| windows.join("Fonts"));
+        if let Some(windows_fonts) = windows_fonts {
+            assert!(
+                directories
+                    .iter()
+                    .any(|directory| comparable_path(directory) == comparable_path(&windows_fonts)),
+                "falta la carpeta de fuentes de Windows: {directories:?}"
+            );
+        }
+
+        if let Some(local) = env_directory("LOCALAPPDATA") {
+            let user_fonts = local.join("Microsoft").join("Windows").join("Fonts");
+            assert!(
+                directories
+                    .iter()
+                    .any(|directory| comparable_path(directory) == comparable_path(&user_fonts)),
+                "falta la carpeta de fuentes del usuario: {directories:?}"
+            );
+        }
+    }
+
+    #[test]
     fn reads_the_fonts_actually_installed_on_this_machine() {
         let families = list_system_fonts_impl().expect("Windows deberia tener fuentes instaladas");
         assert!(families.len() > 20, "se leyeron muy pocas fuentes: {families:?}");
