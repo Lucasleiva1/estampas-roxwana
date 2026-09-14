@@ -1,0 +1,4 @@
+interface:
+  display_name: "RXW Desktop License Integration"
+  short_description: "Integrate secure RXW device-bound licenses"
+  default_prompt: "Use $rxw-desktop-license-integration to add or repair RXW Core licensing in this Windows desktop application."
