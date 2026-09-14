@@ -241,7 +241,13 @@ struct GroupBuilder {
 }
 
 #[tauri::command]
-fn get_initial_state(app: AppHandle) -> Result<LibraryResponse, String> {
+async fn get_initial_state(app: AppHandle) -> Result<LibraryResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || get_initial_state_blocking(app))
+        .await
+        .map_err(to_string)?
+}
+
+fn get_initial_state_blocking(app: AppHandle) -> Result<LibraryResponse, String> {
     license::require_license(&app)?;
     let conn = open_database(&app)?;
     ensure_database(&conn)?;
