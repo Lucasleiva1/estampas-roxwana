@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod license;
+
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -240,6 +242,7 @@ struct GroupBuilder {
 
 #[tauri::command]
 fn get_initial_state(app: AppHandle) -> Result<LibraryResponse, String> {
+    license::require_license(&app)?;
     let conn = open_database(&app)?;
     ensure_database(&conn)?;
     // La migracion de la cache vieja es transitoria. Si falla, la aplicacion
@@ -302,6 +305,23 @@ fn get_initial_state(app: AppHandle) -> Result<LibraryResponse, String> {
     };
     response.root_issue = root_issue;
     Ok(response)
+}
+
+#[tauri::command]
+async fn get_license_state(app: AppHandle) -> Result<license::LicenseState, String> {
+    tauri::async_runtime::spawn_blocking(move || license::get_license_state(app))
+        .await
+        .map_err(to_string)
+}
+
+#[tauri::command]
+async fn activate_license(
+    app: AppHandle,
+    license_key: String,
+) -> Result<license::LicenseState, String> {
+    tauri::async_runtime::spawn_blocking(move || license::activate_license(app, license_key))
+        .await
+        .map_err(to_string)?
 }
 
 /// Revisa una carpeta antes de adoptarla como biblioteca: devuelve error si no
@@ -466,8 +486,7 @@ fn send_reference_to_work(
 fn get_library_from_db(app: AppHandle) -> Result<LibraryResponse, String> {
     let conn = open_database(&app)?;
     ensure_database(&conn)?;
-    let root =
-        get_setting(&conn, "library_root")?.unwrap_or_default();
+    let root = get_setting(&conn, "library_root")?.unwrap_or_default();
     load_library_from_db(&conn, &root)
 }
 
@@ -1114,8 +1133,7 @@ fn restore_database_backup(app: AppHandle, backup_path: String) -> Result<Librar
 
     let conn = open_database(&app)?;
     ensure_database(&conn)?;
-    let root =
-        get_setting(&conn, "library_root")?.unwrap_or_default();
+    let root = get_setting(&conn, "library_root")?.unwrap_or_default();
     let response = load_library_from_db(&conn, &root)?;
     drop(conn);
     if Path::new(&root).is_dir() {
@@ -1924,19 +1942,16 @@ fn library_root_warnings(root: &Path) -> Vec<String> {
         );
     }
 
-    let in_onedrive = root
-        .components()
-        .any(|component| {
-            component
-                .as_os_str()
-                .to_string_lossy()
-                .to_lowercase()
-                .starts_with("onedrive")
-        })
-        || ["OneDrive", "OneDriveCommercial", "OneDriveConsumer"]
-            .iter()
-            .filter_map(|variable| env_directory(variable))
-            .any(|directory| path_is_inside(root, &directory));
+    let in_onedrive = root.components().any(|component| {
+        component
+            .as_os_str()
+            .to_string_lossy()
+            .to_lowercase()
+            .starts_with("onedrive")
+    }) || ["OneDrive", "OneDriveCommercial", "OneDriveConsumer"]
+        .iter()
+        .filter_map(|variable| env_directory(variable))
+        .any(|directory| path_is_inside(root, &directory));
     if in_onedrive {
         warnings.push(
             "La carpeta está dentro de OneDrive. Si las imágenes están \"solo en línea\", la \
@@ -2945,7 +2960,6 @@ fn save_brand_logo_impl(app: &AppHandle, source_path: &str) -> Result<BrandLogo,
         })
 }
 
-
 /// Devuelve las familias tipograficas instaladas en Windows leyendo la tabla
 /// `name` de cada archivo de fuente. WebView2 resuelve `font-family` contra
 /// estos mismos nombres, asi que lo que aparece en la lista es exactamente lo
@@ -2964,9 +2978,7 @@ fn list_system_fonts_impl() -> Result<Vec<String>, String> {
                 continue;
             }
             for family in read_font_families(&path) {
-                families
-                    .entry(family.to_lowercase())
-                    .or_insert(family);
+                families.entry(family.to_lowercase()).or_insert(family);
             }
         }
     }
@@ -5236,6 +5248,8 @@ fn main() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_sql::Builder::default().build())
         .invoke_handler(tauri::generate_handler![
+            get_license_state,
+            activate_license,
             get_initial_state,
             get_brand_logo,
             save_brand_logo,
@@ -5324,7 +5338,9 @@ mod tests {
         let mut entries: Vec<u8> = Vec::new();
         for (platform, language, name_id, text) in records {
             let encoded: Vec<u8> = if *platform == 3 || *platform == 0 {
-                text.encode_utf16().flat_map(|unit| unit.to_be_bytes()).collect()
+                text.encode_utf16()
+                    .flat_map(|unit| unit.to_be_bytes())
+                    .collect()
             } else {
                 text.bytes().collect()
             };
@@ -5411,7 +5427,10 @@ mod tests {
     #[test]
     fn reads_the_fonts_actually_installed_on_this_machine() {
         let families = list_system_fonts_impl().expect("Windows deberia tener fuentes instaladas");
-        assert!(families.len() > 20, "se leyeron muy pocas fuentes: {families:?}");
+        assert!(
+            families.len() > 20,
+            "se leyeron muy pocas fuentes: {families:?}"
+        );
         for expected in ["Arial", "Segoe UI", "Times New Roman"] {
             assert!(
                 families.iter().any(|family| family == expected),

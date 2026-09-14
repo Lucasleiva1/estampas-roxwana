@@ -5805,3 +5805,133 @@ button:disabled {
 .original-toggle.active svg {
   color: #ffd60a;
 }
+
+/* La activación comercial vive antes de la Biblioteca: mientras esta pantalla
+   está visible no se monta ninguna función ni contenido de la aplicación. */
+.license-shell {
+  width: 100vw;
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 32px;
+  color: #f2eee6;
+  background:
+    radial-gradient(circle at 50% 12%, rgb(130 28 31 / 28%), transparent 38%),
+    linear-gradient(145deg, #0b0b0c, #030404 62%, #100708);
+}
+
+.license-loading {
+  align-content: center;
+  gap: 12px;
+  color: #aaa39a;
+  font-size: 14px;
+}
+
+.license-card {
+  width: min(480px, 100%);
+  padding: 38px;
+  border: 1px solid #323236;
+  border-radius: 18px;
+  background: rgb(13 14 15 / 96%);
+  box-shadow: 0 30px 90px rgb(0 0 0 / 55%);
+}
+
+.license-heading h1 {
+  margin: 0 0 9px;
+  color: #fffaf1;
+  font-size: 28px;
+  line-height: 1.08;
+}
+
+.license-heading p {
+  margin: 0;
+  color: #a9a39b;
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.license-form {
+  display: grid;
+  gap: 10px;
+  margin: 28px 0 20px;
+}
+
+.license-form label {
+  color: #ddd6cc;
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.license-input-wrap {
+  height: 48px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 14px;
+  border: 1px solid #3a3b3f;
+  border-radius: 9px;
+  color: #8f8b84;
+  background: #090a0b;
+}
+
+.license-input-wrap:focus-within {
+  border-color: #b43a40;
+  box-shadow: 0 0 0 3px rgb(180 58 64 / 14%);
+}
+
+.license-input-wrap input {
+  min-width: 0;
+  flex: 1;
+  border: 0;
+  outline: 0;
+  color: #f5efe6;
+  background: transparent;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 14px;
+  letter-spacing: 0.035em;
+  text-transform: uppercase;
+}
+
+.license-form button {
+  height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  margin-top: 4px;
+  border: 1px solid #bd2b33;
+  border-radius: 9px;
+  color: white;
+  background: linear-gradient(90deg, #ad1f28, #7c1218);
+  font-weight: 800;
+}
+
+.license-form button:hover:not(:disabled) {
+  background: linear-gradient(90deg, #c42630, #92171e);
+}
+
+.license-error {
+  padding: 10px 12px;
+  border: 1px solid rgb(207 53 61 / 48%);
+  border-radius: 7px;
+  color: #ffc5c7;
+  background: rgb(133 22 28 / 18%);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.development-edition-badge {
+  position: fixed;
+  z-index: 10000;
+  right: 12px;
+  bottom: 10px;
+  padding: 4px 7px;
+  border: 1px solid rgb(210 147 50 / 38%);
+  border-radius: 5px;
+  color: rgb(229 183 105 / 78%);
+  background: rgb(10 10 10 / 82%);
+  font-size: 9px;
+  font-weight: 850;
+  letter-spacing: 0.11em;
+  pointer-events: none;
+}

@@ -1,0 +1,43 @@
+{
+  "rawInputs": {
+    "systemUuid": "SYSTEM-A",
+    "motherboard": "BOARD-A",
+    "cpu": "CPU-A",
+    "bios": "BIOS-A",
+    "storage": "STORAGE-A"
+  },
+  "componentHashes": {
+    "systemUuid": "6668f8cc91e3ae0c8a25084e020ae25a4583e5d2a7b4e07570cd5aa7684a777d",
+    "motherboard": "2bf395cfaab188460e9f460a003534f95842792e486a6bdea8fe130dd6a8a059",
+    "cpu": "41442d2608d9b43293a137297291c4c5483cbaa19861bcc6a5be9fb5558074df",
+    "bios": "2bbfa69e710fdb3a6e6ee0ba38fe48f3d7290d27e040cb36c723170de367f35a",
+    "storage": "9ee11a25dcc41780cd4b07e0dc52933c2d53f0c3755f637bba9357ce771aa859"
+  },
+  "publicKeyPem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEALiASsnwPa0KNPBE+LfkMjP+5mRfXOfckKKa9MHX975I=\n-----END PUBLIC KEY-----\n",
+  "receipt": {
+    "payload": {
+      "receiptVersion": 1,
+      "algorithm": "Ed25519",
+      "keyId": "rxw-test-vector-2026-01",
+      "licenseKeyHash": "eba2b3a590840953584fc24812e45fabe7501158a3e295877f1d7db368501462",
+      "appId": "desktop-app",
+      "activationId": "act-vector-001",
+      "bindingId": "binding-vector-001",
+      "fingerprintVersion": 1,
+      "deviceBinding": { "components": {
+        "systemUuid": "6668f8cc91e3ae0c8a25084e020ae25a4583e5d2a7b4e07570cd5aa7684a777d",
+        "motherboard": "2bf395cfaab188460e9f460a003534f95842792e486a6bdea8fe130dd6a8a059",
+        "cpu": "41442d2608d9b43293a137297291c4c5483cbaa19861bcc6a5be9fb5558074df",
+        "bios": "2bbfa69e710fdb3a6e6ee0ba38fe48f3d7290d27e040cb36c723170de367f35a",
+        "storage": "9ee11a25dcc41780cd4b07e0dc52933c2d53f0c3755f637bba9357ce771aa859"
+      }},
+      "devicePolicy": { "version": 1, "threshold": 70, "weights": {
+        "systemUuid": 30, "motherboard": 30, "cpu": 20, "bios": 15, "storage": 5
+      }},
+      "issuedAt": "2026-08-29T12:00:00.000Z",
+      "licenseType": "PERPETUAL",
+      "validUntil": null
+    },
+    "signature": "2v4J5DDyr5trnCwfGOYDwN03C3odwu09Yx1RNvWPMl_g90FFtjLeXyOhnv-vAg_1GTzDDWwFC-wsFjncYu-eAg"
+  }
+}

@@ -16,6 +16,21 @@ export interface BrandLogo {
   height: number;
 }
 
+export interface LicenseState {
+  edition: "development" | "commercial";
+  status: "licensed" | "activationRequired" | "invalid";
+  message: string | null;
+  licensedTo: string | null;
+}
+
+export async function getLicenseState() {
+  return invoke<LicenseState>("get_license_state");
+}
+
+export async function activateLicense(licenseKey: string) {
+  return invoke<LicenseState>("activate_license", { licenseKey });
+}
+
 /** Revisa permisos y ubicacion de una carpeta antes de adoptarla como
  *  biblioteca. Lanza con un mensaje explicado si Windows no la deja usar. */
 export async function checkLibraryFolder(path: string) {
