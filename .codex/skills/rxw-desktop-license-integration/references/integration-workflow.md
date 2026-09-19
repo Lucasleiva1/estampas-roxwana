@@ -9,7 +9,7 @@ Record and verify these values in both repositories:
 - Stable `appId`: opaque machine contract, such as `visual-library-7f3a9c`; it is not the visible name.
 - Visible name: human-facing label, freely readable and potentially similar to another product name.
 - Tauri/package identifier: operating-system storage and installation identity, such as `com.company.product`.
-- Activation endpoint: currently `https://rxw-core.netlify.app/api/licenses/activate`.
+- Activation endpoint: currently `https://rxw-core-licencias.netlify.app/api/licenses/activate`.
 - Protocol version, fingerprint version, component names, weights, threshold, receipt version, algorithm, license type, signing `keyId`, and public key.
 
 Client and server constants must match exactly. Changing an `appId`, fingerprint version, canonicalization rule, hash domain separator, component set, weight, threshold, `keyId`, or public key is a protocol migration, not a cosmetic edit.

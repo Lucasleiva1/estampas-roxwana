@@ -12,7 +12,7 @@ This is a dated implementation record, not a substitute for checking the current
 - RXW Core root: `D:\PAGINAS WEB Y APP\rxw-core`
 - RXW Core repository: `https://github.com/Lucasleiva1/rxw-core.git`
 - Stable RXW `appId`: `biblioteca-visual`
-- Activation endpoint: `https://rxw-core.netlify.app/api/licenses/activate`
+- Activation endpoint: `https://rxw-core-licencias.netlify.app/api/licenses/activate`
 - Protocol: 2
 - Fingerprint: version 1, five component hashes, threshold 70
 - Receipt: version 1, Ed25519, perpetual, production `keyId` `rxw-signing-prod-2026-01`

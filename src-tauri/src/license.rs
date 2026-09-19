@@ -17,7 +17,7 @@ use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 const APP_ID: &str = "biblioteca-visual";
-const ACTIVATION_ENDPOINT: &str = "https://rxw-core.netlify.app/api/licenses/activate";
+const ACTIVATION_ENDPOINT: &str = "https://rxw-core-licencias.netlify.app/api/licenses/activate";
 const RECEIPT_FILE_NAME: &str = "license.rxw";
 const RECEIPT_MAX_BYTES: u64 = 128 * 1024;
 const PRODUCTION_KEY_ID: &str = "rxw-signing-prod-2026-01";

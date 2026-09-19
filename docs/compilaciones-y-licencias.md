@@ -29,7 +29,7 @@ npm.cmd run build:commercial
 
 Compila con la feature `commercial`. Sin un comprobante local válido muestra
 solamente la pantalla de activación. La primera activación usa el protocolo 2
-contra `https://rxw-core.netlify.app/api/licenses/activate`; después valida el
+contra `https://rxw-core-licencias.netlify.app/api/licenses/activate`; después valida el
 comprobante Ed25519 localmente y puede abrir sin internet.
 
 La clave pública está en
